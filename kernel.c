@@ -63,12 +63,12 @@ uint16_t*   terminal_buffer = (uint16_t*)VGA_MEMORY;
 void terminal_initialize(void) {
     terminal_row = 0;
     terminal_column = 0;
-    terminal_color = vga_entry_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 
     for (size_t y = 0; y < VGA_HEIGHT; y++) {
         for (size_t x = 0; x < VGA_WIDTH; x++) {
+            terminal_color = vga_entry_color(((y + x) % 15) + 1, VGA_COLOR_BLACK);
             const size_t index = y * VGA_WIDTH + x;
-            terminal_buffer[index] = vga_entry(' ', terminal_color);
+            terminal_buffer[index] = vga_entry('-', terminal_color);
         }
     }
 }
@@ -77,29 +77,45 @@ void terminal_setcolor(uint8_t color) {
     terminal_color = color;
 }
 
+void terminal_scroll(void) {
+    // Shift the terminal buffer index
+    for (size_t y = 1; y < VGA_HEIGHT; y++) {
+        for (size_t x = 0; x < VGA_WIDTH; x++) {
+            terminal_buffer[(y - 1) * VGA_WIDTH + x] = terminal_buffer[y * VGA_WIDTH + x];
+        }
+    }
+
+    for (size_t x = 0; x < VGA_WIDTH; x++) {
+        terminal_buffer[(VGA_HEIGHT - 1) * VGA_WIDTH + x] = vga_entry('-', terminal_color);
+    }
+}
+
 void terminal_putentryat(char c, uint8_t color, size_t x, size_t y) {
     const size_t index = y * VGA_WIDTH + x;
     terminal_buffer[index] = vga_entry(c, color);
 }
 
 void terminal_putchar(char c) {
-    // Wrap
-    if (++terminal_column == VGA_WIDTH) {
-        terminal_column = 0;
-
-        if (++terminal_row == VGA_HEIGHT) {
-            terminal_row = 0;
-        }
-    }
-    
-    // Newline
+    // Linebreak
     if (c == '\n') {
         terminal_column = 0;
-        ++terminal_row;
+        terminal_row++;
     } else {
         terminal_putentryat(c, terminal_color, terminal_column, terminal_row);
+        terminal_column++;
     }
 
+    // Wrap text
+    if (terminal_column >= VGA_WIDTH) {
+        terminal_column = 0;
+        terminal_row++;
+    }
+
+    // Scroll
+    if (terminal_row >= VGA_HEIGHT) {
+        terminal_scroll();
+        terminal_row = VGA_HEIGHT - 1;
+    }
 }
 
 void terminal_write(const char* data, size_t size) {
@@ -119,4 +135,5 @@ void kernel_main(void) {
 
     // Newline support is left as an exercise
     terminal_writestring("Lorem ipsum dolor sit amet, consectetur adipiscing elit. Maecenas magna libero, lobortis a mattis at, elementum eu augue. Praesent non sagittis purus. Sed laoreet mi sed magna interdum, sed suscipit mi malesuada. Cras vel nisi velit. Ut malesuada semper tellus, vitae posuere nisi fermentum eu. Cras rutrum sapien nisi, in convallis augue dictum a. Mauris nibh est, tincidunt eget quam sit amet, convallis lobortis nisi. Mauris mattis justo mi, id scelerisque ante ullamcorper ut. Maecenas aliquam facilisis consectetur. Praesent enim nisl, ullamcorper in lacus et, aliquet accumsan erat. Nulla eget nibh vitae dui porta convallis ac nec libero. Praesent malesuada dui vitae justo dictum, ac semper dui accumsan. Donec nec orci est. Sed gravida vel risus in efficitur.\n\nPellentesque viverra tellus id semper auctor. Proin sit amet odio id elit posuere vehicula sit amet quis nunc. Phasellus sit amet pellentesque orci. Vestibulum eu augue maximus, porta enim et, scelerisque risus. Curabitur sit amet dui est. Morbi nec dignissim tellus, ac varius justo. Phasellus sollicitudin lectus sem, in posuere metus viverra posuere. Curabitur laoreet enim quam. Pellentesque sodales elit urna, nec ultrices nibh mollis ut.\n\nVivamus urna nibh, rutrum eu pharetra et, faucibus congue ipsum. Donec faucibus nibh et risus placerat, id iaculis mi dapibus. Etiam non massa viverra, rhoncus odio eget, consequat metus. Nullam pretium vel justo rutrum pellentesque. In egestas aliquet nulla, et fermentum ex venenatis ac. Pellentesque sagittis ultrices eros et fermentum. Mauris erat mauris, sodales ac mi sed, ullamcorper mattis nisl. Proin posuere interdum elementum. Vestibulum vitae magna ac nisi viverra accumsan. In dapibus ante sed nibh tincidunt, et maximus elit aliquam. Morbi ullamcorper dui nec dui lacinia semper luctus sit amet urna. Curabitur nibh nulla, molestie eu nunc eget, congue ultrices risus.");
+    // terminal_writestring("Howdy");
 }
