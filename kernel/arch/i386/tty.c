@@ -9,6 +9,7 @@
 
 static const size_t VGA_WIDTH  =  80;
 static const size_t VGA_HEIGHT =  25;
+static const size_t TAB = 4;
 static uint16_t* const VGA_MEMORY =  (uint16_t*) 0xB8000;
 
 static size_t terminal_row;
@@ -24,8 +25,21 @@ void terminal_initialize(void) {
         for (size_t x = 0; x < VGA_WIDTH; x++) {
             terminal_color = vga_entry_color(((y + x) % 15) + 1, VGA_COLOR_BLACK);
             const size_t index = y * VGA_WIDTH + x;
-            terminal_buffer[index] = vga_entry('-', terminal_color);
+            terminal_buffer[index] = vga_entry(' ', terminal_color);
         }
+    }
+}
+
+void terminal_scroll(void) {
+    // Shift the terminal buffer index
+    for (size_t y = 1; y < VGA_HEIGHT; y++) {
+        for (size_t x = 0; x < VGA_WIDTH; x++) {
+            terminal_buffer[(y - 1) * VGA_WIDTH + x] = terminal_buffer[y * VGA_WIDTH + x];
+        }
+    }
+
+    for (size_t x = 0; x < VGA_WIDTH; x++) {
+        terminal_buffer[(VGA_HEIGHT - 1) * VGA_WIDTH + x] = vga_entry(' ', terminal_color);
     }
 }
 
@@ -38,20 +52,49 @@ void terminal_putentryat(char c, uint8_t color, size_t x, size_t y) {
     terminal_buffer[index] = vga_entry(c, color);
 }
 
+void terminal_tab() {
+    size_t tab_offset = TAB - (terminal_column % TAB);
+    for (size_t i = terminal_column; i < tab_offset; i++) {
+        terminal_putchar(' ');
+    }
+}
+
+void terminal_newline() {
+    terminal_column = 0;
+    terminal_row++;
+}
+
 void terminal_putchar(char c) {
-	unsigned char uc = c;
-	terminal_putentryat(uc, terminal_color, terminal_column, terminal_row);
-	if (++terminal_column == VGA_WIDTH) {
-		terminal_column = 0;
-		if (++terminal_row == VGA_HEIGHT)
-			terminal_row = 0;
-	}
+    terminal_putentryat(c, terminal_color, terminal_column, terminal_row);
+    terminal_column++;
+
+    // Wrap text
+    if (terminal_column >= VGA_WIDTH) {
+        terminal_column = 0;
+        terminal_row++;
+    }
+
+    // Scroll
+    if (terminal_row >= VGA_HEIGHT) {
+        terminal_scroll();
+        terminal_row = VGA_HEIGHT - 1;
+    }
 }
 
 void terminal_write(const char* data, size_t size) {
     // Iterate through each char in the data
     for (size_t i = 0; i < size; i++) {
-        terminal_putchar(data[i]);
+        // Handle special chars
+        switch (data[i]) {
+            case '\n':
+                terminal_newline();
+                break;
+            case '\t':
+                terminal_tab();
+                break;
+            default:
+                terminal_putchar(data[i]);
+        }
     }
 }
 
