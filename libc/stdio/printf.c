@@ -15,6 +15,18 @@ static bool print(const char* data, size_t length) {
     return true;
 }
 
+static void print_hex_uint(unsigned int value) {
+    char buffer[8];
+    const char* hex = "0123456789ABCDEF";
+
+    for (int i = 7; i >= 0; i--) {
+        buffer[i] = hex[value & 0xF];
+        value >>= 4;
+    }
+
+    print(buffer, 8);
+}
+
 int printf(const char* restrict format, ...) {
     va_list params;
     va_start(params, format);
@@ -82,6 +94,17 @@ int printf(const char* restrict format, ...) {
                 }
 
                 written += len;
+            } else if (*format == 'x') {
+                format++;
+
+                unsigned int value = va_arg(params, unsigned int);
+
+                if (!maxrem) {
+                    return -1;
+                }
+
+                print_hex_uint(value);
+                written += 8;
             } else {
                 format = format_begun_at;
                 size_t len = strlen(format);
