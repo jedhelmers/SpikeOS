@@ -2,6 +2,7 @@
 
 #include <kernel/tty.h>
 #include <kernel/gdt.h>
+#include <kernel/idt.h>
 
 void kernel_main(void) {
     terminal_initialize();
@@ -17,4 +18,10 @@ void kernel_main(void) {
 
     printf("CS=%x DS=%x SS=%x\n", cs, ds, ss);
 
+    idt_init();
+
+    volatile int x = 1;
+    volatile int y = 0;
+    volatile int z = x / y;
+    (void)z;
 }
