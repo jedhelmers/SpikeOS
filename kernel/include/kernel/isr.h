@@ -1,9 +1,15 @@
 #ifndef _ISR_H
 #define _ISR_H
 
-#include <stdio.h>
 #include <stdint.h>
 
-void isr_handler(uint32_t int_no, uint32_t err_code);
+typedef struct regs {
+    uint32_t ds;
+    uint32_t edi, esi, edp, esp, ebx, edx, ecx, eax;
+    uint32_t int_no, err_code;
+    uint32_t eip, cs, eflags, useresp, ss;
+} regs_t;
+
+void isr_common_handler(regs_t* r);
 
 #endif

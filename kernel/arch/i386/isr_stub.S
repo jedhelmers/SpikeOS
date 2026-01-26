@@ -1,39 +1,81 @@
-.global isr0
+.extern isr_common_handler
 
-.extern isr_handler
-
-isr0:
+/* Exceptions WITHOUT error code */
+.macro ISR_NOERR n
+.global isr\n
+isr\n:
     cli
+    pushl $0            /* fake err_code */
+    pushl $\n           /* int_no */
+    jmp isr_common
+.endm
 
-    /* Save general register */
+/* Exceptions WITH error code */
+.macro ISR_ERR n
+.global isr\n
+isr\n:
+    cli
+    pushl $\n           /* int_no */
+    jmp isr_common
+.endm
+
+isr_common:
     pusha
 
-    /* Save segment registers */
     push %ds
     push %es
     push %fs
     push %gs
 
-    /* Load kernel data segment (0x10) */
     mov $0x10, %ax
     mov %ax, %ds
     mov %ax, %es
     mov %ax, %fs
     mov %ax, %gs
 
-    /* Switch to kernel data segment. My GDT uses 0x10 for data */
-    pushl $0            /* err_code = 0 */
-    pushl $0            /* int_no = 0 */
+    push %esp           /* pointer to regs_t */
+    call isr_common_handler
+    add $4, %esp
 
-    call isr_handler
-    add $8, %esp        /* pop int_no + err_code */
-
-    /* Restore segs + regs */
     pop %gs
     pop %fs
     pop %es
     pop %ds
     popa
 
-    sti
+    add $8, %esp        /* pop int_no + err_code */
     iret
+
+/* DEFINE INTERUPT MACROS */
+ISR_NOERR 0
+ISR_NOERR 1
+ISR_NOERR 2
+ISR_NOERR 3
+ISR_NOERR 4
+ISR_NOERR 5
+ISR_NOERR 6
+ISR_NOERR 7
+ISR_ERR   8
+ISR_NOERR 9
+ISR_ERR   10
+ISR_ERR   11
+ISR_ERR   12
+ISR_ERR   13
+ISR_ERR   14
+ISR_NOERR 15
+ISR_NOERR 16
+ISR_ERR   17
+ISR_NOERR 18
+ISR_NOERR 19
+ISR_NOERR 20
+ISR_NOERR 21
+ISR_NOERR 22
+ISR_NOERR 23
+ISR_NOERR 24
+ISR_NOERR 25
+ISR_NOERR 26
+ISR_NOERR 27
+ISR_NOERR 28
+ISR_NOERR 29
+ISR_NOERR 30
+ISR_NOERR 31

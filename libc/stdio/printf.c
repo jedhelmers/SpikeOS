@@ -27,6 +27,26 @@ static void print_hex_uint(unsigned int value) {
     print(buffer, 8);
 }
 
+static void print_uint(unsigned int value) {
+    char buffer[10]; // max 32-bit unsigned = 4294967295
+    int i = 0;
+
+    if (value == 0) {
+        putchar('0');
+        return;
+    }
+
+    while (value > 0) {
+        buffer[i++] = '0' + (value % 10);
+        value /= 10;
+    }
+
+    // digits are reversed
+    while (i--) {
+        putchar(buffer[i]);
+    }
+}
+
 int printf(const char* restrict format, ...) {
     va_list params;
     va_start(params, format);
@@ -82,10 +102,14 @@ int printf(const char* restrict format, ...) {
             } else if (*format == 's') {
                 format++;
                 const char* str = va_arg(params, const char*);
+
+                if (!str) {
+                    str = "(null)";
+                }
+
                 size_t len = strlen(str);
 
                 if (maxrem < len) {
-                    // TODO: Set errno to EOVERFLOW.
                     return -1;
                 }
 
@@ -105,6 +129,26 @@ int printf(const char* restrict format, ...) {
 
                 print_hex_uint(value);
                 written += 8;
+            } else if (*format == 'u') {
+                format++;
+
+                unsigned int value = va_arg(params, unsigned int);
+
+                if (!maxrem) {
+                    return -1;
+                }
+
+                print_uint(value);
+                // approximate written count
+                if (value == 0) {
+                    written += 1;
+                } else {
+                    unsigned int tmp = value;
+                    while (tmp) {
+                        written++;
+                        tmp /= 10;
+                    }
+                }
             } else {
                 format = format_begun_at;
                 size_t len = strlen(format);

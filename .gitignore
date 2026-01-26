@@ -1,3 +1,4 @@
 *.o
 *.iso
 myos
+.DS_Store
