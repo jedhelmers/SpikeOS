@@ -16,12 +16,12 @@ brew install \
 ```
 
 What each is for:
-    * i386-elf-gcc - Cross-compiler for building your kernel
-    * nasm - Assembler (x86 assembly)
-    * qemu - Emulator to run your OS
-    * grub - Bootloader
-    * xorriso - ISO creation tool
-    * mtools - FAT filesystem tools (used in some boot/ISO workflows)
+* i386-elf-gcc - Cross-compiler for building your kernel
+* nasm - Assembler (x86 assembly)
+* qemu - Emulator to run your OS
+* grub - Bootloader
+* xorriso - ISO creation tool
+* mtools - FAT filesystem tools (used in some boot/ISO workflows)
 
 ## Get it going
 Commands:
