@@ -1,11 +1,14 @@
 #include <kernel/idt.h>
 #include <kernel/isr.h>
 
+// I've read 256 interrupts exist, but I've also read there are a lot more.
 static struct idt_entry idt[256];
 static struct idt_ptr idtr;
 
 extern void idt_load(struct idt_ptr* idtr);
 
+// Links to ASM labels
+// These correlate to Interriupts
 extern void isr0(void);
 extern void isr1(void);
 extern void isr2(void);

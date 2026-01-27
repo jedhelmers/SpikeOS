@@ -27,8 +27,11 @@ void gdt_init(void) {
     gp.base = (uint32_t)&gdt;
 
     gdt_set_gate(0, 0, 0, 0, 0);
-    gdt_set_gate(1, 0, 0XFFFFFFFF, 0X9A, 0XCF); // 0X9A == 10011010 + 0XCF == 11001111
-    gdt_set_gate(2, 0, 0XFFFFFFFF, 0X92, 0XCF); // 0X92 == 10010010 + 0XCF == 11001111
+    gdt_set_gate(1, 0, 0XFFFFFFFF, 0X9A, 0XCF); // 0X9A == 10011010 + 0XCF == 11001111 <- Code Segment
+    gdt_set_gate(2, 0, 0XFFFFFFFF, 0X92, 0XCF); // 0X92 == 10010010 + 0XCF == 11001111 <- Data Secment
+    /*
+        I think i need a stack segment, too? Maybe not. Probably not.
+    */
 
     gdt_flush((uint32_t)&gp);
 }
