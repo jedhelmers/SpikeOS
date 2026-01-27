@@ -1,5 +1,5 @@
 # SpikeOS
-An x86 learning experiment in loving memory of my boy. 
+An x86 learning experiment in loving memory of my boy, Spike.
 
 ## Arch
 For this project I'm working through the wonderful work outlined via [wiki.osdev.org](wiki.osdev.org), PDFs from the [University of Winsconsin-Madison](https://pages.cs.wisc.edu/~remzi/OSTEP/#book-chapters), and the classic book, *OPERATING SYSTEMS - Design & Implementation* by Andrew S. Tanenbaum. **OsDev.org** largely focusses on x86 and the others are just incredibly good resources.
