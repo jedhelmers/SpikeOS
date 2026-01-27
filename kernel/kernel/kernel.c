@@ -20,8 +20,14 @@ void kernel_main(void) {
 
     idt_init();
 
-    volatile int x = 1;
-    volatile int y = 0;
-    volatile int z = x / y;
-    (void)z;
+    printf("\nINIT IDT\n");
+
+    // volatile int x = 1;
+    // volatile int y = 0;
+    // volatile int z = x / y; // EIP=002008F5 CS=00000008 EFLAGS=00010006
+    // (void)z;
+
+    // asm volatile ("ud2"); // EIP=002008DD CS=00000008 EFLAGS=00010046
+
+    // asm volatile("int $3"); // EIP=002008DE CS=00000008 EFLAGS=00000046
 }

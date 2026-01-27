@@ -5,8 +5,8 @@
 .global isr\n
 isr\n:
     cli
-    pushl $0            /* fake err_code */
     pushl $\n           /* int_no */
+    pushl $0            /* fake err_code */
     jmp isr_common
 .endm
 
@@ -15,17 +15,31 @@ isr\n:
 .global isr\n
 isr\n:
     cli
-    pushl $\n           /* int_no */
+    pushl $\n           /* int_no (CPU already pushed err_code) */
     jmp isr_common
 .endm
 
 isr_common:
     pusha
 
-    push %ds
-    push %es
-    push %fs
-    push %gs
+    /* push seg regs as 32-bit values */
+    xor %eax, %eax
+    mov %gs, %ax
+    pushl %eax
+
+    xor %eax, %eax
+    mov %fs, %ax
+    pushl %eax
+
+    xor %eax, %eax
+    mov %es, %ax
+    pushl %eax
+
+    xor %eax, %eax
+    mov %ds, %ax
+    pushl %eax
+
+
 
     mov $0x10, %ax
     mov %ax, %ds
@@ -33,14 +47,23 @@ isr_common:
     mov %ax, %fs
     mov %ax, %gs
 
-    push %esp           /* pointer to regs_t */
+    push %esp
     call isr_common_handler
     add $4, %esp
 
-    pop %gs
-    pop %fs
-    pop %es
-    pop %ds
+    /* restore seg regs */
+    popl %eax
+    mov %ax, %ds
+
+    popl %eax
+    mov %ax, %es
+
+    popl %eax
+    mov %ax, %fs
+    
+    popl %eax
+    mov %ax, %gs
+
     popa
 
     add $8, %esp        /* pop int_no + err_code */

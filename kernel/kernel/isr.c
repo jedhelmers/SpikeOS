@@ -37,9 +37,13 @@ static const char* exception_names[32] = {
 };
 
 void isr_common_handler(regs_t* r) {
-    printf("\n[EXCEPTION %u] %s\n", r->int_no, exception_names[r->int_no]);
+    if (r->int_no < 32) {
+        printf("\n[EXCEPTION %u] %s\n", r->int_no, exception_names[r->int_no]);
+    } else {
+        printf("\n[EXCEPTION %u]\n", r->int_no);
+    }
 
-    printf("EIP=%x CS=%x EFLAGS=%x\n", r->eip, r->cs, r->eflags);
+    printf("EIP=%x CS=%x EFLAGS=%x INT_NO=%x\n", r->eip, r->cs, r->eflags, r->int_no);
 
     for (;;) {
         __asm__ volatile ("cli; hlt");

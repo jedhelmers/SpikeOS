@@ -4,9 +4,9 @@
 #include <stdint.h>
 
 typedef struct regs {
-    uint32_t ds;
-    uint32_t edi, esi, edp, esp, ebx, edx, ecx, eax;
-    uint32_t int_no, err_code;
+    uint32_t ds, es, fs, gs;
+    uint32_t edi, esi, ebp, esp, ebx, edx, ecx, eax;
+    uint32_t err_code, int_no;
     uint32_t eip, cs, eflags, useresp, ss;
 } regs_t;
 
