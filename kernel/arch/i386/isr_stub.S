@@ -1,4 +1,5 @@
 .extern isr_common_handler
+.global isr_common
 
 /* Exceptions WITHOUT error code */
 .macro ISR_NOERR n
@@ -102,3 +103,4 @@ ISR_NOERR 28
 ISR_NOERR 29
 ISR_NOERR 30
 ISR_NOERR 31
+

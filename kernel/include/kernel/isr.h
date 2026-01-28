@@ -12,4 +12,8 @@ typedef struct regs {
 
 void isr_common_handler(regs_t* r);
 
+typedef void (*irq_handler_t)(regs_t*);
+void irq_install_handler(uint8_t irq, irq_handler_t h);
+void irq_uninstall_handler(uint8_t irq);
+
 #endif
