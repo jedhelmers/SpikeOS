@@ -1,4 +1,5 @@
 #include <kernel/isr.h>
+#include <kernel/pic.h>
 #include <stdio.h>
 
 static const char* exception_names[32] = {
@@ -36,16 +37,34 @@ static const char* exception_names[32] = {
     "Reserved"
 };
 
+static irq_handler_t irq_handlers[16] = {0};
+
+void irq_install_handler(uint8_t irq, irq_handler_t h) {
+    if (irq < 16) irq_handlers[irq] = h;
+}
+void irq_uninstall_handler(uint8_t irq) {
+    if (irq < 16) irq_handlers[irq] = 0;
+}
+
 void isr_common_handler(regs_t* r) {
+    printf("INT=%u ERR=%u\n", r->int_no, r->err_code);
+
+    // CPU exceptions
     if (r->int_no < 32) {
         printf("\n[EXCEPTION %u] %s\n", r->int_no, exception_names[r->int_no]);
-    } else {
-        printf("\n[EXCEPTION %u]\n", r->int_no);
+        printf("EIP=%x CS=%x EFLAGS=%x INT_NO=%x\n", r->eip, r->cs, r->eflags, r->int_no);
+        for (;;) __asm__ volatile ("cli; hlt");
     }
 
-    printf("EIP=%x CS=%x EFLAGS=%x INT_NO=%x\n", r->eip, r->cs, r->eflags, r->int_no);
+    // PIC IRQs (after remap)
+    if (r->int_no >= 32 && r->int_no <= 47) {
+        uint8_t irq = (uint8_t)(r->int_no - 32);
 
-    for (;;) {
-        __asm__ volatile ("cli; hlt");
+        if (irq_handlers[irq]) {
+            irq_handlers[irq](r);
+        }
+
+        pic_send_eoi(irq);
+        return;
     }
 }
