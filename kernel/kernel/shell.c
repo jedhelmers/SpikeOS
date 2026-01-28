@@ -2,7 +2,17 @@
 
 #include <stdio.h>
 
-void shell_readline(void) {}
+void shell_readline(void) {
+    char c = 0;
+
+    while (c != '\n') {
+        c = keyboard_getchar();
+
+        if (c) {
+            putchar(c);
+        }
+    }
+}
 
 void shell_execute(void) {}
 

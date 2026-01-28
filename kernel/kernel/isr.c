@@ -47,7 +47,10 @@ void irq_uninstall_handler(uint8_t irq) {
 }
 
 void isr_common_handler(regs_t* r) {
-    printf("INT=%u ERR=%u\n", r->int_no, r->err_code);
+    // if (r->int_no == 33) {
+    //     printf("IRQ1\n");
+    // }
+
 
     // CPU exceptions
     if (r->int_no < 32) {

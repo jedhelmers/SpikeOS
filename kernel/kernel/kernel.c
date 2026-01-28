@@ -41,13 +41,14 @@ void kernel_main(void) {
 
     printf("INIT TIMER\n");
     timer_init(100); // 100Hz
-    printf("INIT KEYBOARD\n");
-    keyboard_init();
-
     pic_clear_mask(0); // timer IRQ0
     printf("PIC: UNMASK 0\n");
+
+    printf("INIT KEYBOARD\n");
+    keyboard_init();
     pic_clear_mask(1); // keybaord IRQ1
     printf("PIC: UNMASK 1\n");
+
 
     __asm__ volatile ("sti");
 
@@ -66,6 +67,8 @@ void kernel_main(void) {
     /*
         Start Kernel Shell
     */
-//    shell_run();
-//    printf("INIT K-SHELL\n");
+   for (int i = 0; i < 1000000; i++) {}
+
+   shell_run();
+   printf("INIT K-SHELL\n");
 }
