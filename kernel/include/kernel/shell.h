@@ -2,6 +2,7 @@
 #define _SHELL_H
 
 #include <kernel/keyboard.h>
+#include <kernel/key_event.h>
 #include "string.h"
 
 void shell_run(void);

@@ -3,9 +3,10 @@
 
 #include <kernel/io.h>
 #include <kernel/isr.h>
+#include <kernel/key_event.h>
 #include <stdio.h>
 
 void keyboard_init(void);
-char keyboard_getchar(void);
+key_event_t keyboard_get_event(void);
 
 #endif

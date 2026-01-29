@@ -67,7 +67,6 @@ void kernel_main(void) {
     /*
         Start Kernel Shell
     */
-   for (int i = 0; i < 1000000; i++) {}
 
    shell_run();
    printf("INIT K-SHELL\n");

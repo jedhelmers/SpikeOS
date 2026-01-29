@@ -1,6 +1,7 @@
 #ifndef _KERNEL_TTY_H
 #define _KERNEL_TTY_H
 
+#include <kernel/io.h>
 #include <stddef.h>
 
 void terminal_initialize(void);

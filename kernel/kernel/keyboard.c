@@ -1,7 +1,11 @@
 #include <kernel/keyboard.h>
 
-static char key_buffer[128];
-static int key_index = 0;
+#define KBD_BUF_SIZE 128
+
+// Ring buffer
+static key_event_t kbd_buf[KBD_BUF_SIZE];
+static volatile uint8_t kbd_head = 0;
+static volatile uint8_t kbd_tail = 0;
 
 static const char scancode_to_ascii[128] = {
     0,  27, '1','2','3','4','5','6','7','8','9','0','-','=', '\b',
@@ -11,30 +15,60 @@ static const char scancode_to_ascii[128] = {
     0,   '*', 0,  ' '
 };
 
+static inline void kbd_push(key_event_t e) {
+    uint8_t next = (kbd_head + 1) % KBD_BUF_SIZE;
 
-char keyboard_getchar(void) {
-    if (!key_index) return 0;
+    if (next != kbd_tail) {
+        // drop if full
+        kbd_buf[kbd_head] = e;
+        kbd_head = next;
+    }
+}
 
-    char c = key_buffer[0];
+key_event_t keyboard_get_event(void) {
+    key_event_t o;
+    o.type = KEY_NONE;
 
-    for (int i = 0; i < key_index; i++) {
-        key_buffer[i - 1] = key_buffer[i];
+    if (kbd_head == kbd_tail) {
+        return o; // empty
     }
 
-    key_index--;
+    o = kbd_buf[kbd_tail];
+    kbd_tail = (kbd_tail + 1) % KBD_BUF_SIZE;
 
-    return c;
+    return o;
 }
 
 static void keyboard_irq(regs_t* r) {
     (void)r;
+
     uint8_t sc = inb(0x60);
 
-    if (!(sc & 0x80)) {
+    /* Ignore key releases */
+    if (sc & 0x80) {
+        return;
+    }
+
+    key_event_t e;
+    e.type = KEY_NONE;
+    e.ch = 0;
+
+    /* Backspace */
+    if (sc == 0x0E) {
+        e.type = KEY_BACKSPACE;
+    } else if (sc == 0x1C) {
+        e.type = KEY_ENTER;
+    } else if (sc < 128) {
         char c = scancode_to_ascii[sc];
-        if (c && key_index < 127) {
-            key_buffer[key_index++] = c;
+
+        if (c) {
+            e.type = KEY_CHAR;
+            e.ch = c;
         }
+    }
+
+    if (e.type != KEY_NONE) {
+        kbd_push(e);
     }
 }
 
