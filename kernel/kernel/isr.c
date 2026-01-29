@@ -51,7 +51,6 @@ void isr_common_handler(regs_t* r) {
     //     printf("IRQ1\n");
     // }
 
-
     // CPU exceptions
     if (r->int_no < 32) {
         printf("\n[EXCEPTION %u] %s\n", r->int_no, exception_names[r->int_no]);

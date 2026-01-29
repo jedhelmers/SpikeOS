@@ -19,12 +19,12 @@ void kernel_main(void) {
         by the pages.
     */
     gdt_init();
-    printf("INIT GDT\n");
+    printf("INIT Global Descriptor Table (GDT)\n");
 
     /*
         TESTING GDT
     */
-    printf("Testing GDT\n");
+    printf("Testing  GDT\n");
     uint16_t cs, ds, ss;
     asm volatile ("mov %%cs, %0" : "=r"(cs));
     asm volatile ("mov %%ds, %0" : "=r"(ds));
@@ -32,22 +32,24 @@ void kernel_main(void) {
     printf("CS=%x DS=%x SS=%x\n", cs, ds, ss);
 
     idt_init();
-    printf("INIT IDT\n");
+    printf("INIT Interrupt Descriptor Table (IDT)\n");
 
 
     // Remap PICs
-    printf("REMAP PIC\n");
+    printf("REMAP Programmable Interrupt Controller (PIC)\n");
+    printf("\tTo avoid catastrophic conflics with the CPU,\n");
+    printf("\tthe IRQs (Interrupt Requests) from the PIC must be remapped.\n");
     pic_remap(0x20, 0x28);
 
-    printf("INIT TIMER\n");
+    printf("INIT IRQ0 (Timer)\n");
     timer_init(100); // 100Hz
     pic_clear_mask(0); // timer IRQ0
-    printf("PIC: UNMASK 0\n");
+    printf("PIC: UNMASK Timer (enable hardware interrupt)\n");
 
-    printf("INIT KEYBOARD\n");
+    printf("INIT IRQ1 (Keyboard)\n");
     keyboard_init();
     pic_clear_mask(1); // keybaord IRQ1
-    printf("PIC: UNMASK 1\n");
+    printf("PIC: UNMASK Keyboard (enable hardware interrupt)\n");
 
 
     __asm__ volatile ("sti");

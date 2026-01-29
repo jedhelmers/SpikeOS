@@ -42,6 +42,10 @@ void terminal_initialize(void) {
     terminal_update_cursor();
 }
 
+void terminal_clear(void) {
+    terminal_initialize();
+}
+
 void terminal_scroll(void) {
     // Shift the terminal buffer index
     for (size_t y = 1; y < VGA_HEIGHT; y++) {

@@ -1,11 +1,17 @@
 #include <kernel/shell.h>
 #include <stdio.h>
 
+#include <kernel/tty.h>
+
 #define LINE_BUF_SIZE 128
 
 static char line_buf[LINE_BUF_SIZE];
 static int line_len = 0;
 
+void shell_clear(void) {
+    terminal_clear();
+    shell_init_prefix();
+}
 
 void shell_readline(void) {
     line_len = 0;
@@ -32,8 +38,10 @@ void shell_readline(void) {
                 line_len--;
 
                 printf("\b \b");
+
             }
 
+            // shell_clear();
             continue;
         }
 
@@ -49,11 +57,15 @@ void shell_execute(void) {
     // printf("cmd: %s\n", line_buf);
 }
 
+void shell_init_prefix(void) {
+    printf("jedhelmers> ");
+}
+
 void shell_run(void) {
-    printf("SpikeOS shell\n");
+    printf("\nbooting shell...\n\n");
 
     while (1) {
-        printf("jedhelmers > ");
+        shell_init_prefix();
         shell_readline();
         shell_execute();
     }
