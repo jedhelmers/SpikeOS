@@ -39,7 +39,7 @@ key_event_t keyboard_get_event(void) {
     return o;
 }
 
-static void keyboard_irq(regs_t* r) {
+static void keyboard_irq(trapframe* r) {
     (void)r;
 
     uint8_t sc = inb(0x60);

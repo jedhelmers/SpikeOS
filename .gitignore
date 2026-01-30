@@ -2,3 +2,5 @@
 *.iso
 myos
 .DS_Store
+sysroot/
+isodir/boot/

@@ -6,8 +6,8 @@
 irq\n:
     cli
     .set irqvec, 32 + \n    /* int_no */
-    pushl $irqvec
     pushl $0                /* fake err_code */
+    pushl $irqvec
     jmp isr_common
 .endm
 

@@ -6,8 +6,8 @@
 .global isr\n
 isr\n:
     cli
-    pushl $\n           /* int_no */
     pushl $0            /* fake err_code */
+    pushl $\n           /* int_no */
     jmp isr_common
 .endm
 
@@ -51,6 +51,11 @@ isr_common:
     push %esp
     call isr_common_handler
     add $4, %esp
+
+    test %eax, %eax
+    jz 1f
+    mov %eax, %esp /* switch to the next process's interrupt frame */
+1:
 
     /* restore seg regs */
     popl %eax
