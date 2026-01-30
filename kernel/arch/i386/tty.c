@@ -130,3 +130,11 @@ void terminal_write(const char* data, size_t size) {
 void terminal_writestring(const char* data) {
     terminal_write(data, strlen(data));
 }
+
+void terminal_setforeground(uint8_t fg) {
+    terminal_color = vga_entry_color((enum vga_color)fg, (terminal_color & VGA_BG_MASK) >> 4);
+}
+
+void terminal_setbackground(uint8_t bg) {
+    terminal_color = vga_entry_color((terminal_color & VGA_FG_MASK), (enum vga_color)bg);
+}
