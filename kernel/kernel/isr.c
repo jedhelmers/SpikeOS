@@ -1,5 +1,6 @@
 #include <kernel/isr.h>
 #include <kernel/pic.h>
+#include <kernel/scheduler.h>
 #include <stdio.h>
 
 static const char* exception_names[32] = {
@@ -37,6 +38,10 @@ static const char* exception_names[32] = {
     "Reserved"
 };
 
+// static void time_handler(trapframe *tf) {
+//     scheduler_tick(tf);
+// }
+
 static irq_handler_t irq_handlers[16] = {0};
 
 void irq_install_handler(uint8_t irq, irq_handler_t h) {
@@ -46,7 +51,7 @@ void irq_uninstall_handler(uint8_t irq) {
     if (irq < 16) irq_handlers[irq] = 0;
 }
 
-void isr_common_handler(regs_t* r) {
+void isr_common_handler(trapframe* r) {
     // if (r->int_no == 33) {
     //     printf("IRQ1\n");
     // }

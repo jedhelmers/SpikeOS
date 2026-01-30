@@ -3,10 +3,28 @@
 #include <kernel/tty.h>
 #include <kernel/gdt.h>
 #include <kernel/idt.h>
+#include <kernel/process.h>
+#include <kernel/scheduler.h>
 #include <kernel/pic.h>
 #include <kernel/timer.h>
 #include <kernel/keyboard.h>
 #include <kernel/shell.h>
+
+void thread_inc(void) {
+    for (;;) {
+        terminal_putchar('+');
+
+        for (volatile int i = 0; i < 1000000; i++);
+    }
+}
+
+void thread_dec(void) {
+    for (;;) {
+        terminal_putchar('-');
+
+        for (volatile int i = 0; i < 1000000; i++);
+    }
+}
 
 void kernel_main(void) {
     terminal_initialize();
@@ -46,13 +64,17 @@ void kernel_main(void) {
     pic_clear_mask(0); // timer IRQ0
     printf("PIC: UNMASK Timer (enable hardware interrupt)\n");
 
+
+    printf("INIT Process\n");
+    process_init();
+
+    printf("INIT Scheduler\n");
+    scheduler_init();
+
     printf("INIT IRQ1 (Keyboard)\n");
     keyboard_init();
     pic_clear_mask(1); // keybaord IRQ1
     printf("PIC: UNMASK Keyboard (enable hardware interrupt)\n");
-
-
-    __asm__ volatile ("sti");
 
     /*
         TESTING INTERRUPTS
@@ -70,6 +92,13 @@ void kernel_main(void) {
         Start Kernel Shell
     */
 
-   shell_run();
-   printf("INIT K-SHELL\n");
+
+    proc_create_kernel_thread(thread_inc);
+    proc_create_kernel_thread(thread_dec);
+
+
+    // shell_run();
+    // printf("INIT K-SHELL\n");
+
+    asm volatile ("sti");
 }

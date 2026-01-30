@@ -6,8 +6,8 @@
 .global isr\n
 isr\n:
     cli
-    pushl $\n           /* int_no */
     pushl $0            /* fake err_code */
+    pushl $\n           /* int_no */
     jmp isr_common
 .endm
 

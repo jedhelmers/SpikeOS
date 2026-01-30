@@ -1,11 +1,19 @@
 #include <kernel/timer.h>
+#include <kernel/scheduler.h>
+#include <kernel/tty.h>
 
 
 static volatile uint32_t g_ticks = 0;
 
-static void timer_irq(regs_t* r) {
+static void timer_irq(trapframe* r) {
     (void)r;
     g_ticks++;
+
+    //     terminal_writestring("tick\n");
+    // if ((g_ticks % 100) == 0) {
+    // }
+
+    scheduler_tick(r);
 }
 
 uint32_t timer_ticks(void) {
