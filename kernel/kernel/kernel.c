@@ -22,7 +22,7 @@ void thread_mid(void) {
     for (;;) {
         terminal_putchar('=');
 
-        for (volatile int i = 0; i < 10000000; i++);
+        for (volatile int i = 0; i < 1000000; i++);
     }
 }
 
@@ -30,7 +30,7 @@ void thread_dec(void) {
     for (;;) {
         terminal_putchar('-');
 
-        for (volatile int i = 0; i < 2000000; i++);
+        for (volatile int i = 0; i < 1000000; i++);
     }
 }
 
@@ -104,6 +104,7 @@ void kernel_main(void) {
     proc_create_kernel_thread(thread_inc);
     proc_create_kernel_thread(thread_mid);
     proc_create_kernel_thread(thread_dec);
+    proc_create_kernel_thread(shell_run);
 
 
     // shell_run();
