@@ -2,3 +2,4 @@
 *.iso
 myos
 .DS_Store
+sysroot/

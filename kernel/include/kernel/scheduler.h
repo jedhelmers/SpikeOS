@@ -1,10 +1,12 @@
 #ifndef _SCHEDULER_H
 #define _SCHEDULER_H
 
+#include <stdint.h>
+
 struct trapframe;   // forward declaration
 
 void scheduler_init(void);
 
-void scheduler_tick(struct trapframe *tf);
+uint32_t scheduler_tick(struct trapframe *tf);
 
 #endif

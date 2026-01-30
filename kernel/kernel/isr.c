@@ -51,7 +51,7 @@ void irq_uninstall_handler(uint8_t irq) {
     if (irq < 16) irq_handlers[irq] = 0;
 }
 
-void isr_common_handler(trapframe* r) {
+uint32_t isr_common_handler(trapframe* r) {
     // if (r->int_no == 33) {
     //     printf("IRQ1\n");
     // }
@@ -72,6 +72,13 @@ void isr_common_handler(trapframe* r) {
         }
 
         pic_send_eoi(irq);
-        return;
+
+        // if this was IRQ0, ask schedule whether to switch stacks
+        if (irq == 0) {
+            return scheduler_tick(r); // return new ESP (or 0)
+        }
+        return 0;
     }
+
+    return 0;
 }

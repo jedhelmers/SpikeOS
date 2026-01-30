@@ -49,6 +49,7 @@ struct process *proc_create_kernel_thread(void (*entry)(void)) {
             struct process *p = &proc_table[i];
 
             p->pid = next_pid++;
+            p->state = PROC_READY;
             p->mm = NULL;
 
             // Assign a real kernel stack for this process

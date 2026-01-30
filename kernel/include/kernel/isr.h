@@ -22,7 +22,7 @@ typedef struct trapframe {
     uint32_t eip, cs, eflags, useresp, ss;
 } trapframe;
 
-void isr_common_handler(trapframe* r);
+uint32_t isr_common_handler(trapframe* r);
 
 typedef void (*irq_handler_t)(trapframe*);
 void irq_install_handler(uint8_t irq, irq_handler_t h);

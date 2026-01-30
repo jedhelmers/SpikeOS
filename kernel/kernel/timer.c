@@ -13,7 +13,7 @@ static void timer_irq(trapframe* r) {
     // if ((g_ticks % 100) == 0) {
     // }
 
-    scheduler_tick(r);
+    // scheduler_tick(r);
 }
 
 uint32_t timer_ticks(void) {
