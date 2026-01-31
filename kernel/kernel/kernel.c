@@ -15,7 +15,7 @@ void thread_inc(void) {
     int idx = 0;
     for (;;) {
         idx++;
-        terminal_setforeground((idx % 15) + 1);
+        // terminal_setforeground((idx % 15) + 1);
         terminal_putchar('+');
 
         for (volatile int i = 0; i < 1000000; i++);
@@ -26,7 +26,7 @@ void thread_mid(void) {
     int idx = 1;
     for (;;) {
         idx++;
-        terminal_setbackground((idx % 15) + 1);
+        // terminal_setbackground((idx % 15) + 1);
         terminal_putchar('=');
 
         for (volatile int i = 0; i < 1000000; i++);
