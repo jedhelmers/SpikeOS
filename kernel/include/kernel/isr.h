@@ -27,5 +27,6 @@ uint32_t isr_common_handler(trapframe* r);
 typedef void (*irq_handler_t)(trapframe*);
 void irq_install_handler(uint8_t irq, irq_handler_t h);
 void irq_uninstall_handler(uint8_t irq);
+void uart_irq_handler(trapframe* tf);
 
 #endif

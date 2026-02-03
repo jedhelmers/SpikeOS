@@ -2,4 +2,6 @@
 set -e
 . ./iso.sh
 
-qemu-system-$(./target-triplet-to-arch.sh $HOST) -cdrom myos.iso
+# -serial pty allows for PTY psuedo-terminal
+# This is required when developing UART interrupts
+qemu-system-$(./target-triplet-to-arch.sh $HOST) -cdrom myos.iso -serial pty

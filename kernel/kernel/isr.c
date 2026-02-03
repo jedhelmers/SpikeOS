@@ -1,6 +1,10 @@
+/*
+    Interrupt Service Routine (ISR)
+*/
 #include <kernel/isr.h>
 #include <kernel/pic.h>
 #include <kernel/scheduler.h>
+#include <kernel/uart.h>
 #include <stdio.h>
 
 static const char* exception_names[32] = {
@@ -49,6 +53,15 @@ void irq_install_handler(uint8_t irq, irq_handler_t h) {
 }
 void irq_uninstall_handler(uint8_t irq) {
     if (irq < 16) irq_handlers[irq] = 0;
+}
+
+void uart_irq_handler(trapframe* tf) {
+    uint8_t b = uart_read();
+
+    // For now: debug print
+    printf("\n[UART] RX = 0x%x ('%c')\n", b, (b >= 32 && b < 127) ? b : '.');
+
+    // Later: enqueue event, signal neural engine, panic, etc.
 }
 
 uint32_t isr_common_handler(trapframe* r) {

@@ -3,6 +3,8 @@
 #include <kernel/tty.h>
 #include <kernel/gdt.h>
 #include <kernel/idt.h>
+#include <kernel/uart.h>
+#include <kernel/isr.h>
 #include <kernel/process.h>
 #include <kernel/scheduler.h>
 #include <kernel/pic.h>
@@ -91,6 +93,13 @@ void kernel_main(void) {
     pic_clear_mask(1); // keybaord IRQ1
     printf("PIC: UNMASK Keyboard (enable hardware interrupt)\n");
 
+    printf("INIT UART (COM1)\n");
+    uart_init();
+    irq_install_handler(4, uart_irq_handler);
+    pic_clear_mask(4);   // UNMASK IRQ4 (COM1)
+    printf("PIC: UNMASK UART (IRQ4)\n");
+
+
     /*
         TESTING INTERRUPTS
     */
@@ -108,9 +117,9 @@ void kernel_main(void) {
     */
 
 
-    // proc_create_kernel_thread(thread_inc);
-    // proc_create_kernel_thread(thread_mid);
-    // proc_create_kernel_thread(thread_dec);
+    proc_create_kernel_thread(thread_inc);
+    proc_create_kernel_thread(thread_mid);
+    proc_create_kernel_thread(thread_dec);
     proc_create_kernel_thread(shell_run);
 
 
