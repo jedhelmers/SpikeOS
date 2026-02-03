@@ -108,9 +108,9 @@ void kernel_main(void) {
     */
 
 
-    proc_create_kernel_thread(thread_inc);
-    proc_create_kernel_thread(thread_mid);
-    proc_create_kernel_thread(thread_dec);
+    // proc_create_kernel_thread(thread_inc);
+    // proc_create_kernel_thread(thread_mid);
+    // proc_create_kernel_thread(thread_dec);
     proc_create_kernel_thread(shell_run);
 
 
