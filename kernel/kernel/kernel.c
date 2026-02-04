@@ -11,6 +11,7 @@
 #include <kernel/timer.h>
 #include <kernel/keyboard.h>
 #include <kernel/shell.h>
+#include <kernel/nn.h>
 
 
 void thread_inc(void) {
@@ -116,11 +117,12 @@ void kernel_main(void) {
         Start Kernel Shell
     */
 
-
-    proc_create_kernel_thread(thread_inc);
-    proc_create_kernel_thread(thread_mid);
-    proc_create_kernel_thread(thread_dec);
-    proc_create_kernel_thread(shell_run);
+    nn_load_embedded();
+    nn_dump_bytes(128);
+    // proc_create_kernel_thread(thread_inc);
+    // proc_create_kernel_thread(thread_mid);
+    // proc_create_kernel_thread(thread_dec);
+    // proc_create_kernel_thread(shell_run);
 
 
     // shell_run();

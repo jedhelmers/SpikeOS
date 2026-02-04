@@ -31,7 +31,7 @@ CPPFLAGS:=$(CPPFLAGS) $(KERNEL_ARCH_CPPFLAGS)
 LDFLAGS:=$(LDFLAGS) $(KERNEL_ARCH_LDFLAGS)
 LIBS:=$(LIBS) -nostdlib -L../sysroot/usr/lib -lk -lgcc
 
-KERNEL_OBJS := $(KERNEL_ARCH_OBJS) kernel/kernel.o
+KERNEL_OBJS := $(KERNEL_ARCH_OBJS) kernel/kernel.o kernel/nn_blob.o
 
 OBJS := $(ARCHDIR)/crti.o $(ARCHDIR)/crtbegin.o $(KERNEL_OBJS) $(ARCHDIR)/crtend.o $(ARCHDIR)/crtn.o
 
