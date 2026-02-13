@@ -2,6 +2,7 @@
 
 #include <kernel/tty.h>
 #include <kernel/gdt.h>
+#include <kernel/paging.h>
 #include <kernel/idt.h>
 #include <kernel/uart.h>
 #include <kernel/isr.h>
@@ -12,6 +13,9 @@
 #include <kernel/keyboard.h>
 #include <kernel/shell.h>
 
+extern void kprint_howdy(void);
+extern void paging_enable(uint32_t);
+extern uint32_t endkernel;
 
 void thread_inc(void) {
     int idx = 0;
@@ -69,6 +73,15 @@ void kernel_main(void) {
     idt_init();
     printf("INIT Interrupt Descriptor Table (IDT)\n");
 
+    printf("INIT Paging\n");
+    paging_init();
+    printf("ENABLE Paging\n");
+    paging_enable((uint32_t)page_directory);
+
+    uint32_t cr0;
+    asm volatile("mov %%cr0, %0" : "=r"(cr0));
+    printf("CR0 = %x\n", cr0);
+
 
     // Remap PICs
     printf("REMAP Programmable Interrupt Controller (PIC)\n");
@@ -116,12 +129,12 @@ void kernel_main(void) {
         Start Kernel Shell
     */
 
-
-    proc_create_kernel_thread(thread_inc);
-    proc_create_kernel_thread(thread_mid);
-    proc_create_kernel_thread(thread_dec);
+    // proc_create_kernel_thread(thread_inc);
+    // proc_create_kernel_thread(thread_mid);
+    // proc_create_kernel_thread(thread_dec);
     proc_create_kernel_thread(shell_run);
 
+    kprint_howdy();
 
     // shell_run();
     // printf("INIT K-SHELL\n");
