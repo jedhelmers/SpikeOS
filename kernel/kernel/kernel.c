@@ -2,6 +2,7 @@
 
 #include <kernel/tty.h>
 #include <kernel/gdt.h>
+#include <kernel/paging.h>
 #include <kernel/idt.h>
 #include <kernel/uart.h>
 #include <kernel/isr.h>
@@ -12,20 +13,29 @@
 #include <kernel/keyboard.h>
 #include <kernel/shell.h>
 
+extern void kprint_howdy(void);
+extern void paging_enable(uint32_t);
+extern uint32_t endkernel;
 
 void thread_inc(void) {
-    int idx = 0;
-    for (;;) {
-        idx++;
-        // terminal_setforeground((idx % 15) + 1);
-        terminal_putchar('+');
+    int idx = 42;
 
+    uint32_t virt = (uint32_t)&idx;
+    uint32_t phys = virt_to_phys(virt);
+
+    printf("\nThread_inc:\n");
+    printf("Virtual:  %x\n", virt);
+    printf("Physical: %x\n", phys);
+
+    for (;;) {
+        terminal_putchar('+');
         for (volatile int i = 0; i < 1000000; i++);
     }
 }
 
 void thread_mid(void) {
     int idx = 1;
+    
     for (;;) {
         idx++;
         // terminal_setbackground((idx % 15) + 1);
@@ -68,6 +78,15 @@ void kernel_main(void) {
 
     idt_init();
     printf("INIT Interrupt Descriptor Table (IDT)\n");
+
+    printf("INIT Paging\n");
+    paging_init();
+    printf("ENABLE Paging\n");
+    paging_enable((uint32_t)page_directory);
+
+    uint32_t cr0;
+    asm volatile("mov %%cr0, %0" : "=r"(cr0));
+    printf("CR0 = %x\n", cr0);
 
 
     // Remap PICs
@@ -116,12 +135,18 @@ void kernel_main(void) {
         Start Kernel Shell
     */
 
+    // proc_create_kernel_thread(thread_inc);
+    uint32_t virt = 0x0060cc24;
+    uint32_t phys = virt_to_phys(virt);
 
-    proc_create_kernel_thread(thread_inc);
-    proc_create_kernel_thread(thread_mid);
-    proc_create_kernel_thread(thread_dec);
+    printf("Alias Virtual:  %x\n", virt);
+    printf("Alias Physical: %x\n", phys);
+
+    // proc_create_kernel_thread(thread_mid);
+    // proc_create_kernel_thread(thread_dec);
     proc_create_kernel_thread(shell_run);
 
+    kprint_howdy();
 
     // shell_run();
     // printf("INIT K-SHELL\n");
