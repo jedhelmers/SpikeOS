@@ -18,18 +18,24 @@ extern void paging_enable(uint32_t);
 extern uint32_t endkernel;
 
 void thread_inc(void) {
-    int idx = 0;
-    for (;;) {
-        idx++;
-        // terminal_setforeground((idx % 15) + 1);
-        terminal_putchar('+');
+    int idx = 42;
 
+    uint32_t virt = (uint32_t)&idx;
+    uint32_t phys = virt_to_phys(virt);
+
+    printf("\nThread_inc:\n");
+    printf("Virtual:  %x\n", virt);
+    printf("Physical: %x\n", phys);
+
+    for (;;) {
+        terminal_putchar('+');
         for (volatile int i = 0; i < 1000000; i++);
     }
 }
 
 void thread_mid(void) {
     int idx = 1;
+    
     for (;;) {
         idx++;
         // terminal_setbackground((idx % 15) + 1);
@@ -130,6 +136,12 @@ void kernel_main(void) {
     */
 
     // proc_create_kernel_thread(thread_inc);
+    uint32_t virt = 0x0060cc24;
+    uint32_t phys = virt_to_phys(virt);
+
+    printf("Alias Virtual:  %x\n", virt);
+    printf("Alias Physical: %x\n", phys);
+
     // proc_create_kernel_thread(thread_mid);
     // proc_create_kernel_thread(thread_dec);
     proc_create_kernel_thread(shell_run);

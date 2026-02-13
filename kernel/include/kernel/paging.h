@@ -2,6 +2,7 @@
 #define PAGING_H
 
 #include <stdint.h>
+#include <stdio.h>
 
 /*
     31                      12 11            0
@@ -46,5 +47,7 @@ void paging_init(void);
     Enables paging (implemented in paging_enable.S)
 */
 void paging_enable(uint32_t page_directory_address);
+
+uint32_t virt_to_phys(uint32_t virt);
 
 #endif
