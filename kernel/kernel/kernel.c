@@ -18,14 +18,14 @@ extern void paging_enable(uint32_t);
 extern uint32_t endkernel;
 
 void thread_inc(void) {
-    int idx = 42;
+    // int idx = 42;
 
-    uint32_t virt = (uint32_t)&idx;
-    uint32_t phys = virt_to_phys(virt);
+    // uint32_t virt = (uint32_t)&idx;
+    // uint32_t phys = virt_to_phys(virt);
 
-    printf("\nThread_inc:\n");
-    printf("Virtual:  %x\n", virt);
-    printf("Physical: %x\n", phys);
+    // printf("\nThread_inc:\n");
+    // printf("Virtual:  %x\n", virt);
+    // printf("Physical: %x\n", phys);
 
     for (;;) {
         terminal_putchar('+');
@@ -82,7 +82,9 @@ void kernel_main(void) {
     printf("INIT Paging\n");
     paging_init();
     printf("ENABLE Paging\n");
-    paging_enable((uint32_t)page_directory);
+    // CR3 requires a physical address; page_directory lives in the higher half,
+    // so subtract KERNEL_VMA_OFFSET to convert VMA → physical.
+    paging_enable((uint32_t)page_directory - KERNEL_VMA_OFFSET);
 
     uint32_t cr0;
     asm volatile("mov %%cr0, %0" : "=r"(cr0));
@@ -118,7 +120,6 @@ void kernel_main(void) {
     pic_clear_mask(4);   // UNMASK IRQ4 (COM1)
     printf("PIC: UNMASK UART (IRQ4)\n");
 
-
     /*
         TESTING INTERRUPTS
     */
@@ -135,16 +136,19 @@ void kernel_main(void) {
         Start Kernel Shell
     */
 
-    // proc_create_kernel_thread(thread_inc);
-    uint32_t virt = 0x0060cc24;
-    uint32_t phys = virt_to_phys(virt);
+    // uint32_t virt = 0x0060cc24;
+    // uint32_t phys = virt_to_phys(virt);
 
-    printf("Alias Virtual:  %x\n", virt);
-    printf("Alias Physical: %x\n", phys);
+    // printf("Alias Virtual:  %x\n", virt);
+    // printf("Alias Physical: %x\n", phys);
 
+    printf("Kernel end: %x\n", (uint32_t)&endkernel); // THIS PRINTS: 0022F800
+
+    proc_create_kernel_thread(thread_inc); // THIS CAUSES A PAGE FAULT
     // proc_create_kernel_thread(thread_mid);
     // proc_create_kernel_thread(thread_dec);
     proc_create_kernel_thread(shell_run);
+    
 
     kprint_howdy();
 
