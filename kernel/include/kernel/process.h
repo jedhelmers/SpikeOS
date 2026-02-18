@@ -40,5 +40,6 @@ struct process *process_ge_table(void);
 void process_init(void);
 
 struct process *proc_create_kernel_thread(void (*entry)(void));
+void proc_kill(uint32_t pid);
 
 #endif

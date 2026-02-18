@@ -44,6 +44,17 @@ struct process *process_ge_table(void) {
     return proc_table;
 }
 
+void proc_kill(uint32_t pid) {
+    for (int i = 1; i < MAX_PROCS; i++) {
+        if (proc_table[i].pid == pid && proc_table[i].state != PROC_ZOMBIE) {
+            proc_table[i].state = PROC_ZOMBIE;
+            printf("[proc] killed PID %d\n", pid);
+            return;
+        }
+    }
+    printf("[proc] PID %d not found\n", pid);
+}
+
 struct process *proc_create_kernel_thread(void (*entry)(void)) {
     for (int i = 1; i < MAX_PROCS; i++) {
         if (proc_table[i].state == PROC_ZOMBIE) {
