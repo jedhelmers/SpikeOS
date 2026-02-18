@@ -1,5 +1,6 @@
 #include <kernel/shell.h>
 #include <kernel/process.h>
+#include <kernel/tetris.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -72,11 +73,15 @@ void shell_execute(void) {
 
     if (strcmp(line_buf, "help") == 0) {
         printf("Commands:\n");
-        printf("  help       - show this help\n");
-        printf("  run        - start thread_inc\n");
-        printf("  ps         - list processes\n");
-        printf("  kill <pid> - kill process by PID\n");
-        printf("  clear      - clear screen\n");
+        printf("  help         - show this help\n");
+        printf("  run          - start thread_inc\n");
+        printf("  run tetris   - play Tetris (WASD=move, Space=drop, Q=quit)\n");
+        printf("  ps           - list processes\n");
+        printf("  kill <pid>   - kill process by PID\n");
+        printf("  clear        - clear screen\n");
+    }
+    else if (strcmp(line_buf, "run tetris") == 0) {
+        tetris_run();
     }
     else if (strcmp(line_buf, "run") == 0) {
         struct process *p = proc_create_kernel_thread(thread_inc);

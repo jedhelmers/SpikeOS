@@ -8,6 +8,7 @@ static volatile uint8_t kbd_head = 0;
 static volatile uint8_t kbd_tail = 0;
 
 static int ctrl_held = 0;
+static int extended  = 0;  /* set when 0xE0 prefix received */
 
 static const char scancode_to_ascii[128] = {
     0,  27, '1','2','3','4','5','6','7','8','9','0','-','=', '\b',
@@ -46,29 +47,47 @@ static void keyboard_irq(trapframe* r) {
 
     uint8_t sc = inb(0x60);
 
-    /* Ctrl release (0x9D = 0x1D | 0x80) — handle before generic release filter */
+    /* Extended scancode prefix — next byte is the real scancode */
+    if (sc == 0xE0) {
+        extended = 1;
+        return;
+    }
+
+    /* Ctrl release: 0x9D (left) or extended+0x1D (right) */
     if (sc == 0x9D) {
         ctrl_held = 0;
+        extended  = 0;
         return;
     }
 
-    /* Ignore other key releases */
+    /* All other key releases — clear extended flag and ignore */
     if (sc & 0x80) {
+        extended = 0;
         return;
     }
 
-    /* Ctrl press */
+    /* Ctrl press (left = 0x1D, right = extended+0x1D) */
     if (sc == 0x1D) {
         ctrl_held = 1;
+        extended  = 0;
         return;
     }
 
     key_event_t e;
     e.type = KEY_NONE;
-    e.ch = 0;
+    e.ch   = 0;
 
-    /* Ctrl+C (scancode 0x2E = 'c') */
-    if (ctrl_held && sc == 0x2E) {
+    if (extended) {
+        /* Arrow keys (E0-prefixed) */
+        switch (sc) {
+            case 0x48: e.type = KEY_UP;    break;
+            case 0x50: e.type = KEY_DOWN;  break;
+            case 0x4B: e.type = KEY_LEFT;  break;
+            case 0x4D: e.type = KEY_RIGHT; break;
+        }
+        extended = 0;
+    } else if (ctrl_held && sc == 0x2E) {
+        /* Ctrl+C (scancode 0x2E = 'c') */
         e.type = KEY_CTRL_C;
     } else if (sc == 0x0E) {
         /* Backspace */
@@ -77,10 +96,9 @@ static void keyboard_irq(trapframe* r) {
         e.type = KEY_ENTER;
     } else if (sc < 128) {
         char c = scancode_to_ascii[sc];
-
         if (c) {
             e.type = KEY_CHAR;
-            e.ch = c;
+            e.ch   = c;
         }
     }
 

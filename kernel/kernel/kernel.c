@@ -144,8 +144,8 @@ void kernel_main(void) {
 
     printf("Kernel end: %x\n", (uint32_t)&endkernel); // THIS PRINTS: 0022F800
 
-    proc_create_kernel_thread(thread_mid);
-    proc_create_kernel_thread(thread_inc);
+    // proc_create_kernel_thread(thread_inc);
+    // proc_create_kernel_thread(thread_mid);
     // proc_create_kernel_thread(thread_dec);
     proc_create_kernel_thread(shell_run);
     
