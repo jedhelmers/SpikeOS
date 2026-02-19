@@ -54,6 +54,13 @@ void paging_init() {
     page_directory[0]                = fpt_phys | PAGE_PRESENT | PAGE_WRITABLE;
     page_directory[KERNEL_PDE_INDEX] = fpt_phys | PAGE_PRESENT | PAGE_WRITABLE;
 
+    // Pre-allocate PDE[769] for the kernel heap region (0xC0400000–0xC07FFFFF).
+    // Using the statically-allocated second_page_table avoids the map_page()
+    // new-table-allocation path, which has issues with physical vs virtual addresses.
+    memset(second_page_table, 0, sizeof(second_page_table));
+    uint32_t spt_phys = (uint32_t)second_page_table - KERNEL_VMA_OFFSET;
+    page_directory[769] = spt_phys | PAGE_PRESENT | PAGE_WRITABLE;
+
     // Optional: map page dir itself recursively (helps later for dynamic mapping)
     // page_directory[1023] = (uint32_t)page_directory | PAGE_PRESENT | PAGE_WRITABLE;
 }
@@ -88,7 +95,7 @@ void set_frame(uint32_t frame) {
 }
 
 void clear_frame(uint32_t frame) {
-    frame_bitmap[frame / 32] &= (1 << (frame % 32));
+    frame_bitmap[frame / 32] &= ~(1 << (frame % 32));
 }
 
 int test_frame(uint32_t frame) {
@@ -111,7 +118,7 @@ void map_page(uint32_t virt, uint32_t phys, uint32_t flags) {
     uint32_t pd_index = virt >> 22;
     uint32_t pt_index = (virt >> 12) & 0x3FF;
 
-    if (!page_directory[pd_index] & PAGE_PRESENT) {
+    if (!(page_directory[pd_index] & PAGE_PRESENT)) {
         uint32_t new_table = alloc_frame();
         page_directory[pd_index] = new_table | PAGE_PRESENT | PAGE_WRITABLE;
 

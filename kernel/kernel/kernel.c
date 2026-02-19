@@ -12,6 +12,7 @@
 #include <kernel/timer.h>
 #include <kernel/keyboard.h>
 #include <kernel/shell.h>
+#include <kernel/heap.h>
 
 extern void kprint_howdy(void);
 extern void paging_enable(uint32_t);
@@ -90,6 +91,8 @@ void kernel_main(void) {
     asm volatile("mov %%cr0, %0" : "=r"(cr0));
     printf("CR0 = %x\n", cr0);
 
+    heap_init();
+    printf("INIT Kernel Heap\n");
 
     // Remap PICs
     printf("REMAP Programmable Interrupt Controller (PIC)\n");
