@@ -1,64 +1,118 @@
-/* Declare constants for the multiboot header. */
-.set ALIGN,     1<<0                /* align loaded modules on page boundaries */
-.set MEMINFO,   1<<1                /* provide memory map */
-.set FLAGS,     ALIGN | MEMINFO     /* this is the multiboot flag field */
-.set MAGIC,     0x1BADB002          /* magic number lets bootloader find the header */
-.set CHECKSUM,  -(MAGIC + FLAGS)    /* checksum of above, to prove we are multiboot */
+/* Multiboot header constants */
+.set ALIGN,    1<<0
+.set MEMINFO,  1<<1
+.set FLAGS,    ALIGN | MEMINFO
+.set MAGIC,    0x1BADB002
+.set CHECKSUM, -(MAGIC + FLAGS)
 
 /*
-    Declare a multiboot header that marks the program as a kernel. These are magic values
-    that are documented in the multiboot standard. The bootloader will search for these
-    signatures in the first 8KiB of the kernel file, aligned at a 32-bit boundary. The
-    signature is in its own section so the header can be forced to be within the first
-    8KiB of the kernel file.
+    Multiboot header – must be in the first 8 KiB of the file.
+    Placed in its own section so the linker script can force it first.
 */
-.section .multiboot
+.section .multiboot,"a",@progbits
 .align 4
 .long MAGIC
 .long FLAGS
 .long CHECKSUM
 
 /*
-    The multibook standard does not define the value of the stack pointer register (esp)
-    and it is up to the kernel to provide a stack. This allocates room for a small stack by
-    creating a symbol at the top. The stack grows downwards on x86. The stack is in its
-    own section so it can be marked nobits, which means the kernel file is smaller because
-    it does not contain an uninitialized stack. The stack on x86 must be 16-byte aligned
-    according to the System V ABI standard and de-factor extensions. The compiler will
-    assume the stack is properly aligned and failure to align the stack will result in
-    undefined behavior.
+    Bootstrap data: boot-time page directory, page table, and stack.
+    These live at low physical addresses (VMA == LMA in .bootdata).
+    We reference them by their link address, which IS their physical address.
 */
-.section .bss
+.section .boot.bss, "aw", @nobits
+
+.align 4096
+boot_page_dir:
+    .skip 4096          /* 1024 × 4-byte PDEs */
+
+.align 4096
+boot_page_table0:
+    .skip 4096          /* 1024 × 4-byte PTEs – covers first 4 MiB */
+
 .align 16
-stack_bottom:
-    .skip 16384 # 16KiB
-stack_top:
+boot_stack_bottom:
+    .skip 16384         /* 16 KiB kernel stack */
+boot_stack_top:
 
 /*
-    The linker script specifies _start as the entry point to the kernel and the bootloader
-    will jump to this position once the kernel has been loaded. It doesn't make sense to
-    return from this function as the bootloader is gone alread.
-*/
+    _start: entry point called by GRUB.
+    Runs with paging OFF at a low physical address.
 
-.section .text
+    Responsibilities:
+      1. Set up a temporary page directory that maps the first 4 MiB both
+         identity (PDE[0]) and at 0xC0000000 (PDE[768]), so the kernel can
+         keep running through the CR0.PG flip and the jump to the higher half.
+      2. Enable paging.
+      3. Long-jump into the higher-half virtual address of _higher_half_start.
+*/
+.section .boot.text, "ax"
 .global _start
 .type _start, @function
 _start:
-    movl $stack_top, %esp
+    /* Use the physical (boot) stack while paging is off */
+    movl $boot_stack_top, %esp
 
-    # Call the global constructors.
+    /* ------------------------------------------------------------------
+       Fill boot_page_table0: map frame i → virtual page i (first 4 MiB)
+       Entry format: (frame_addr) | PRESENT(1) | WRITABLE(2)
+    ------------------------------------------------------------------ */
+    movl $0, %ecx
+.Lfill_pt:
+    movl %ecx, %eax
+    shll $12, %eax          /* physical address = frame * 4096 */
+    orl  $3,  %eax          /* PRESENT | WRITABLE */
+    movl %eax, boot_page_table0(, %ecx, 4)
+    addl $1,  %ecx
+    cmpl $1024, %ecx
+    jl   .Lfill_pt
+
+    /* PDE[0]   → identity map  0x00000000–0x003FFFFF */
+    movl $boot_page_table0, %eax
+    orl  $3, %eax
+    movl %eax, boot_page_dir
+
+    /* PDE[768] → higher-half  0xC0000000–0xC03FFFFF */
+    movl $boot_page_table0, %eax
+    orl  $3, %eax
+    movl %eax, boot_page_dir + (768 * 4)
+
+    /* Load CR3 with physical address of boot page directory */
+    movl $boot_page_dir, %eax
+    movl %eax, %cr3
+
+    /* Set CR0.PG – paging is now ON */
+    movl %cr0, %eax
+    orl  $0x80000000, %eax
+    movl %eax, %cr0
+
+    /*
+        We are still executing at a low physical/virtual address (identity map).
+        Do an absolute indirect jump to the higher-half virtual address of
+        _higher_half_start so that EIP moves into 0xC0000000+ space.
+    */
+    lea  _higher_half_start, %eax
+    jmp  *%eax
+
+.size _start, . - _start
+
+/*
+    _higher_half_start: entered immediately after the paging jump.
+    Now running at VMA 0xC0000000+.
+*/
+.section .text
+.global _higher_half_start
+.type _higher_half_start, @function
+_higher_half_start:
+    /* Call global constructors (needed for C++) */
     call _init
 
-    # Transfer control to the main kernel
+    /* Hand off to the C kernel */
     call kernel_main
 
-    # Hand if kernel_main unexpectedly returns.
+    /* kernel_main must never return; halt if it does */
     cli
 1:  hlt
     jmp 1b
 
-/*
-    Set the size of the _start symbol to the current location '.' minus its start.
-    This is useful for debugging or when you implement call tracing.
-*/
-.size _start, . - _start
+.size _higher_half_start, . - _higher_half_start

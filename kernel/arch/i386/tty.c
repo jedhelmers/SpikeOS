@@ -4,6 +4,7 @@
 #include "string.h"
 
 #include <kernel/tty.h>
+#include <kernel/vga13.h>
 
 #include "vga.h"
 
@@ -19,6 +20,8 @@ static uint16_t* terminal_buffer = (uint16_t*)VGA_MEMORY;
 
 
 static void terminal_update_cursor(void) {
+    if (vga_busy) return;   /* VGA mid-switch; skip to avoid port 0x3D4/5 race */
+
     size_t pos = terminal_row * VGA_WIDTH + terminal_column;
 
     outb(0x3D4, 0x0E);

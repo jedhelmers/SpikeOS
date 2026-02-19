@@ -19,7 +19,8 @@ typedef struct trapframe {
     uint32_t eax; // Accumulator
     uint32_t int_no;
     uint32_t err_code;
-    uint32_t eip, cs, eflags, useresp, ss;
+    uint32_t eip, cs, eflags;
+    // uint32_t eip, cs, eflags, useresp, ss;
 } trapframe;
 
 uint32_t isr_common_handler(trapframe* r);

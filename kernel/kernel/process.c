@@ -1,6 +1,7 @@
 #include <kernel/process.h>
 #include <kernel/isr.h>
 #include <string.h>
+#include <stdio.h>
 
 
 #define KSTACK_SIZE 4096
@@ -43,6 +44,17 @@ struct process *process_ge_table(void) {
     return proc_table;
 }
 
+void proc_kill(uint32_t pid) {
+    for (int i = 1; i < MAX_PROCS; i++) {
+        if (proc_table[i].pid == pid && proc_table[i].state != PROC_ZOMBIE) {
+            proc_table[i].state = PROC_ZOMBIE;
+            printf("[proc] killed PID %d\n", pid);
+            return;
+        }
+    }
+    printf("[proc] PID %d not found\n", pid);
+}
+
 struct process *proc_create_kernel_thread(void (*entry)(void)) {
     for (int i = 1; i < MAX_PROCS; i++) {
         if (proc_table[i].state == PROC_ZOMBIE) {
@@ -68,6 +80,8 @@ struct process *proc_create_kernel_thread(void (*entry)(void)) {
             tf->eflags = 0x00000202;     // IF=1
             tf->eip = (uint32_t)entry;
 
+            tf->esp_dummy = (uint32_t)&tf->int_no;
+
             tf->int_no = 0;
             tf->err_code = 0;
 
@@ -76,6 +90,9 @@ struct process *proc_create_kernel_thread(void (*entry)(void)) {
             p->ctx.ebp = (uint32_t)tf;
 
             p->state = PROC_READY;
+
+            printf("Thread %x stack top: %x\n", p->pid, p->kstack_top);
+
             return p;
         }
     }

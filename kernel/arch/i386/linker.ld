@@ -1,68 +1,63 @@
-/*
-    This bootloader will look at this image and start execution at the symbol
-    designated as the entry point
-*/
-
 ENTRY(_start)
 
-/*
-    Tell where the various sections of the object files will be put in the final
-    kernal image
-*/
-
 SECTIONS {
-    /*
-        It used to be universally recommended to use 1M as the start offset,
-        as it was effectively guaranteed to be available under BIOS systems.
-        However, UEFI has made things more complicated, and experimental data
-        strongly suggests that 2M is safer place to load. In 2016, a new feature
-        was introduced to the multiboot2 spec to inform bootloaders that a kernal
-        can be loaded anywhere within a range of addresses and will be able to
-        relocate itself to run from such a loader-selected address, in order to
-        give the loader freedom in selecting a span of memory which is verified
-        to be avvailable by the firmware, in order to  work around this issue.
-        This does not use that feature, so 2M was hosen as a safer option
-        than traditional 1M.
-    */
+    /* Physical load address – GRUB places the image here */
+    . = 0x00200000;
 
-    . = 2M;
-
-    /*
-        First put the multiboot header, as it is required to be put very earily
-        in the image or the bootloader won't recognize the file format.
-
-        Next we'll put the .text section
-    */
-
-    .text BLOCK(4K) : ALIGN(4K) {
+    /* Multiboot header must appear within the first 8 KiB of the file */
+    .multiboot : ALIGN(4K) {
         *(.multiboot)
-        *(.text)
+    }
+
+    /* Pre-paging bootstrap code/data – VMA == LMA (low physical addresses) */
+    .boottext : ALIGN(4K) {
+        *(.boot.text)
+        *(.boot.rodata)
+    }
+
+    .bootdata : ALIGN(4K) {
+        *(.boot.data)
+        *(.boot.bss)
     }
 
     /*
-        Read-only data.
+        Record the physical address where the higher-half sections begin.
+        Used in AT() so the ELF LMA stays in low memory while the VMA lives
+        at 0xC0000000+.
     */
+    _higher_half_lma = .;
+
+    /*
+        Switch location counter to higher-half VMA.
+        Adding 0xC0000000 means VMA = phys + 0xC0000000, so the boot page
+        directory (PDE[768]: 0xC0000000–0xC03FFFFF → 0x00000000–0x003FFFFF)
+        maps each virtual address to its correct physical frame.
+    */
+    . += 0xC0000000;
+
+    _kernel_start = .;
+
+    /*
+        AT(_higher_half_lma) sets the LMA for .text.  Subsequent sections
+        inherit the VMA-to-LMA delta automatically, giving each section an
+        LMA of  VMA - 0xC0000000  (i.e. its physical load address).
+    */
+    .text BLOCK(4K) : AT(_higher_half_lma) ALIGN(4K) {
+        *(.text)
+    }
+
     .rodata BLOCK(4K) : ALIGN(4K) {
         *(.rodata)
     }
 
-    /*
-        Read-write data (initialized)
-    */
     .data BLOCK(4K) : ALIGN(4K) {
         *(.data)
     }
 
-    /*
-        Read-write data (uninitialized) and stack
-    */
     .bss BLOCK(4K) : ALIGN(4K) {
         *(COMMON)
         *(.bss)
     }
 
-    /*
-        The compiler may produce other sections, by default it will put them
-        in a segment with the same name. Simply and stuff here as needed.
-    */
+    endkernel = .;
 }
