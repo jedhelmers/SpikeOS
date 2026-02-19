@@ -5,3 +5,4 @@ myos
 sysroot/
 isodir/boot/
 .debug.log
+CLAUDE.md
