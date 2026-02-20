@@ -109,3 +109,6 @@ ISR_NOERR 29
 ISR_NOERR 30
 ISR_NOERR 31
 
+/* Syscall vector — callable from ring 3 via int $0x80 */
+ISR_NOERR 128
+

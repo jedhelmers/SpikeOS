@@ -13,6 +13,8 @@
 #include <kernel/keyboard.h>
 #include <kernel/shell.h>
 #include <kernel/heap.h>
+#include <kernel/tss.h>
+#include <kernel/syscall.h>
 
 extern void kprint_howdy(void);
 extern void paging_enable(uint32_t);
@@ -30,7 +32,7 @@ void thread_inc(void) {
 
     for (;;) {
         terminal_putchar('+');
-        for (volatile int i = 0; i < 1000000; i++);
+        for (volatile int i = 0; i < 10000000; i++);
     }
 }
 
@@ -42,7 +44,7 @@ void thread_mid(void) {
         // terminal_setbackground((idx % 15) + 1);
         terminal_putchar('=');
 
-        for (volatile int i = 0; i < 1000000; i++);
+        for (volatile int i = 0; i < 10000000; i++);
     }
 }
 
@@ -50,8 +52,96 @@ void thread_dec(void) {
     for (;;) {
         terminal_putchar('-');
 
-        for (volatile int i = 0; i < 1000000; i++);
+        for (volatile int i = 0; i < 10000000; i++);
     }
+}
+
+/*
+ * Ring-3 test: proves user mode + syscalls work end-to-end.
+ *
+ * ring3_test_fn executes at CPL=3 and uses int $0x80 to invoke
+ * real syscalls: sys_write to print a message, then sys_exit.
+ *
+ * We must mark the pages containing the test function, the
+ * message string, and user stack with PAGE_USER, and also
+ * the PDE covering them, so the CPU allows ring-3 access.
+ */
+static uint8_t ring3_user_stack[4096] __attribute__((aligned(4096)));
+
+static const char ring3_msg[] = "[ring3] Hello from user mode!\n";
+
+static void __attribute__((noinline)) ring3_test_fn(void) {
+    /* sys_write(fd=1, buf=ring3_msg, len=30) */
+    asm volatile(
+        "mov $1, %%eax\n"       /* SYS_WRITE */
+        "mov $1, %%ebx\n"       /* fd = stdout */
+        "mov %0, %%ecx\n"       /* buf */
+        "mov %1, %%edx\n"       /* len */
+        "int $0x80\n"
+        :
+        : "r"(ring3_msg), "r"((uint32_t)sizeof(ring3_msg) - 1)
+        : "eax", "ebx", "ecx", "edx"
+    );
+
+    /* sys_exit(0) */
+    asm volatile(
+        "mov $0, %%eax\n"       /* SYS_EXIT */
+        "mov $0, %%ebx\n"       /* status = 0 */
+        "int $0x80\n"
+        :
+        :
+        : "eax", "ebx"
+    );
+
+    for (;;) asm volatile("hlt");
+}
+
+void ring3_test(void) {
+    /*
+     * Mark the PDE covering 0xC0000000-0xC03FFFFF as user-accessible.
+     * Both PDE and PTE must have PAGE_USER for the CPU to allow ring-3 access.
+     */
+    page_directory[KERNEL_PDE_INDEX] |= PAGE_USER;
+
+    /* Mark the page containing ring3_test_fn as user-accessible. */
+    uint32_t fn_phys = (uint32_t)ring3_test_fn - KERNEL_VMA_OFFSET;
+    uint32_t fn_pte = fn_phys >> 12;
+    first_page_table[fn_pte] |= PAGE_USER;
+    asm volatile("invlpg (%0)" :: "r"((uint32_t)ring3_test_fn) : "memory");
+
+    /* Mark the user stack page as user-accessible. */
+    uint32_t stk_phys = (uint32_t)ring3_user_stack - KERNEL_VMA_OFFSET;
+    uint32_t stk_pte = stk_phys >> 12;
+    first_page_table[stk_pte] |= PAGE_USER;
+    asm volatile("invlpg (%0)" :: "r"((uint32_t)ring3_user_stack) : "memory");
+
+    uint32_t user_esp = (uint32_t)&ring3_user_stack[4096];
+    uint32_t user_eip = (uint32_t)ring3_test_fn;
+
+    printf("[ring3_test] iret to ring 3: EIP=0x%x ESP=0x%x\n", user_eip, user_esp);
+
+    /*
+     * Build the 5-word iret frame for a privilege-level change:
+     *   ss, useresp, eflags, cs, eip
+     * Then iret transitions us from ring 0 to ring 3.
+     */
+    asm volatile(
+        "mov $0x23, %%ax\n"     /* user data selector | RPL=3 */
+        "mov %%ax, %%ds\n"
+        "mov %%ax, %%es\n"
+        "mov %%ax, %%fs\n"
+        "mov %%ax, %%gs\n"
+        "pushl $0x23\n"          /* ss */
+        "pushl %0\n"             /* useresp */
+        "pushfl\n"               /* eflags */
+        "orl $0x200, (%%esp)\n"  /* ensure IF=1 */
+        "pushl $0x1B\n"          /* cs = user code | RPL=3 */
+        "pushl %1\n"             /* eip */
+        "iret\n"
+        :
+        : "r"(user_esp), "r"(user_eip)
+        : "eax"
+    );
 }
 
 void kernel_main(void) {
@@ -66,6 +156,9 @@ void kernel_main(void) {
     */
     gdt_init();
     printf("INIT Global Descriptor Table (GDT)\n");
+
+    tss_init();
+    printf("INIT Task State Segment (TSS)\n");
 
     /*
         TESTING GDT
@@ -146,6 +239,11 @@ void kernel_main(void) {
     // printf("Alias Physical: %x\n", phys);
 
     printf("Kernel end: %x\n", (uint32_t)&endkernel); // THIS PRINTS: 0022F800
+
+    /* Ring-3 test: proves TSS + GDT + trapframe work.
+       This will iret to ring 3, call int $0x80, and halt.
+       Comment out to boot normally into the shell. */
+    ring3_test();
 
     // proc_create_kernel_thread(thread_inc);
     // proc_create_kernel_thread(thread_mid);

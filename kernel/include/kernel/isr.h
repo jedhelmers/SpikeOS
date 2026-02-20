@@ -20,7 +20,10 @@ typedef struct trapframe {
     uint32_t int_no;
     uint32_t err_code;
     uint32_t eip, cs, eflags;
-    // uint32_t eip, cs, eflags, useresp, ss;
+    /* Pushed by CPU only on privilege-level change (ring 3 -> ring 0).
+       Valid only when (cs & 3) != 0. For kernel-to-kernel interrupts
+       these fields are not pushed and contain whatever was on the stack. */
+    uint32_t useresp, ss;
 } trapframe;
 
 uint32_t isr_common_handler(trapframe* r);

@@ -1,6 +1,7 @@
 #include <kernel/scheduler.h>
 #include <kernel/process.h>
 #include <kernel/isr.h>
+#include <kernel/tss.h>
 #include <stddef.h>
 
 // REMOVE
@@ -50,6 +51,10 @@ uint32_t scheduler_tick(trapframe *tf) {
 
     next->state = PROC_RUNNING;
     current_process = next;
+
+    // Update TSS esp0 so the CPU uses the correct kernel stack
+    // when this process is interrupted from ring 3.
+    tss_set_kernel_stack(next->kstack_top);
 
     // Return the stack pointer of the next process's interrupt frame
     return next->ctx.esp;
