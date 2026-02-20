@@ -42,6 +42,7 @@ extern void isr28(void);
 extern void isr29(void);
 extern void isr30(void);
 extern void isr31(void);
+extern void isr128(void);  /* syscall vector 0x80 */
 
 extern void irq0(void);
 extern void irq1(void);
@@ -133,6 +134,9 @@ void idt_init(void) {
     idt_set_gate(45, (uint32_t)irq13, 0x08, 0x8E);
     idt_set_gate(46, (uint32_t)irq14, 0x08, 0x8E);
     idt_set_gate(47, (uint32_t)irq15, 0x08, 0x8E);
+
+    // Syscall gate: DPL=3 (0xEE) so ring-3 code can call int $0x80
+    idt_set_gate(0x80, (uint32_t)isr128, 0x08, 0xEE);
 
     idtr.limit = (uint16_t)(sizeof(idt) - 1);
     idtr.base = (uint32_t)&idt[0];

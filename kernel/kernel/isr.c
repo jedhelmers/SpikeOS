@@ -69,6 +69,17 @@ uint32_t isr_common_handler(trapframe* r) {
     //     printf("IRQ1\n");
     // }
 
+    // Syscall from ring 3 (int $0x80)
+    if (r->int_no == 0x80) {
+        printf("\n[SYSCALL] int 0x80 from ring %u\n", r->cs & 3);
+        printf("CS=%x EIP=%x USERESP=%x SS=%x\n",
+               r->cs, r->eip, r->useresp, r->ss);
+        if ((r->cs & 3) == 3) {
+            printf("*** RING 3 CONFIRMED ***\n");
+        }
+        for (;;) __asm__ volatile ("cli; hlt");
+    }
+
     // CPU exceptions
     if (r->int_no < 32) {
         printf("\n[EXCEPTION %u] %s\n", r->int_no, exception_names[r->int_no]);
