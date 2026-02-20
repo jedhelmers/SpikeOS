@@ -30,4 +30,10 @@ extern void gdt_flush(uint32_t);
 
 void gdt_init(void);
 
+/*
+ * Install the TSS descriptor into GDT slot 5 (selector 0x28).
+ * Called by tss_init() after the TSS struct is initialized.
+ */
+void gdt_install_tss(uint32_t base, uint32_t limit, uint8_t access, uint8_t gran);
+
 #endif

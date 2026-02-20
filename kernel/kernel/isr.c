@@ -4,6 +4,7 @@
 #include <kernel/isr.h>
 #include <kernel/pic.h>
 #include <kernel/scheduler.h>
+#include <kernel/syscall.h>
 #include <kernel/uart.h>
 #include <stdio.h>
 
@@ -68,6 +69,12 @@ uint32_t isr_common_handler(trapframe* r) {
     // if (r->int_no == 33) {
     //     printf("IRQ1\n");
     // }
+
+    // Syscall from ring 3 (int $0x80)
+    if (r->int_no == 0x80) {
+        syscall_dispatch(r);
+        return 0;
+    }
 
     // CPU exceptions
     if (r->int_no < 32) {

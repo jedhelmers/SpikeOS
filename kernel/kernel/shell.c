@@ -1,6 +1,7 @@
 #include <kernel/shell.h>
 #include <kernel/process.h>
 #include <kernel/tetris.h>
+#include <kernel/heap.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -78,6 +79,7 @@ void shell_execute(void) {
         printf("  run tetris   - play Tetris (WASD=move, Space=drop, Q=quit)\n");
         printf("  ps           - list processes\n");
         printf("  kill <pid>   - kill process by PID\n");
+        printf("  meminfo      - show heap info\n");
         printf("  clear        - clear screen\n");
     }
     else if (strcmp(line_buf, "run tetris") == 0) {
@@ -108,6 +110,9 @@ void shell_execute(void) {
         uint32_t pid = parse_uint(line_buf + 5);
         if (pid == foreground_pid) foreground_pid = 0;
         proc_kill(pid);
+    }
+    else if (strcmp(line_buf, "meminfo") == 0) {
+        heap_dump();
     }
     else if (strcmp(line_buf, "clear") == 0) {
         shell_clear();

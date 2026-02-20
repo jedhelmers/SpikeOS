@@ -47,6 +47,16 @@ static void print_uint(unsigned int value) {
     }
 }
 
+static void print_int(int value) {
+    if (value < 0) {
+        putchar('-');
+        // handle INT_MIN: cast to unsigned after negation trick
+        print_uint((unsigned int)(-(value + 1)) + 1);
+    } else {
+        print_uint((unsigned int)value);
+    }
+}
+
 int printf(const char* restrict format, ...) {
     va_list params;
     va_start(params, format);
@@ -129,6 +139,21 @@ int printf(const char* restrict format, ...) {
 
                 print_hex_uint(value);
                 written += 8;
+            } else if (*format == 'd') {
+                format++;
+
+                int value = va_arg(params, int);
+
+                if (!maxrem) {
+                    return -1;
+                }
+
+                print_int(value);
+                // approximate written count
+                int tmp = value;
+                if (tmp < 0) { written++; tmp = -tmp; }
+                if (tmp == 0) { written++; }
+                else { while (tmp) { written++; tmp /= 10; } }
             } else if (*format == 'u') {
                 format++;
 
