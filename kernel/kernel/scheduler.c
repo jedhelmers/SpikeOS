@@ -56,6 +56,13 @@ uint32_t scheduler_tick(trapframe *tf) {
     // when this process is interrupted from ring 3.
     tss_set_kernel_stack(next->kstack_top);
 
+    // Switch CR3 if the next process uses a different page directory
+    uint32_t next_cr3 = proc_get_cr3(next);
+    uint32_t prev_cr3 = proc_get_cr3(prev);
+    if (next_cr3 != prev_cr3) {
+        asm volatile("mov %0, %%cr3" :: "r"(next_cr3) : "memory");
+    }
+
     // Return the stack pointer of the next process's interrupt frame
     return next->ctx.esp;
 }

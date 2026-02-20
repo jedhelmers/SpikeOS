@@ -1,6 +1,7 @@
 #include <kernel/syscall.h>
 #include <kernel/isr.h>
 #include <kernel/process.h>
+#include <kernel/paging.h>
 #include <kernel/tty.h>
 #include <stdio.h>
 
@@ -17,8 +18,20 @@ static void sys_exit(trapframe *tf) {
 
     current_process->state = PROC_ZOMBIE;
 
+    /* If this process has its own page directory, switch back to the
+       kernel's PD and free it. We're in ring 0 so kernel pages are
+       accessible regardless of PAGE_USER. */
+    if (current_process->cr3 != 0) {
+        uint32_t kcr3 = get_kernel_cr3();
+        asm volatile("mov %0, %%cr3" :: "r"(kcr3) : "memory");
+        pgdir_destroy(current_process->cr3);
+        current_process->cr3 = 0;
+    }
+
     /* Yield the CPU — the scheduler will pick someone else.
-       We halt in a loop; the next timer IRQ triggers the switch. */
+       Re-enable interrupts first: we're inside an interrupt gate (IF=0),
+       so without STI the HLT would hang forever. */
+    asm volatile("sti");
     for (;;) __asm__ volatile("hlt");
 }
 
@@ -40,9 +53,7 @@ static int32_t sys_write(trapframe *tf) {
         return -1;
     }
 
-    for (uint32_t i = 0; i < len; i++) {
-        terminal_putchar(buf[i]);
-    }
+    terminal_write(buf, len);
 
     return (int32_t)len;
 }

@@ -4,5 +4,9 @@ myos
 .DS_Store
 sysroot/
 isodir/boot/
-.debug.log
+
 CLAUDE.md
+
+*.elf
+*.log
+*.img
