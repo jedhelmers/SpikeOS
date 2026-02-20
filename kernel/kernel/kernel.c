@@ -14,6 +14,7 @@
 #include <kernel/shell.h>
 #include <kernel/heap.h>
 #include <kernel/tss.h>
+#include <kernel/syscall.h>
 
 extern void kprint_howdy(void);
 extern void paging_enable(uint32_t);
@@ -31,7 +32,7 @@ void thread_inc(void) {
 
     for (;;) {
         terminal_putchar('+');
-        for (volatile int i = 0; i < 1000000; i++);
+        for (volatile int i = 0; i < 10000000; i++);
     }
 }
 
@@ -43,7 +44,7 @@ void thread_mid(void) {
         // terminal_setbackground((idx % 15) + 1);
         terminal_putchar('=');
 
-        for (volatile int i = 0; i < 1000000; i++);
+        for (volatile int i = 0; i < 10000000; i++);
     }
 }
 
@@ -51,25 +52,47 @@ void thread_dec(void) {
     for (;;) {
         terminal_putchar('-');
 
-        for (volatile int i = 0; i < 1000000; i++);
+        for (volatile int i = 0; i < 10000000; i++);
     }
 }
 
 /*
- * Ring-3 test: proves user mode works end-to-end.
+ * Ring-3 test: proves user mode + syscalls work end-to-end.
  *
- * ring3_test_fn executes at CPL=3 and calls int $0x80,
- * which traps back to ring 0 via the DPL=3 IDT gate.
- * The ISR handler prints CS — if it shows 0x1B, ring 3 is working.
+ * ring3_test_fn executes at CPL=3 and uses int $0x80 to invoke
+ * real syscalls: sys_write to print a message, then sys_exit.
  *
- * We must mark the pages containing the test function and
- * user stack with PAGE_USER, and also the PDE covering them,
- * so the CPU allows ring-3 access.
+ * We must mark the pages containing the test function, the
+ * message string, and user stack with PAGE_USER, and also
+ * the PDE covering them, so the CPU allows ring-3 access.
  */
 static uint8_t ring3_user_stack[4096] __attribute__((aligned(4096)));
 
+static const char ring3_msg[] = "[ring3] Hello from user mode!\n";
+
 static void __attribute__((noinline)) ring3_test_fn(void) {
-    asm volatile("int $0x80");
+    /* sys_write(fd=1, buf=ring3_msg, len=30) */
+    asm volatile(
+        "mov $1, %%eax\n"       /* SYS_WRITE */
+        "mov $1, %%ebx\n"       /* fd = stdout */
+        "mov %0, %%ecx\n"       /* buf */
+        "mov %1, %%edx\n"       /* len */
+        "int $0x80\n"
+        :
+        : "r"(ring3_msg), "r"((uint32_t)sizeof(ring3_msg) - 1)
+        : "eax", "ebx", "ecx", "edx"
+    );
+
+    /* sys_exit(0) */
+    asm volatile(
+        "mov $0, %%eax\n"       /* SYS_EXIT */
+        "mov $0, %%ebx\n"       /* status = 0 */
+        "int $0x80\n"
+        :
+        :
+        : "eax", "ebx"
+    );
+
     for (;;) asm volatile("hlt");
 }
 
@@ -220,7 +243,7 @@ void kernel_main(void) {
     /* Ring-3 test: proves TSS + GDT + trapframe work.
        This will iret to ring 3, call int $0x80, and halt.
        Comment out to boot normally into the shell. */
-    // ring3_test();
+    ring3_test();
 
     // proc_create_kernel_thread(thread_inc);
     // proc_create_kernel_thread(thread_mid);

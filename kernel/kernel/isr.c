@@ -4,6 +4,7 @@
 #include <kernel/isr.h>
 #include <kernel/pic.h>
 #include <kernel/scheduler.h>
+#include <kernel/syscall.h>
 #include <kernel/uart.h>
 #include <stdio.h>
 
@@ -71,13 +72,8 @@ uint32_t isr_common_handler(trapframe* r) {
 
     // Syscall from ring 3 (int $0x80)
     if (r->int_no == 0x80) {
-        printf("\n[SYSCALL] int 0x80 from ring %u\n", r->cs & 3);
-        printf("CS=%x EIP=%x USERESP=%x SS=%x\n",
-               r->cs, r->eip, r->useresp, r->ss);
-        if ((r->cs & 3) == 3) {
-            printf("*** RING 3 CONFIRMED ***\n");
-        }
-        for (;;) __asm__ volatile ("cli; hlt");
+        syscall_dispatch(r);
+        return 0;
     }
 
     // CPU exceptions
