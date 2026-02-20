@@ -15,10 +15,13 @@
 #include <kernel/heap.h>
 #include <kernel/tss.h>
 #include <kernel/syscall.h>
+#include <kernel/multiboot.h>
+#include <kernel/initrd.h>
 
 extern void kprint_howdy(void);
 extern void paging_enable(uint32_t);
 extern uint32_t endkernel;
+extern uint32_t multiboot_info_ptr;  /* saved EBX from boot.S (.boot.bss) */
 
 void thread_inc(void) {
     int idx = 42;
@@ -96,52 +99,58 @@ static void __attribute__((noinline)) ring3_test_fn(void) {
     for (;;) asm volatile("hlt");
 }
 
-void ring3_test(void) {
-    /*
-     * Mark the PDE covering 0xC0000000-0xC03FFFFF as user-accessible.
-     * Both PDE and PTE must have PAGE_USER for the CPU to allow ring-3 access.
-     */
-    page_directory[KERNEL_PDE_INDEX] |= PAGE_USER;
+/*
+ * ring3_test_perprocess — per-process page directory test.
+ *
+ * Creates a new page directory (clone of kernel's), marks the test
+ * function/message/stack pages as PAGE_USER in the new PD by cloning
+ * the kernel's PDE[768] page table, then creates a scheduled user
+ * process. The scheduler picks it up, loads its CR3, and irets to
+ * ring 3. The test function calls sys_write + sys_exit.
+ *
+ * This proves:
+ *   - pgdir_create() works
+ *   - pgdir_map_user_page() clones kernel PTs correctly
+ *   - CR3 switching in the scheduler works
+ *   - Ring-3 code executes under a per-process PD
+ *   - Syscalls work across the CR3 boundary
+ *   - pgdir_destroy() cleans up on exit
+ */
+void ring3_test_perprocess(void) {
+    uint32_t user_pd = pgdir_create();
+    if (user_pd == 0) {
+        printf("[ring3] ERROR: pgdir_create failed\n");
+        return;
+    }
 
-    /* Mark the page containing ring3_test_fn as user-accessible. */
-    uint32_t fn_phys = (uint32_t)ring3_test_fn - KERNEL_VMA_OFFSET;
-    uint32_t fn_pte = fn_phys >> 12;
-    first_page_table[fn_pte] |= PAGE_USER;
-    asm volatile("invlpg (%0)" :: "r"((uint32_t)ring3_test_fn) : "memory");
+    /* Mark the page containing ring3_test_fn as user-accessible.
+       This will clone PDE[768]'s page table in the new PD. */
+    uint32_t fn_virt = (uint32_t)ring3_test_fn;
+    uint32_t fn_phys = fn_virt - KERNEL_VMA_OFFSET;
+    pgdir_map_user_page(user_pd, fn_virt, fn_phys, PAGE_PRESENT | PAGE_USER);
 
-    /* Mark the user stack page as user-accessible. */
-    uint32_t stk_phys = (uint32_t)ring3_user_stack - KERNEL_VMA_OFFSET;
-    uint32_t stk_pte = stk_phys >> 12;
-    first_page_table[stk_pte] |= PAGE_USER;
-    asm volatile("invlpg (%0)" :: "r"((uint32_t)ring3_user_stack) : "memory");
+    /* Mark the page containing ring3_msg as user-accessible */
+    uint32_t msg_virt = (uint32_t)ring3_msg;
+    uint32_t msg_phys = msg_virt - KERNEL_VMA_OFFSET;
+    pgdir_map_user_page(user_pd, msg_virt, msg_phys, PAGE_PRESENT | PAGE_USER);
 
+    /* Mark the user stack page as user-accessible + writable */
+    uint32_t stk_virt = (uint32_t)ring3_user_stack;
+    uint32_t stk_phys = stk_virt - KERNEL_VMA_OFFSET;
+    pgdir_map_user_page(user_pd, stk_virt, stk_phys, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
+
+    /* Create the user process — the scheduler will pick it up */
     uint32_t user_esp = (uint32_t)&ring3_user_stack[4096];
     uint32_t user_eip = (uint32_t)ring3_test_fn;
 
-    printf("[ring3_test] iret to ring 3: EIP=0x%x ESP=0x%x\n", user_eip, user_esp);
+    struct process *p = proc_create_user_process(user_pd, user_eip, user_esp);
+    if (p == NULL) {
+        printf("[ring3] ERROR: proc_create_user_process failed\n");
+        pgdir_destroy(user_pd);
+        return;
+    }
 
-    /*
-     * Build the 5-word iret frame for a privilege-level change:
-     *   ss, useresp, eflags, cs, eip
-     * Then iret transitions us from ring 0 to ring 3.
-     */
-    asm volatile(
-        "mov $0x23, %%ax\n"     /* user data selector | RPL=3 */
-        "mov %%ax, %%ds\n"
-        "mov %%ax, %%es\n"
-        "mov %%ax, %%fs\n"
-        "mov %%ax, %%gs\n"
-        "pushl $0x23\n"          /* ss */
-        "pushl %0\n"             /* useresp */
-        "pushfl\n"               /* eflags */
-        "orl $0x200, (%%esp)\n"  /* ensure IF=1 */
-        "pushl $0x1B\n"          /* cs = user code | RPL=3 */
-        "pushl %1\n"             /* eip */
-        "iret\n"
-        :
-        : "r"(user_esp), "r"(user_eip)
-        : "eax"
-    );
+    printf("[ring3] user process PID %d, CR3=0x%x\n", p->pid, user_pd);
 }
 
 void kernel_main(void) {
@@ -173,6 +182,15 @@ void kernel_main(void) {
     idt_init();
     printf("INIT Interrupt Descriptor Table (IDT)\n");
 
+    /* Remap PIC immediately after IDT so that any accidental STI
+       (e.g. from kmalloc) won't deliver IRQs on exception vectors.
+       Default BIOS mapping: IRQ0→vec8, IRQ1→vec9, etc. which collide
+       with CPU exceptions.  After remap: IRQ0→vec32, IRQ1→vec33, etc. */
+    pic_remap(0x20, 0x28);
+    /* Mask all IRQs until handlers are ready */
+    for (int i = 0; i < 16; i++) pic_set_mask(i);
+    printf("REMAP PIC (IRQs → vectors 32-47, all masked)\n");
+
     printf("INIT Paging\n");
     paging_init();
     printf("ENABLE Paging\n");
@@ -187,11 +205,24 @@ void kernel_main(void) {
     heap_init();
     printf("INIT Kernel Heap\n");
 
-    // Remap PICs
-    printf("REMAP Programmable Interrupt Controller (PIC)\n");
-    printf("\tTo avoid catastrophic conflics with the CPU,\n");
-    printf("\tthe IRQs (Interrupt Requests) from the PIC must be remapped.\n");
-    pic_remap(0x20, 0x28);
+    /* Parse Multiboot info to find initrd module.
+       multiboot_info_ptr is a global set in boot.S from GRUB's EBX.
+       It's in .boot.bss (low physical address, identity-mapped). */
+    uint32_t mb_info_phys = multiboot_info_ptr;
+    if (mb_info_phys != 0) {
+        struct multiboot_info *mb = (struct multiboot_info *)mb_info_phys;
+        if ((mb->flags & MB_FLAG_MODS) && mb->mods_count > 0) {
+            struct multiboot_mod_entry *mods =
+                (struct multiboot_mod_entry *)mb->mods_addr;
+            printf("INIT initrd (phys 0x%x-0x%x)\n",
+                   mods[0].mod_start, mods[0].mod_end);
+            initrd_init(mods[0].mod_start, mods[0].mod_end);
+        } else {
+            printf("[initrd] no modules loaded\n");
+        }
+    } else {
+        printf("[initrd] no multiboot info\n");
+    }
 
     printf("INIT IRQ0 (Timer)\n");
     timer_init(100); // 100Hz
@@ -240,10 +271,10 @@ void kernel_main(void) {
 
     printf("Kernel end: %x\n", (uint32_t)&endkernel); // THIS PRINTS: 0022F800
 
-    /* Ring-3 test: proves TSS + GDT + trapframe work.
-       This will iret to ring 3, call int $0x80, and halt.
+    /* Per-process page directory test: creates a user process with its
+       own page directory, proving CR3 switching + ring-3 works.
        Comment out to boot normally into the shell. */
-    ring3_test();
+    // ring3_test_perprocess();
 
     // proc_create_kernel_thread(thread_inc);
     // proc_create_kernel_thread(thread_mid);
@@ -251,9 +282,9 @@ void kernel_main(void) {
     proc_create_kernel_thread(shell_run);
     
 
-    kprint_howdy();
+    // kprint_howdy();
 
-    // shell_run();
+    shell_run();
     // printf("INIT K-SHELL\n");
 
     asm volatile ("sti");

@@ -70,6 +70,16 @@ void paging_enable(uint32_t page_directory_address);
 uint32_t virt_to_phys(uint32_t virt);
 
 /*
+    Temp mapping window — maps any physical frame at a fixed kernel VA.
+    Uses PTE[1023] of first_page_table.
+    Not reentrant: only one temp mapping active at a time.
+*/
+#define TEMP_MAP_VADDR 0xC03FF000u
+
+void *temp_map(uint32_t phys_frame);
+void  temp_unmap(void);
+
+/*
     Page Frame Allocation
 */
 void frame_init();
@@ -84,6 +94,15 @@ int test_frame(uint32_t frame);
 
 uint32_t alloc_frame();
 
+void free_frame(uint32_t phys);
+
 void map_page(uint32_t virt, uint32_t phys, uint32_t flags);
+
+/*
+    Per-process page directory management
+*/
+uint32_t pgdir_create(void);
+void     pgdir_destroy(uint32_t pd_phys);
+int      pgdir_map_user_page(uint32_t pd_phys, uint32_t virt, uint32_t phys, uint32_t flags);
 
 #endif

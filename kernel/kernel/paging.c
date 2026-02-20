@@ -114,6 +114,170 @@ uint32_t alloc_frame() {
     return 0;
 }
 
+void free_frame(uint32_t phys) {
+    uint32_t frame = phys / FRAME_SIZE;
+    clear_frame(frame);
+}
+
+/*
+ * Temp mapping: map any physical frame at TEMP_MAP_VADDR (0xC03FF000).
+ * Uses PTE[1023] of first_page_table. Since first_page_table is in
+ * kernel BSS (physical < 4MB, identity-mapped), we can write to it directly.
+ */
+#define TEMP_MAP_PTE_INDEX 1023
+
+void *temp_map(uint32_t phys_frame) {
+    first_page_table[TEMP_MAP_PTE_INDEX] = phys_frame | PAGE_PRESENT | PAGE_WRITABLE;
+    asm volatile("invlpg (%0)" :: "r"(TEMP_MAP_VADDR) : "memory");
+    return (void *)TEMP_MAP_VADDR;
+}
+
+void temp_unmap(void) {
+    first_page_table[TEMP_MAP_PTE_INDEX] = 0;
+    asm volatile("invlpg (%0)" :: "r"(TEMP_MAP_VADDR) : "memory");
+}
+
+/*
+ * Allocate a new page directory that clones the kernel's PDEs.
+ * Returns the physical address, or 0 on failure.
+ */
+uint32_t pgdir_create(void) {
+    uint32_t pd_phys = alloc_frame();
+    if (pd_phys == 0) return 0;
+
+    uint32_t *pd = (uint32_t *)temp_map(pd_phys);
+    memcpy(pd, page_directory, PAGE_SIZE);
+    temp_unmap();
+
+    return pd_phys;
+}
+
+/*
+ * Destroy a per-process page directory.
+ * Frees user page tables (PDEs 1-767) and their mapped frames,
+ * then frees the PD frame itself. Skips shared kernel page tables.
+ */
+void pgdir_destroy(uint32_t pd_phys) {
+    if (pd_phys == 0) return;
+
+    uint32_t fpt_phys = (uint32_t)first_page_table - KERNEL_VMA_OFFSET;
+    uint32_t spt_phys = (uint32_t)second_page_table - KERNEL_VMA_OFFSET;
+
+    for (int i = 1; i < 768; i++) {
+        /* Temp-map PD, read one PDE, temp-unmap */
+        uint32_t *pd = (uint32_t *)temp_map(pd_phys);
+        uint32_t pde = pd[i];
+        temp_unmap();
+
+        if (!(pde & PAGE_PRESENT)) continue;
+
+        uint32_t pt_phys = pde & 0xFFFFF000;
+
+        /* Skip shared kernel page tables */
+        if (pt_phys == fpt_phys || pt_phys == spt_phys) continue;
+
+        /* Free all frames referenced by this page table */
+        for (int j = 0; j < PAGE_ENTRIES; j++) {
+            uint32_t *pt = (uint32_t *)temp_map(pt_phys);
+            uint32_t pte = pt[j];
+            temp_unmap();
+
+            if (pte & PAGE_PRESENT) {
+                free_frame(pte & 0xFFFFF000);
+            }
+        }
+
+        /* Free the page table frame itself */
+        free_frame(pt_phys);
+    }
+
+    /* Also check for cloned kernel page tables in PDEs 768+ */
+    for (int i = 768; i < PAGE_ENTRIES; i++) {
+        uint32_t *pd = (uint32_t *)temp_map(pd_phys);
+        uint32_t pde = pd[i];
+        temp_unmap();
+
+        if (!(pde & PAGE_PRESENT)) continue;
+
+        uint32_t pt_phys = pde & 0xFFFFF000;
+
+        /* Only free if it's NOT a shared kernel page table */
+        if (pt_phys != fpt_phys && pt_phys != spt_phys) {
+            /* This is a cloned kernel PT — free the clone but NOT the frames
+               (they're kernel frames, still in use by the kernel's PD) */
+            free_frame(pt_phys);
+        }
+    }
+
+    free_frame(pd_phys);
+}
+
+/*
+ * Map a single page in a per-process page directory.
+ * If the PDE points to a shared kernel page table and PAGE_USER is
+ * requested, clones the page table to avoid modifying the kernel's tables.
+ * Returns 0 on success, -1 on failure.
+ */
+int pgdir_map_user_page(uint32_t pd_phys, uint32_t virt, uint32_t phys,
+                        uint32_t flags) {
+    uint32_t pd_index = virt >> 22;
+    uint32_t pt_index = (virt >> 12) & 0x3FF;
+
+    uint32_t fpt_phys = (uint32_t)first_page_table - KERNEL_VMA_OFFSET;
+    uint32_t spt_phys = (uint32_t)second_page_table - KERNEL_VMA_OFFSET;
+
+    /* Read the PDE */
+    uint32_t *pd = (uint32_t *)temp_map(pd_phys);
+    uint32_t pde = pd[pd_index];
+
+    if (!(pde & PAGE_PRESENT)) {
+        /* Allocate a new page table */
+        uint32_t pt_phys = alloc_frame();
+        if (pt_phys == 0) { temp_unmap(); return -1; }
+
+        pd[pd_index] = pt_phys | PAGE_PRESENT | PAGE_WRITABLE | (flags & PAGE_USER);
+        temp_unmap();
+
+        /* Zero the new page table and write the PTE */
+        uint32_t *pt = (uint32_t *)temp_map(pt_phys);
+        memset(pt, 0, PAGE_SIZE);
+        pt[pt_index] = phys | flags;
+        temp_unmap();
+        return 0;
+    }
+
+    uint32_t pt_phys = pde & 0xFFFFF000;
+
+    /* If PDE points to a shared kernel PT and we need PAGE_USER, clone it */
+    if ((flags & PAGE_USER) &&
+        (pt_phys == fpt_phys || pt_phys == spt_phys)) {
+        uint32_t new_pt_phys = alloc_frame();
+        if (new_pt_phys == 0) { temp_unmap(); return -1; }
+
+        /* Update the PDE to point to the clone */
+        pd[pd_index] = new_pt_phys | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+        temp_unmap();
+
+        /* Copy from the original kernel PT (accessible via identity map) */
+        uint32_t *orig_pt = (pt_phys == fpt_phys) ? first_page_table
+                                                   : second_page_table;
+
+        uint32_t *new_pt = (uint32_t *)temp_map(new_pt_phys);
+        memcpy(new_pt, orig_pt, PAGE_SIZE);
+        new_pt[pt_index] = phys | flags;
+        temp_unmap();
+        return 0;
+    }
+
+    /* PDE present and not a shared kernel PT — just write the PTE */
+    temp_unmap(); /* unmap PD */
+
+    uint32_t *pt = (uint32_t *)temp_map(pt_phys);
+    pt[pt_index] = phys | flags;
+    temp_unmap();
+    return 0;
+}
+
 void map_page(uint32_t virt, uint32_t phys, uint32_t flags) {
     uint32_t pd_index = virt >> 22;
     uint32_t pt_index = (virt >> 12) & 0x3FF;

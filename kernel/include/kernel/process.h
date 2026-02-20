@@ -29,7 +29,9 @@ struct process {
 
     struct cpu_context ctx;     // schedule saves this
     struct trapframe *tf;       // last interrupt
-    struct page_dir *mm;        // ionde? Am I there yet?
+
+    uint32_t cr3;               // physical address of page directory
+                                // 0 = use kernel's page directory
 };
 
 extern struct process *current_process;
@@ -40,6 +42,10 @@ struct process *process_ge_table(void);
 void process_init(void);
 
 struct process *proc_create_kernel_thread(void (*entry)(void));
+struct process *proc_create_user_process(uint32_t pd_phys, uint32_t user_eip, uint32_t user_esp);
 void proc_kill(uint32_t pid);
+
+uint32_t get_kernel_cr3(void);
+uint32_t proc_get_cr3(struct process *p);
 
 #endif

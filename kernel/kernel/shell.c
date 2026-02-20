@@ -2,6 +2,8 @@
 #include <kernel/process.h>
 #include <kernel/tetris.h>
 #include <kernel/heap.h>
+#include <kernel/initrd.h>
+#include <kernel/elf.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -75,6 +77,8 @@ void shell_execute(void) {
     if (strcmp(line_buf, "help") == 0) {
         printf("Commands:\n");
         printf("  help         - show this help\n");
+        printf("  ls           - list files in initrd\n");
+        printf("  exec <name>  - run ELF binary from initrd\n");
         printf("  run          - start thread_inc\n");
         printf("  run tetris   - play Tetris (WASD=move, Space=drop, Q=quit)\n");
         printf("  ps           - list processes\n");
@@ -113,6 +117,23 @@ void shell_execute(void) {
     }
     else if (strcmp(line_buf, "meminfo") == 0) {
         heap_dump();
+    }
+    else if (strcmp(line_buf, "ls") == 0) {
+        initrd_list();
+    }
+    else if (strncmp(line_buf, "exec ", 5) == 0) {
+        const char *name = line_buf + 5;
+        uint32_t file_phys, file_size;
+        if (initrd_find(name, &file_phys, &file_size) != 0) {
+            printf("File not found: '%s'\n", name);
+        } else {
+            struct process *p = elf_load_and_exec(file_phys, file_size);
+            if (p) {
+                printf("Started '%s' [PID %d]\n", name, p->pid);
+            } else {
+                printf("Failed to load '%s'\n", name);
+            }
+        }
     }
     else if (strcmp(line_buf, "clear") == 0) {
         shell_clear();

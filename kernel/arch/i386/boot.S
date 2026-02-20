@@ -35,6 +35,11 @@ boot_stack_bottom:
     .skip 16384         /* 16 KiB kernel stack */
 boot_stack_top:
 
+.global multiboot_info_ptr
+.align 4
+multiboot_info_ptr:
+    .skip 4             /* saved EBX from GRUB (Multiboot info pointer) */
+
 /*
     _start: entry point called by GRUB.
     Runs with paging OFF at a low physical address.
@@ -52,6 +57,9 @@ boot_stack_top:
 _start:
     /* Use the physical (boot) stack while paging is off */
     movl $boot_stack_top, %esp
+
+    /* Save the Multiboot info pointer (GRUB passes it in EBX) */
+    movl %ebx, multiboot_info_ptr
 
     /* ------------------------------------------------------------------
        Fill boot_page_table0: map frame i → virtual page i (first 4 MiB)

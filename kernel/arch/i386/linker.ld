@@ -25,6 +25,7 @@ SECTIONS {
         Used in AT() so the ELF LMA stays in low memory while the VMA lives
         at 0xC0000000+.
     */
+    . = ALIGN(4K);
     _higher_half_lma = .;
 
     /*
