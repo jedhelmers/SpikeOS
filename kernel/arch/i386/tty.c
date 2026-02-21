@@ -5,6 +5,7 @@
 
 #include <kernel/tty.h>
 #include <kernel/vga13.h>
+#include <kernel/io.h>
 
 #include "vga.h"
 
@@ -30,7 +31,115 @@ static void terminal_update_cursor(void) {
     outb(0x3D5, (uint8_t)(pos & 0xFF));
 }
 
+/*
+ * vga_set_mode3 -- Force VGA into 80x25 text mode (mode 3).
+ *
+ * Under UEFI, OVMF sets the display to a GOP framebuffer via Bochs VBE.
+ * The legacy VGA registers are left in an undefined state. This function
+ * disables VBE and fully reprograms all VGA registers for standard text mode,
+ * then reloads the 8x16 font into plane 2 (OVMF's framebuffer writes may
+ * have overwritten it).
+ *
+ * Under BIOS, this is harmless — the VGA is already in mode 3 and we just
+ * reprogram it to the same state.
+ */
+static void vga_set_mode3(void) {
+    /* 1. Disable Bochs VBE (QEMU/Bochs) */
+    outw(0x01CE, 0x04);  /* VBE_DISPI_INDEX_ENABLE */
+    outw(0x01CF, 0x00);  /* VBE_DISPI_DISABLED     */
+
+    /* 2. Miscellaneous Output: 25MHz clock, RAM enable, I/O at 0x3Dx */
+    outb(0x3C2, 0x67);
+
+    /* 3. Sequencer */
+    outb(0x3C4, 0x00); outb(0x3C5, 0x03);  /* Reset: normal */
+    outb(0x3C4, 0x01); outb(0x3C5, 0x00);  /* Clocking: 9-dot */
+    outb(0x3C4, 0x02); outb(0x3C5, 0x03);  /* Map Mask: planes 0,1 */
+    outb(0x3C4, 0x03); outb(0x3C5, 0x00);  /* Char Map: font 0 */
+    outb(0x3C4, 0x04); outb(0x3C5, 0x02);  /* Mem Mode: O/E, no chain4 */
+
+    /* 4. Unlock CRTC, then program all 25 registers */
+    outb(0x3D4, 0x11); outb(0x3D5, inb(0x3D5) & 0x7F);
+
+    static const uint8_t crtc[25] = {
+        0x5F,0x4F,0x50,0x82,0x55,0x81,0xBF,0x1F,
+        0x00,0x4F,0x0D,0x0E,0x00,0x00,0x00,0x00,
+        0x9C,0x0E,0x8F,0x28,0x1F,0x96,0xB9,0xA3,
+        0xFF
+    };
+    for (unsigned i = 0; i < 25; i++) {
+        outb(0x3D4, i);
+        outb(0x3D5, crtc[i]);
+    }
+
+    /* 5. Graphics Controller */
+    static const uint8_t gc[9] = {
+        0x00,0x00,0x00,0x00,0x00,0x10,0x0E,0x00,0xFF
+    };
+    for (unsigned i = 0; i < 9; i++) {
+        outb(0x3CE, i);
+        outb(0x3CF, gc[i]);
+    }
+
+    /* 6. Attribute Controller */
+    static const uint8_t ac[21] = {
+        0x00,0x01,0x02,0x03,0x04,0x05,0x14,0x07,
+        0x38,0x39,0x3A,0x3B,0x3C,0x3D,0x3E,0x3F,
+        0x0C,0x00,0x0F,0x08,0x00
+    };
+    for (unsigned i = 0; i < 21; i++) {
+        inb(0x3DA);          /* reset flip-flop */
+        outb(0x3C0, i);      /* index */
+        outb(0x3C0, ac[i]);  /* data  */
+    }
+    inb(0x3DA);
+    outb(0x3C0, 0x20);  /* re-enable display */
+
+    /* 7. Load 8x16 font into plane 2.
+       OVMF's VBE framebuffer writes may have overwritten the font data.
+       We copy 256 glyphs from the VGA BIOS ROM at 0xC0000 + 0x???? but
+       that ROM may not exist under UEFI. Instead, we poke the VGA sequencer
+       to expose plane 2, zero it, then write a minimal built-in font.
+       For now, trigger a font reset by toggling the character map select —
+       QEMU's VGA emulation keeps the ROM font in a shadow buffer and
+       reloads it when we switch to text mode with the correct sequencer
+       state (seq reg 2 = 0x04 selects plane 2 for CPU writes). */
+
+    /* Expose plane 2 for CPU access */
+    outb(0x3C4, 0x02); outb(0x3C5, 0x04);  /* Map Mask: plane 2 only */
+    outb(0x3C4, 0x04); outb(0x3C5, 0x06);  /* Mem Mode: sequential, no O/E */
+    outb(0x3CE, 0x04); outb(0x3CF, 0x02);  /* Read Map: plane 2 */
+    outb(0x3CE, 0x05); outb(0x3CF, 0x00);  /* Mode: read/write mode 0 */
+    outb(0x3CE, 0x06); outb(0x3CF, 0x00);  /* Misc: A000-BFFF window, sequential */
+
+    /* Copy font from VGA ROM shadow (0xC0000 + 0x0FA6E is the standard
+       8x16 font location in most VGA BIOSes, but under UEFI/QEMU the
+       font lives at a different offset). Use the BIOS font area at
+       physical 0xFFA6E as a fallback if 0xC0000 area is valid.
+
+       Safer approach: write a small built-in font covering printable ASCII. */
+    volatile uint8_t *plane2 = (volatile uint8_t *)0xA0000;
+
+    /* Include the built-in 8x16 CP437 font */
+    #include "vga_font.h"
+
+    for (unsigned ch = 0; ch < 256; ch++) {
+        for (unsigned row = 0; row < 16; row++) {
+            plane2[ch * 32 + row] = vga_font_8x16[ch * 16 + row];
+        }
+    }
+
+    /* Restore sequencer/GC to normal text mode */
+    outb(0x3C4, 0x02); outb(0x3C5, 0x03);  /* Map Mask: planes 0,1 */
+    outb(0x3C4, 0x04); outb(0x3C5, 0x02);  /* Mem Mode: O/E, no chain4 */
+    outb(0x3CE, 0x04); outb(0x3CF, 0x00);  /* Read Map: plane 0 */
+    outb(0x3CE, 0x05); outb(0x3CF, 0x10);  /* Mode: O/E */
+    outb(0x3CE, 0x06); outb(0x3CF, 0x0E);  /* Misc: text, B800-BFFF */
+}
+
 void terminal_initialize(void) {
+    vga_set_mode3();
+
     terminal_row = 0;
     terminal_column = 0;
 

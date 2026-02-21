@@ -18,9 +18,16 @@ mkdir -p isodir/boot/grub
 cp sysroot/boot/myos.kernel isodir/boot/myos.kernel
 cp initrd.img isodir/boot/initrd.img
 cat > isodir/boot/grub/grub.cfg << EOF
+insmod all_video
+set timeout=3
+set default=0
+
 menuentry "myos" {
 	multiboot /boot/myos.kernel
 	module /boot/initrd.img
 }
 EOF
+
+# Build hybrid BIOS+UEFI ISO if x86_64-efi modules are available
+# (run setup-efi.sh once to enable), otherwise BIOS-only as before
 i686-elf-grub-mkrescue -o myos.iso isodir
