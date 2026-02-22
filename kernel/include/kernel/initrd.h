@@ -35,4 +35,17 @@ int initrd_find(const char *name, uint32_t *out_phys, uint32_t *out_size);
  */
 void initrd_list(void);
 
+/*
+ * Return the number of files in the initrd.
+ */
+uint32_t initrd_count(void);
+
+/*
+ * Get initrd file entry by index.
+ * Sets *name_out, *phys_out, *size_out on success.
+ * Returns 0 on success, -1 if index out of range.
+ */
+int initrd_get_entry(uint32_t index, const char **name_out,
+                     uint32_t *phys_out, uint32_t *size_out);
+
 #endif

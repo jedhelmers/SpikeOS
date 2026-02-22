@@ -31,9 +31,16 @@ VARS_COPY="$(mktemp)"
 cp "$OVMF_VARS" "$VARS_COPY"
 trap "rm -f '$VARS_COPY'" EXIT
 
+# Create disk image if it doesn't exist (64 MiB = 131072 sectors)
+if [ ! -f disk.img ]; then
+    dd if=/dev/zero of=disk.img bs=512 count=131072 2>/dev/null
+    echo "Created 64 MiB disk image"
+fi
+
 qemu-system-x86_64 \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
     -drive if=pflash,format=raw,file="$VARS_COPY" \
+    -drive file=disk.img,format=raw,if=ide,index=0,media=disk \
     -cdrom myos.iso \
     -vga std \
     -serial file:.debug.log \

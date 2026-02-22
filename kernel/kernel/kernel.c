@@ -17,6 +17,9 @@
 #include <kernel/syscall.h>
 #include <kernel/multiboot.h>
 #include <kernel/initrd.h>
+#include <kernel/vfs.h>
+#include <kernel/ata.h>
+#include <kernel/spikefs.h>
 
 extern void kprint_howdy(void);
 extern void paging_enable(uint32_t);
@@ -223,6 +226,17 @@ void kernel_main(void) {
     } else {
         printf("[initrd] no multiboot info\n");
     }
+
+    printf("INIT ATA disk driver\n");
+    ata_init();
+
+    /* Start with a small inode table — grows on demand (btrfs/XFS-style) */
+    vfs_init(64);
+    printf("INIT Virtual File System (VFS)\n");
+    vfs_import_initrd();
+
+    printf("INIT SpikeFS\n");
+    spikefs_init();
 
     printf("INIT IRQ0 (Timer)\n");
     timer_init(100); // 100Hz
