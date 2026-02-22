@@ -105,3 +105,17 @@ void initrd_list(void) {
         printf("  %s  (%d bytes)\n", initrd_files[i].name, initrd_files[i].size);
     }
 }
+
+uint32_t initrd_count(void) {
+    return initrd_num_files;
+}
+
+int initrd_get_entry(uint32_t index, const char **name_out,
+                     uint32_t *phys_out, uint32_t *size_out) {
+    if (!initrd_files || index >= initrd_num_files)
+        return -1;
+    *name_out = initrd_files[index].name;
+    *phys_out = initrd_phys_start + initrd_files[index].offset;
+    *size_out = initrd_files[index].size;
+    return 0;
+}
