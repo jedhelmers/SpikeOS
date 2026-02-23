@@ -1,6 +1,6 @@
-DEFAULT_HOST := $(shell ../default-host.sh)
+DEFAULT_HOST := $(shell ../scripts/default-host.sh)
 HOST ?= $(DEFAULT_HOST)
-HOSTARCH := $(shell ../target-triplet-to-arch.sh $(HOST))
+HOSTARCH := $(shell ../scripts/target-triplet-to-arch.sh $(HOST))
 
 $(info DEFAULT_HOST=$(DEFAULT_HOST))
 $(info HOST=$(HOST))

@@ -1,12 +1,23 @@
+# Build artifacts
 *.o
+*.d
+*.a
 *.iso
-myos
-.DS_Store
-sysroot/
-isodir/boot/
-
-CLAUDE.md
-
-*.elf
-*.log
 *.img
+*.elf
+*.kernel
+*.log
+myos
+
+# Host tools (rebuilt by iso.sh)
+tools/mkinitrd
+
+# macOS junk
+.DS_Store
+
+# Build staging
+sysroot/
+isodir/
+
+# Editor config
+CLAUDE.md

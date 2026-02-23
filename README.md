@@ -25,22 +25,25 @@ brew install i386-elf-gcc i686-elf-grub x86_64-elf-grub nasm qemu xorriso mtools
 
 For UEFI boot support (hybrid BIOS+UEFI ISO), run the one-time setup:
 ```bash
-./setup-efi.sh
+make setup-efi
 ```
 
 ## Build & Run
 
 ```bash
-./clean.sh        # Remove build artifacts
-./headers.sh      # Install headers to sysroot (required before first build)
-./qemu.sh         # Build everything and launch in QEMU (BIOS)
-./qemu.sh -v      # Build and launch with verbose boot logging (no splash screen)
-./qemu-uefi.sh    # Build everything and launch in QEMU (UEFI via OVMF)
-./qemu-uefi.sh -v # Build and launch UEFI with verbose boot logging
-./iso.sh          # Build and create bootable ISO (myos.iso)
+make run                # Build everything and launch in QEMU (BIOS)
+make run-verbose        # Build and launch with verbose boot logging (no splash screen)
+make run-uefi           # Build everything and launch in QEMU (UEFI via OVMF)
+make run-uefi-verbose   # Build and launch UEFI with verbose boot logging
+make iso                # Build and create bootable ISO (myos.iso)
+make clean              # Remove build artifacts
+make headers            # Install headers to sysroot (required before first build)
+make setup-efi          # One-time UEFI support setup
 ```
 
-`./qemu.sh` is the primary development loop — it builds and runs the kernel, with UART serial output captured to `.debug.log`. By default, the kernel shows a 1980s-style boot splash; pass `-v` or `--verbose` to see init logging instead.
+Scripts can also be called directly: `scripts/qemu.sh`, `scripts/clean.sh`, etc.
+
+`make run` is the primary development loop — it builds and runs the kernel, with UART serial output captured to `.debug.log`. By default, the kernel shows a 1980s-style boot splash; pass `-v` or `--verbose` to see init logging instead.
 
 ```bash
 cat .debug.log    # Inspect UART debug output during or after a run
@@ -97,9 +100,17 @@ All init `printf` calls are wrapped in `#ifdef VERBOSE_BOOT`. Without the flag, 
 | Path | Purpose |
 |------|---------|
 | `kernel/arch/i386/` | Boot stub (`boot.S`), GDT/IDT/TSS flush stubs, paging enable, linker script, VGA driver |
-| `kernel/kernel/` | All C source: kernel entry, GDT, IDT, TSS, ISR/IRQ, syscall, paging, heap, VFS, ATA, SpikeFS, process, scheduler, PIC, timer, keyboard, UART, shell |
-| `kernel/include/kernel/` | All kernel headers |
+| `kernel/core/` | Kernel entry, GDT, IDT, ISR, TSS, syscall dispatch |
+| `kernel/mm/` | Paging (page directory/tables, frame allocator) and heap allocator |
+| `kernel/fs/` | VFS, SpikeFS on-disk filesystem, initrd |
+| `kernel/drivers/` | ATA disk, keyboard, UART, PIC, timer, VGA mode 13h, debug log |
+| `kernel/proc/` | Process table, scheduler, ELF loader |
+| `kernel/shell/` | Kernel shell, Tetris, boot splash |
+| `kernel/include/kernel/` | All kernel headers (flat) |
 | `libc/` | Freestanding kernel libc (`libk.a`): printf, string, stdlib/abort |
+| `scripts/` | Build, run, and setup scripts |
+| `tools/` | Host-side build tools (mkinitrd) |
+| `userland/` | User-mode test programs |
 | `sysroot/` | Staging install directory (headers + libraries) |
 | `isodir/` | ISO staging directory with GRUB config |
 
@@ -261,25 +272,26 @@ Shell prompt shows current working directory: `jedhelmers:/path> `
 
 | File | Purpose |
 |------|---------|
-| `kernel/kernel/kernel.c` | Kernel entry point, init sequence, test functions |
-| `kernel/kernel/paging.c` | Page directory/table management, frame allocator, temp mapping, per-process PD functions |
-| `kernel/kernel/process.c` | Process table, kernel thread + user process creation |
-| `kernel/kernel/scheduler.c` | Round-robin scheduler with CR3 switching |
-| `kernel/kernel/syscall.c` | Syscall dispatcher and implementations |
-| `kernel/kernel/heap.c` | Kernel heap allocator (kmalloc/kfree) |
-| `kernel/kernel/isr.c` | Interrupt/exception/syscall dispatcher |
-| `kernel/kernel/gdt.c` | GDT with kernel + user segments + TSS |
-| `kernel/kernel/tss.c` | TSS initialization and kernel stack update |
-| `kernel/kernel/vfs.c` | In-memory VFS: growable inode table, directories, path resolution, file I/O, dirty tracking |
-| `kernel/kernel/ata.c` | ATA PIO disk driver (primary master, 28-bit LBA) |
-| `kernel/kernel/spikefs.c` | SpikeFS v3: inode chunks in unified data pool, imap chain, full write-back sync/load |
-| `kernel/kernel/shell.c` | Kernel shell with command parsing, filesystem commands, auto write-back |
-| `kernel/kernel/initrd.c` | Initial ramdisk: parse GRUB module, file lookup, VFS import |
+| `kernel/core/kernel.c` | Kernel entry point, init sequence, test functions |
+| `kernel/core/gdt.c` | GDT with kernel + user segments + TSS |
+| `kernel/core/isr.c` | Interrupt/exception/syscall dispatcher |
+| `kernel/core/syscall.c` | Syscall dispatcher and implementations |
+| `kernel/mm/paging.c` | Page directory/table management, frame allocator, temp mapping, per-process PD functions |
+| `kernel/mm/heap.c` | Kernel heap allocator (kmalloc/kfree) |
+| `kernel/fs/vfs.c` | In-memory VFS: growable inode table, directories, path resolution, file I/O, dirty tracking |
+| `kernel/fs/spikefs.c` | SpikeFS v3: inode chunks in unified data pool, imap chain, full write-back sync/load |
+| `kernel/fs/initrd.c` | Initial ramdisk: parse GRUB module, file lookup, VFS import |
+| `kernel/drivers/ata.c` | ATA PIO disk driver (primary master, 28-bit LBA) |
+| `kernel/proc/process.c` | Process table, kernel thread + user process creation |
+| `kernel/proc/scheduler.c` | Round-robin scheduler with CR3 switching |
+| `kernel/shell/shell.c` | Kernel shell with command parsing, filesystem commands, auto write-back |
+| `kernel/shell/boot_splash.c` | 1980s-style retro boot splash |
 | `kernel/arch/i386/isr_stub.S` | ISR/IRQ/syscall assembly stubs, context switch via stack swap |
 | `kernel/arch/i386/boot.S` | Multiboot entry, bootstrap paging, jump to higher-half |
 | `kernel/arch/i386/linker.ld` | Linker script: physical load at 0x200000, VMA at 0xC0000000+ |
-| `setup-efi.sh` | One-time setup: symlinks x86_64-efi GRUB modules for hybrid ISO |
-| `qemu-uefi.sh` | Build + run in QEMU with UEFI firmware (OVMF/EDK2) |
+| `scripts/qemu.sh` | Build + run in QEMU (BIOS) |
+| `scripts/qemu-uefi.sh` | Build + run in QEMU with UEFI firmware (OVMF/EDK2) |
+| `scripts/setup-efi.sh` | One-time setup: symlinks x86_64-efi GRUB modules for hybrid ISO |
 
 ## Resources
 

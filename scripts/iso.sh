@@ -1,6 +1,10 @@
 #!/bin/sh
 set -e
-. ./build.sh
+if [ -z "${SPIKEOS_ROOT:-}" ]; then
+    SPIKEOS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+    cd "$SPIKEOS_ROOT"
+fi
+. scripts/build.sh
 
 # Build host tools
 cc -o tools/mkinitrd tools/mkinitrd.c
