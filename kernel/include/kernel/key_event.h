@@ -21,6 +21,9 @@ typedef enum {
     KEY_SHIFT_UP,
 
     KEY_CTRL_C,
+
+    KEY_PAGE_UP,
+    KEY_PAGE_DOWN,
 } key_type_t;
 
 typedef struct {

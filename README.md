@@ -34,11 +34,13 @@ For UEFI boot support (hybrid BIOS+UEFI ISO), run the one-time setup:
 ./clean.sh        # Remove build artifacts
 ./headers.sh      # Install headers to sysroot (required before first build)
 ./qemu.sh         # Build everything and launch in QEMU (BIOS)
+./qemu.sh -v      # Build and launch with verbose boot logging (no splash screen)
 ./qemu-uefi.sh    # Build everything and launch in QEMU (UEFI via OVMF)
+./qemu-uefi.sh -v # Build and launch UEFI with verbose boot logging
 ./iso.sh          # Build and create bootable ISO (myos.iso)
 ```
 
-`./qemu.sh` is the primary development loop — it builds and runs the kernel, with UART serial output captured to `.debug.log`.
+`./qemu.sh` is the primary development loop — it builds and runs the kernel, with UART serial output captured to `.debug.log`. By default, the kernel shows a 1980s-style boot splash; pass `-v` or `--verbose` to see init logging instead.
 
 ```bash
 cat .debug.log    # Inspect UART debug output during or after a run
@@ -68,24 +70,27 @@ cat .debug.log    # Inspect UART debug output during or after a run
 
 ### Boot Sequence
 
+All init `printf` calls are wrapped in `#ifdef VERBOSE_BOOT`. Without the flag, init is silent and a retro boot splash is shown instead.
+
 1. `terminal_initialize()` — VGA 80x25 text mode (includes `vga_set_mode3()` for UEFI compatibility)
 2. `gdt_init()` — 6-entry GDT (null, kernel code/data, user code/data, TSS placeholder)
 3. `tss_init()` — TSS with `ss0=0x10`, `esp0` set to current kernel stack
 4. `idt_init()` — 256-vector IDT, including syscall gate at vector 0x80 (DPL=3)
-5. `paging_init()` + `paging_enable()` — enable CR0.PG, switch to higher-half
-6. `heap_init()` — kernel heap allocator (kmalloc/kfree)
-7. `initrd_init()` — parse GRUB module into file entry table
-8. `ata_init()` — ATA PIO disk driver (primary master, 28-bit LBA)
-9. `vfs_init(64)` — in-memory inode filesystem (starts with 64 slots, grows on demand up to 8192)
-10. `vfs_import_initrd()` — copy initrd files into VFS root
-11. `spikefs_init()` — load filesystem from disk (or format if blank/incompatible)
-12. `pic_remap(0x20, 0x28)` — remap PIC IRQs away from CPU exceptions
+5. `pic_remap(0x20, 0x28)` — remap PIC IRQs away from CPU exceptions
+6. `paging_init()` + `paging_enable()` — enable CR0.PG, switch to higher-half
+7. `heap_init()` — kernel heap allocator (kmalloc/kfree)
+8. `initrd_init()` — parse GRUB module into file entry table
+9. `ata_init()` — ATA PIO disk driver (primary master, 28-bit LBA)
+10. `vfs_init(64)` — in-memory inode filesystem (starts with 64 slots, grows on demand up to 8192)
+11. `vfs_import_initrd()` — copy initrd files into VFS root
+12. `spikefs_init()` — load filesystem from disk (or format if blank/incompatible)
 13. `timer_init(100)` — 100 Hz preemptive timer on IRQ0
 14. `process_init()` / `scheduler_init()` — process table (max 32) + round-robin scheduler
 15. `keyboard_init()` — keyboard on IRQ1
 16. `uart_init()` — COM1 serial on IRQ4
-17. `proc_create_kernel_thread(shell_run)` — start the kernel shell
-18. `sti` — enable interrupts
+17. `boot_splash()` — 1980s-style animated boot screen (only without `VERBOSE_BOOT`)
+18. `proc_create_kernel_thread(shell_run)` — start the kernel shell
+19. `sti` — enable interrupts
 
 ### Directory Structure
 
@@ -198,6 +203,23 @@ Sectors B+1..end:    Data pool (inode chunks + file data, unified)
 - **Full write-back**: sync clears bitmap and reallocates everything fresh from the in-memory VFS
 - **Auto write-back**: shell prompt checks dirty flag + 5-second cooldown, auto-syncs if needed
 - **Version detection**: auto-reformats disks with incompatible versions on boot
+
+### Terminal & Scrollback
+
+VGA 80x25 text mode driver with color output, cursor management, and a 200-line scrollback buffer.
+
+- **Scrollback**: lines that scroll off the top of the screen are saved in a ring buffer (~32 KB in BSS)
+- **Page Up / Page Down**: scroll through terminal history; any new output snaps back to the live view
+- **Clear resets scrollback**: the `clear` command zeros the ring buffer
+
+### Boot Splash
+
+1980s-style retro boot screen shown by default (suppressed with `-v` flag). Green-on-black color scheme using CP437 box drawing and block characters.
+
+- "SPIKE OS" logo in large block characters (5 rows tall)
+- 4 animated system check stages with progress bar and `[ OK ]` results
+- Animated progress bar that fills character-by-character
+- Busy-wait timing (interrupts not yet enabled during splash)
 
 ### UEFI Boot Support
 

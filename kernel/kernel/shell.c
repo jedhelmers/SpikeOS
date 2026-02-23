@@ -73,6 +73,16 @@ void shell_readline(void) {
             continue;
         }
 
+        if (c.type == KEY_PAGE_UP) {
+            terminal_page_up();
+            continue;
+        }
+
+        if (c.type == KEY_PAGE_DOWN) {
+            terminal_page_down();
+            continue;
+        }
+
         if (c.type == KEY_CTRL_C) {
             printf("^C\n");
             if (foreground_pid != 0) {
@@ -399,8 +409,6 @@ void shell_init_prefix(void) {
 }
 
 void shell_run(void) {
-    printf("\nbooting shell...\n\n");
-
     while (1) {
         shell_init_prefix();
         shell_readline();
