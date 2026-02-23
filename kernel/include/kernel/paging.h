@@ -105,4 +105,11 @@ uint32_t pgdir_create(void);
 void     pgdir_destroy(uint32_t pd_phys);
 int      pgdir_map_user_page(uint32_t pd_phys, uint32_t virt, uint32_t phys, uint32_t flags);
 
+/*
+    Page fault handler (ISR 14)
+    Called from isr_common_handler. Returns 0 if handled, -1 to kill/halt.
+*/
+struct trapframe;
+void page_fault_handler(struct trapframe *tf);
+
 #endif

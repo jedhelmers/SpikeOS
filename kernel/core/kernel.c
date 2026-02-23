@@ -21,6 +21,8 @@
 #include <kernel/ata.h>
 #include <kernel/spikefs.h>
 #include <kernel/boot_splash.h>
+#include <kernel/fd.h>
+#include <kernel/pipe.h>
 
 extern void kprint_howdy(void);
 extern void paging_enable(uint32_t);
@@ -258,6 +260,12 @@ void kernel_main(void) {
     pic_clear_mask(0);
 #ifdef VERBOSE_BOOT
     printf("PIC: UNMASK Timer (enable hardware interrupt)\n");
+#endif
+
+    fd_init();
+    pipe_init();
+#ifdef VERBOSE_BOOT
+    printf("INIT File Descriptor & Pipe Tables\n");
 #endif
 
 #ifdef VERBOSE_BOOT

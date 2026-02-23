@@ -1,6 +1,7 @@
 #include <kernel/elf.h>
 #include <kernel/paging.h>
 #include <kernel/process.h>
+#include <kernel/initrd.h>
 #include <kernel/heap.h>
 #include <string.h>
 #include <stdio.h>
@@ -205,4 +206,15 @@ fail:
     kfree(phdrs);
     pgdir_destroy(pd_phys);
     return NULL;
+}
+
+struct process *elf_spawn(const char *name) {
+    uint32_t file_phys, file_size;
+
+    if (initrd_find(name, &file_phys, &file_size) != 0) {
+        printf("[elf] '%s' not found in initrd\n", name);
+        return NULL;
+    }
+
+    return elf_load_and_exec(file_phys, file_size);
 }

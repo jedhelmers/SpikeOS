@@ -3,6 +3,7 @@
 */
 #include <kernel/isr.h>
 #include <kernel/pic.h>
+#include <kernel/paging.h>
 #include <kernel/scheduler.h>
 #include <kernel/syscall.h>
 #include <kernel/uart.h>
@@ -78,8 +79,15 @@ uint32_t isr_common_handler(trapframe* r) {
 
     // CPU exceptions
     if (r->int_no < 32) {
+        /* Page fault — route to dedicated handler */
+        if (r->int_no == 14) {
+            page_fault_handler(r);
+            return 0;
+        }
+
         printf("\n[EXCEPTION %u] %s\n", r->int_no, exception_names[r->int_no]);
-        printf("EIP=%x CS=%x EFLAGS=%x INT_NO=%x\n", r->eip, r->cs, r->eflags, r->int_no);
+        printf("EIP=%x CS=%x EFLAGS=%x INT_NO=%x ERR=%x\n",
+               r->eip, r->cs, r->eflags, r->int_no, r->err_code);
         for (;;) __asm__ volatile ("cli; hlt");
     }
 

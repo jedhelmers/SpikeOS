@@ -1,5 +1,8 @@
 #include <kernel/boot_splash.h>
 #include <kernel/tty.h>
+#include <kernel/keyboard.h>
+#include <kernel/key_event.h>
+#include <kernel/hal.h>
 #include <stdint.h>
 #include <stddef.h>
 
@@ -241,4 +244,27 @@ void boot_splash(void) {
     }
 
     splash_delay(DELAY_LONG);
+
+    /* 8. "Press any key to continue..." — wait for keyboard input */
+    {
+        const char *prompt = "Press any key to continue...";
+        int plen = 0;
+        const char *p = prompt;
+        while (*p++) plen++;
+        int px = (SCREEN_W - plen) / 2;
+        splash_puts(px, 23, mkcolor(COL_DARK_GREY, COL_BLACK), prompt);
+
+        /* Enable interrupts so the keyboard IRQ can fire */
+        hal_irq_enable();
+
+        /* Wait for any key press */
+        for (;;) {
+            key_event_t ev = keyboard_get_event();
+            if (ev.type != KEY_NONE) break;
+            hal_halt();
+        }
+
+        /* Leave interrupts enabled — shell_readline needs them for
+           keyboard IRQ to fire and wake HLT. */
+    }
 }

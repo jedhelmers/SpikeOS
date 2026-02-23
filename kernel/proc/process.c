@@ -33,6 +33,11 @@ void process_init(void) {
         proc_table[i].state = PROC_ZOMBIE;
         proc_table[i].tf = NULL;
         proc_table[i].cr3 = 0;
+        proc_table[i].parent_pid = 0;
+        proc_table[i].exit_status = 0;
+        proc_table[i].wait_children.head = NULL;
+        for (int j = 0; j < MAX_FDS; j++)
+            proc_table[i].fds[j] = -1;
     }
 
     // Initialize idle/kernel process (PID 0)
@@ -50,6 +55,9 @@ void process_init(void) {
 
     idle->tf = NULL;
 
+    // Init fds for idle process (kernel shell runs here)
+    fd_init_process(idle->fds);
+
     current_process = idle;
 }
 
@@ -62,10 +70,23 @@ void proc_kill(uint32_t pid) {
         if (proc_table[i].pid == pid && proc_table[i].state != PROC_ZOMBIE) {
             proc_table[i].state = PROC_ZOMBIE;
 
+            /* Close all open file descriptors */
+            fd_close_all(proc_table[i].fds);
+
             /* Free per-process page directory if this process has one */
             if (proc_table[i].cr3 != 0) {
                 pgdir_destroy(proc_table[i].cr3);
                 proc_table[i].cr3 = 0;
+            }
+
+            /* Wake parent if it's waiting */
+            uint32_t ppid = proc_table[i].parent_pid;
+            for (int j = 0; j < MAX_PROCS; j++) {
+                if (proc_table[j].pid == ppid &&
+                    proc_table[j].state != PROC_ZOMBIE) {
+                    wake_up_all(&proc_table[j].wait_children);
+                    break;
+                }
             }
 
             printf("[proc] killed PID %d\n", pid);
@@ -83,6 +104,12 @@ struct process *proc_create_kernel_thread(void (*entry)(void)) {
             p->pid = next_pid++;
             p->state = PROC_READY;
             p->cr3 = 0;
+            p->parent_pid = current_process ? current_process->pid : 0;
+            p->exit_status = 0;
+            p->wait_children.head = NULL;
+
+            /* Inherit parent's fds (kernel threads share console) */
+            fd_init_process(p->fds);
 
             // Assign a real kernel stack for this process
             p->kstack_top = (uint32_t)&kstacks[i][KSTACK_SIZE];
@@ -130,6 +157,12 @@ struct process *proc_create_user_process(uint32_t pd_phys,
             p->pid = next_pid++;
             p->state = PROC_READY;
             p->cr3 = pd_phys;
+            p->parent_pid = current_process ? current_process->pid : 0;
+            p->exit_status = 0;
+            p->wait_children.head = NULL;
+
+            /* Give user process its own console fds */
+            fd_init_process(p->fds);
 
             /* Kernel stack for ring-3 → ring-0 traps */
             p->kstack_top = (uint32_t)&kstacks[i][KSTACK_SIZE];

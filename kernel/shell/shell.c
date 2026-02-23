@@ -7,6 +7,9 @@
 #include <kernel/vfs.h>
 #include <kernel/spikefs.h>
 #include <kernel/timer.h>
+#include <kernel/fd.h>
+#include <kernel/pipe.h>
+#include <kernel/hal.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -114,6 +117,165 @@ void shell_readline(void) {
     }
 }
 
+/* ================================================================== */
+/*  Shell test commands                                               */
+/* ================================================================== */
+
+static int test_fd(void) {
+    int pass = 1;
+
+    printf("  fd_open  /_test_fd (O_CREAT|O_RDWR)... ");
+    int fd = fd_open("/_test_fd", O_CREAT | O_RDWR);
+    if (fd >= 0) { printf("[PASS] fd=%d\n", fd); }
+    else         { printf("[FAIL] returned %d\n", fd); return 0; }
+
+    printf("  fd_write 'hello'... ");
+    int32_t w = fd_write(fd, "hello", 5);
+    if (w == 5) { printf("[PASS] wrote %d bytes\n", w); }
+    else        { printf("[FAIL] wrote %d bytes\n", w); pass = 0; }
+
+    printf("  fd_seek  to 0... ");
+    int32_t s = fd_seek(fd, 0, SEEK_SET);
+    if (s == 0) { printf("[PASS]\n"); }
+    else        { printf("[FAIL] offset=%d\n", s); pass = 0; }
+
+    printf("  fd_read  5 bytes... ");
+    char buf[16] = {0};
+    int32_t r = fd_read(fd, buf, 5);
+    if (r == 5 && memcmp(buf, "hello", 5) == 0) {
+        printf("[PASS] got '%s'\n", buf);
+    } else {
+        printf("[FAIL] read %d bytes, got '%s'\n", r, buf);
+        pass = 0;
+    }
+
+    printf("  fd_close... ");
+    if (fd_close(fd) == 0) { printf("[PASS]\n"); }
+    else                    { printf("[FAIL]\n"); pass = 0; }
+
+    vfs_remove("/_test_fd");
+    return pass;
+}
+
+static int test_pipe(void) {
+    int pass = 1;
+
+    printf("  pipe_create... ");
+    int rfd, wfd;
+    if (pipe_create(&rfd, &wfd) == 0) {
+        printf("[PASS] rfd=%d wfd=%d\n", rfd, wfd);
+    } else {
+        printf("[FAIL]\n");
+        return 0;
+    }
+
+    printf("  fd_write 'pipe!'... ");
+    int32_t w = fd_write(wfd, "pipe!", 5);
+    if (w == 5) { printf("[PASS]\n"); }
+    else        { printf("[FAIL] wrote %d\n", w); pass = 0; }
+
+    printf("  fd_read  5 bytes... ");
+    char buf[16] = {0};
+    int32_t r = fd_read(rfd, buf, 5);
+    if (r == 5 && memcmp(buf, "pipe!", 5) == 0) {
+        printf("[PASS] got '%s'\n", buf);
+    } else {
+        printf("[FAIL] read %d, got '%s'\n", r, buf);
+        pass = 0;
+    }
+
+    fd_close(rfd);
+    fd_close(wfd);
+    return pass;
+}
+
+static int test_sleep(void) {
+    printf("  sleeping 100 ticks (1 sec)... ");
+    uint32_t before = timer_ticks();
+
+    uint32_t target = before + 100;
+    while (timer_ticks() < target) {
+        hal_irq_enable();
+        hal_halt();
+    }
+
+    uint32_t after = timer_ticks();
+    uint32_t elapsed = after - before;
+
+    if (elapsed >= 100) {
+        printf("[PASS] elapsed=%d ticks\n", elapsed);
+        return 1;
+    } else {
+        printf("[FAIL] elapsed=%d ticks (expected >= 100)\n", elapsed);
+        return 0;
+    }
+}
+
+static int test_stat(void) {
+    int pass = 1;
+
+    printf("  create /_test_stat... ");
+    int32_t ino = vfs_create_file("/_test_stat");
+    if (ino >= 0) { printf("[PASS] ino=%d\n", ino); }
+    else          { printf("[FAIL]\n"); return 0; }
+
+    const char *data = "test data";
+    vfs_write((uint32_t)ino, data, 0, 9);
+
+    printf("  check type/size... ");
+    vfs_inode_t *node = vfs_get_inode((uint32_t)ino);
+    if (node && node->type == VFS_TYPE_FILE && node->size == 9) {
+        printf("[PASS] type=%d size=%d\n", node->type, node->size);
+    } else {
+        printf("[FAIL] type=%d size=%d\n",
+               node ? node->type : -1, node ? node->size : 0);
+        pass = 0;
+    }
+
+    vfs_remove("/_test_stat");
+    return pass;
+}
+
+static void run_tests(int which) {
+    /* which: 0=all, 1=fd, 2=pipe, 3=sleep, 4=stat, 5=waitpid */
+    int total = 0, passed = 0;
+
+    if (which == 0 || which == 1) {
+        printf("[test fd]\n");
+        int r = test_fd();
+        total++; if (r) passed++;
+        printf("  result: %s\n\n", r ? "PASS" : "FAIL");
+    }
+    if (which == 0 || which == 2) {
+        printf("[test pipe]\n");
+        int r = test_pipe();
+        total++; if (r) passed++;
+        printf("  result: %s\n\n", r ? "PASS" : "FAIL");
+    }
+    if (which == 0 || which == 3) {
+        printf("[test sleep]\n");
+        int r = test_sleep();
+        total++; if (r) passed++;
+        printf("  result: %s\n\n", r ? "PASS" : "FAIL");
+    }
+    if (which == 0 || which == 4) {
+        printf("[test stat]\n");
+        int r = test_stat();
+        total++; if (r) passed++;
+        printf("  result: %s\n\n", r ? "PASS" : "FAIL");
+    }
+    if (which == 0 || which == 5) {
+        printf("[test waitpid]\n");
+        printf("  spawn/waitpid requires a user-mode ELF binary.\n");
+        printf("  Use 'exec <name>' to run an initrd ELF, which exercises\n");
+        printf("  process creation, scheduling, and exit.\n\n");
+    }
+
+    if (which == 0) {
+        printf("=== %d/%d tests passed ===\n", passed, total);
+    }
+}
+
 void shell_execute(void) {
     if (line_len == 0) return;
 
@@ -139,6 +301,7 @@ void shell_execute(void) {
         printf("  ps             - list processes\n");
         printf("  kill <pid>     - kill process by PID\n");
         printf("  meminfo        - show heap info\n");
+        printf("  test <name>    - run kernel tests (fd|pipe|sleep|stat|waitpid|all)\n");
         printf("  clear          - clear screen\n");
     }
 
@@ -382,6 +545,29 @@ void shell_execute(void) {
                 printf("Failed to load '%s'\n", name);
             }
         }
+    }
+
+    /* ---- test ---- */
+    else if (strcmp(line_buf, "test all") == 0) {
+        run_tests(0);
+    }
+    else if (strcmp(line_buf, "test fd") == 0) {
+        run_tests(1);
+    }
+    else if (strcmp(line_buf, "test pipe") == 0) {
+        run_tests(2);
+    }
+    else if (strcmp(line_buf, "test sleep") == 0) {
+        run_tests(3);
+    }
+    else if (strcmp(line_buf, "test stat") == 0) {
+        run_tests(4);
+    }
+    else if (strcmp(line_buf, "test waitpid") == 0) {
+        run_tests(5);
+    }
+    else if (strcmp(line_buf, "test") == 0) {
+        printf("Usage: test <fd|pipe|sleep|stat|waitpid|all>\n");
     }
 
     /* ---- clear ---- */
