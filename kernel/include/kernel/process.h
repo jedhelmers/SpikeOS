@@ -42,6 +42,9 @@ struct process {
     uint32_t parent_pid;        /* PID of parent (0 = no parent / init) */
     int32_t  exit_status;       /* set on exit, read by waitpid */
     wait_queue_t wait_children; /* parent sleeps here for waitpid */
+
+    uint32_t cwd;               /* inode of current working directory */
+    uint32_t pending_signals;   /* bitmask of pending signals */
 };
 
 extern struct process *current_process;

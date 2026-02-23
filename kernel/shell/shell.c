@@ -10,6 +10,10 @@
 #include <kernel/fd.h>
 #include <kernel/pipe.h>
 #include <kernel/hal.h>
+#include <kernel/signal.h>
+#include <kernel/mutex.h>
+#include <kernel/condvar.h>
+#include <kernel/rwlock.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -19,7 +23,9 @@
 
 static char line_buf[LINE_BUF_SIZE];
 static int line_len = 0;
-static uint32_t foreground_pid = 0;
+#define MAX_FG_PIDS 4
+static uint32_t fg_pids[MAX_FG_PIDS];
+static int fg_count = 0;
 
 extern void thread_inc(void);
 
@@ -88,10 +94,9 @@ void shell_readline(void) {
 
         if (c.type == KEY_CTRL_C) {
             printf("^C\n");
-            if (foreground_pid != 0) {
-                proc_kill(foreground_pid);
-                foreground_pid = 0;
-            }
+            for (int i = 0; i < fg_count; i++)
+                proc_kill(fg_pids[i]);
+            fg_count = 0;
             line_len = 0;
             return;
         }
@@ -236,8 +241,195 @@ static int test_stat(void) {
     return pass;
 }
 
+static int test_stdin(void) {
+    printf("  Press a key (blocking fd_read on stdin)... ");
+    char ch;
+    int32_t r = fd_read(0, &ch, 1);
+    if (r == 1) {
+        printf("[PASS] got '%c' (0x%x)\n", ch >= 32 ? ch : '.', (uint8_t)ch);
+        return 1;
+    } else {
+        printf("[FAIL] fd_read returned %d\n", r);
+        return 0;
+    }
+}
+
+static int test_mutex(void) {
+    int pass = 1;
+
+    printf("  mutex_init... ");
+    mutex_t m = MUTEX_INIT;
+    printf("[PASS]\n");
+
+    printf("  mutex_lock... ");
+    mutex_lock(&m);
+    if (m.locked && m.owner == current_process) { printf("[PASS]\n"); }
+    else { printf("[FAIL]\n"); pass = 0; }
+
+    printf("  mutex_trylock (should fail)... ");
+    if (mutex_trylock(&m) == 0) { printf("[PASS] correctly returned 0\n"); }
+    else { printf("[FAIL] acquired already-locked mutex\n"); pass = 0; }
+
+    printf("  mutex_unlock... ");
+    mutex_unlock(&m);
+    if (!m.locked && !m.owner) { printf("[PASS]\n"); }
+    else { printf("[FAIL]\n"); pass = 0; }
+
+    printf("  mutex_trylock (should succeed)... ");
+    if (mutex_trylock(&m) == 1) { printf("[PASS]\n"); mutex_unlock(&m); }
+    else { printf("[FAIL]\n"); pass = 0; }
+
+    return pass;
+}
+
+static int test_semaphore(void) {
+    int pass = 1;
+
+    printf("  sem_init(2)... ");
+    semaphore_t s;
+    sem_init(&s, 2);
+    if (s.count == 2) { printf("[PASS]\n"); }
+    else { printf("[FAIL] count=%d\n", s.count); pass = 0; }
+
+    printf("  sem_wait (2->1)... ");
+    sem_wait(&s);
+    if (s.count == 1) { printf("[PASS] count=%d\n", s.count); }
+    else { printf("[FAIL] count=%d\n", s.count); pass = 0; }
+
+    printf("  sem_wait (1->0)... ");
+    sem_wait(&s);
+    if (s.count == 0) { printf("[PASS] count=%d\n", s.count); }
+    else { printf("[FAIL] count=%d\n", s.count); pass = 0; }
+
+    printf("  sem_trywait (should fail at 0)... ");
+    if (sem_trywait(&s) == 0) { printf("[PASS] correctly returned 0\n"); }
+    else { printf("[FAIL] acquired at count=0\n"); pass = 0; }
+
+    printf("  sem_post (0->1)... ");
+    sem_post(&s);
+    if (s.count == 1) { printf("[PASS] count=%d\n", s.count); }
+    else { printf("[FAIL] count=%d\n", s.count); pass = 0; }
+
+    printf("  sem_trywait (should succeed at 1)... ");
+    if (sem_trywait(&s) == 1) { printf("[PASS]\n"); }
+    else { printf("[FAIL]\n"); pass = 0; }
+
+    return pass;
+}
+
+static int test_signal(void) {
+    int pass = 1;
+
+    printf("  proc_signal on non-existent PID... ");
+    if (proc_signal(9999, SIGKILL) != 0) { printf("[PASS] returned -1\n"); }
+    else { printf("[FAIL] should have failed\n"); pass = 0; }
+
+    printf("  SIG_BIT(SIGKILL) = 0x%x... ", SIG_BIT(SIGKILL));
+    if (SIG_BIT(SIGKILL) == (1u << 8)) { printf("[PASS]\n"); }
+    else { printf("[FAIL]\n"); pass = 0; }
+
+    printf("  SIG_BIT(SIGSEGV) = 0x%x... ", SIG_BIT(SIGSEGV));
+    if (SIG_BIT(SIGSEGV) == (1u << 10)) { printf("[PASS]\n"); }
+    else { printf("[FAIL]\n"); pass = 0; }
+
+    printf("  SIG_BIT(SIGPIPE) = 0x%x... ", SIG_BIT(SIGPIPE));
+    if (SIG_BIT(SIGPIPE) == (1u << 12)) { printf("[PASS]\n"); }
+    else { printf("[FAIL]\n"); pass = 0; }
+
+    return pass;
+}
+
+static int test_cwd(void) {
+    int pass = 1;
+
+    printf("  save original cwd... ");
+    uint32_t saved_cwd = vfs_get_cwd();
+    printf("[PASS] inode=%d\n", saved_cwd);
+
+    printf("  mkdir /_test_cwd... ");
+    int32_t ino = vfs_mkdir("/_test_cwd");
+    if (ino >= 0) { printf("[PASS] ino=%d\n", ino); }
+    else { printf("[FAIL]\n"); return 0; }
+
+    printf("  cd /_test_cwd... ");
+    if (vfs_chdir("/_test_cwd") == 0) { printf("[PASS]\n"); }
+    else { printf("[FAIL]\n"); pass = 0; }
+
+    printf("  verify cwd path... ");
+    const char *path = vfs_get_cwd_path();
+    if (strcmp(path, "/_test_cwd") == 0) { printf("[PASS] '%s'\n", path); }
+    else { printf("[FAIL] got '%s'\n", path); pass = 0; }
+
+    printf("  cd / (restore)... ");
+    vfs_chdir("/");
+    if (vfs_get_cwd() == 0) { printf("[PASS]\n"); }
+    else { printf("[FAIL]\n"); pass = 0; }
+
+    vfs_remove("/_test_cwd");
+    return pass;
+}
+
+static int test_condvar(void) {
+    int pass = 1;
+
+    printf("  condvar_init... ");
+    condvar_t cv = CONDVAR_INIT;
+    printf("[PASS]\n");
+
+    printf("  condvar_signal (empty queue)... ");
+    condvar_signal(&cv);
+    printf("[PASS] no crash\n");
+
+    printf("  condvar_broadcast (empty queue)... ");
+    condvar_broadcast(&cv);
+    printf("[PASS] no crash\n");
+
+    return pass;
+}
+
+static int test_rwlock(void) {
+    int pass = 1;
+
+    printf("  rwlock_init... ");
+    rwlock_t rw = RWLOCK_INIT;
+    printf("[PASS]\n");
+
+    printf("  rwlock_read_lock (0->1)... ");
+    rwlock_read_lock(&rw);
+    if (rw.reader_count == 1) { printf("[PASS]\n"); }
+    else { printf("[FAIL] count=%d\n", rw.reader_count); pass = 0; }
+
+    printf("  rwlock_read_lock (1->2)... ");
+    rwlock_read_lock(&rw);
+    if (rw.reader_count == 2) { printf("[PASS]\n"); }
+    else { printf("[FAIL] count=%d\n", rw.reader_count); pass = 0; }
+
+    printf("  rwlock_read_unlock (2->1)... ");
+    rwlock_read_unlock(&rw);
+    if (rw.reader_count == 1) { printf("[PASS]\n"); }
+    else { printf("[FAIL] count=%d\n", rw.reader_count); pass = 0; }
+
+    printf("  rwlock_read_unlock (1->0)... ");
+    rwlock_read_unlock(&rw);
+    if (rw.reader_count == 0) { printf("[PASS]\n"); }
+    else { printf("[FAIL] count=%d\n", rw.reader_count); pass = 0; }
+
+    printf("  rwlock_write_lock... ");
+    rwlock_write_lock(&rw);
+    if (rw.writer_active == 1) { printf("[PASS]\n"); }
+    else { printf("[FAIL] writer_active=%d\n", rw.writer_active); pass = 0; }
+
+    printf("  rwlock_write_unlock... ");
+    rwlock_write_unlock(&rw);
+    if (rw.writer_active == 0) { printf("[PASS]\n"); }
+    else { printf("[FAIL] writer_active=%d\n", rw.writer_active); pass = 0; }
+
+    return pass;
+}
+
 static void run_tests(int which) {
-    /* which: 0=all, 1=fd, 2=pipe, 3=sleep, 4=stat, 5=waitpid */
+    /* which: 0=all, 1=fd, 2=pipe, 3=sleep, 4=stat, 5=waitpid, 6=stdin,
+             7=mutex, 8=sem, 9=signal, 10=cwd, 11=condvar, 12=rwlock */
     int total = 0, passed = 0;
 
     if (which == 0 || which == 1) {
@@ -270,9 +462,78 @@ static void run_tests(int which) {
         printf("  Use 'exec <name>' to run an initrd ELF, which exercises\n");
         printf("  process creation, scheduling, and exit.\n\n");
     }
+    if (which == 0 || which == 6) {
+        printf("[test stdin]\n");
+        int r = test_stdin();
+        total++; if (r) passed++;
+        printf("  result: %s\n\n", r ? "PASS" : "FAIL");
+    }
+    if (which == 0 || which == 7) {
+        printf("[test mutex]\n");
+        int r = test_mutex();
+        total++; if (r) passed++;
+        printf("  result: %s\n\n", r ? "PASS" : "FAIL");
+    }
+    if (which == 0 || which == 8) {
+        printf("[test semaphore]\n");
+        int r = test_semaphore();
+        total++; if (r) passed++;
+        printf("  result: %s\n\n", r ? "PASS" : "FAIL");
+    }
+    if (which == 0 || which == 9) {
+        printf("[test signal]\n");
+        int r = test_signal();
+        total++; if (r) passed++;
+        printf("  result: %s\n\n", r ? "PASS" : "FAIL");
+    }
+    if (which == 0 || which == 10) {
+        printf("[test cwd]\n");
+        int r = test_cwd();
+        total++; if (r) passed++;
+        printf("  result: %s\n\n", r ? "PASS" : "FAIL");
+    }
+    if (which == 0 || which == 11) {
+        printf("[test condvar]\n");
+        int r = test_condvar();
+        total++; if (r) passed++;
+        printf("  result: %s\n\n", r ? "PASS" : "FAIL");
+    }
+    if (which == 0 || which == 12) {
+        printf("[test rwlock]\n");
+        int r = test_rwlock();
+        total++; if (r) passed++;
+        printf("  result: %s\n\n", r ? "PASS" : "FAIL");
+    }
 
     if (which == 0) {
         printf("=== %d/%d tests passed ===\n", passed, total);
+    }
+}
+
+/* ================================================================== */
+/*  Concurrent demo: two threads sharing a mutex-protected counter    */
+/* ================================================================== */
+
+static volatile int shared_counter = 0;
+static mutex_t counter_mutex = MUTEX_INIT;
+
+static void thread_counter_inc(void) {
+    for (;;) {
+        mutex_lock(&counter_mutex);
+        shared_counter++;
+        printf("[INC] counter = %d\n", shared_counter);
+        mutex_unlock(&counter_mutex);
+        for (volatile int i = 0; i < 5000000; i++);
+    }
+}
+
+static void thread_counter_dec(void) {
+    for (;;) {
+        mutex_lock(&counter_mutex);
+        shared_counter--;
+        printf("[DEC] counter = %d\n", shared_counter);
+        mutex_unlock(&counter_mutex);
+        for (volatile int i = 0; i < 5000000; i++);
     }
 }
 
@@ -297,11 +558,13 @@ void shell_execute(void) {
         printf("  format         - reformat disk (erases all data!)\n");
         printf("  exec <name>    - run ELF binary from initrd\n");
         printf("  run            - start thread_inc\n");
+        printf("  run concurrent - mutex demo: two threads inc/dec a shared counter\n");
         printf("  run tetris     - play Tetris (WASD=move, Space=drop, Q=quit)\n");
         printf("  ps             - list processes\n");
         printf("  kill <pid>     - kill process by PID\n");
         printf("  meminfo        - show heap info\n");
-        printf("  test <name>    - run kernel tests (fd|pipe|sleep|stat|waitpid|all)\n");
+        printf("  test <name>    - run kernel tests (fd|pipe|sleep|stat|stdin|waitpid|\n");
+        printf("                   mutex|sem|signal|cwd|condvar|rwlock|all)\n");
         printf("  clear          - clear screen\n");
     }
 
@@ -490,6 +753,24 @@ void shell_execute(void) {
         }
     }
 
+    /* ---- run concurrent ---- */
+    else if (strcmp(line_buf, "run concurrent") == 0) {
+        shared_counter = 0;
+        counter_mutex = (mutex_t)MUTEX_INIT;
+        struct process *p1 = proc_create_kernel_thread(thread_counter_inc);
+        struct process *p2 = proc_create_kernel_thread(thread_counter_dec);
+        if (p1 && p2) {
+            fg_count = 0;
+            fg_pids[fg_count++] = p1->pid;
+            fg_pids[fg_count++] = p2->pid;
+            printf("Started concurrent threads [PID %d inc, PID %d dec] - Ctrl+C to stop\n",
+                   p1->pid, p2->pid);
+        } else {
+            printf("Error: could not create threads\n");
+            if (p1) proc_kill(p1->pid);
+            if (p2) proc_kill(p2->pid);
+        }
+    }
     /* ---- run tetris ---- */
     else if (strcmp(line_buf, "run tetris") == 0) {
         tetris_run();
@@ -498,7 +779,8 @@ void shell_execute(void) {
     else if (strcmp(line_buf, "run") == 0) {
         struct process *p = proc_create_kernel_thread(thread_inc);
         if (p) {
-            foreground_pid = p->pid;
+            fg_count = 1;
+            fg_pids[0] = p->pid;
             printf("Started thread_inc [PID %d] - Ctrl+C to stop\n", p->pid);
         } else {
             printf("Error: process table full\n");
@@ -522,8 +804,14 @@ void shell_execute(void) {
     /* ---- kill ---- */
     else if (strncmp(line_buf, "kill ", 5) == 0) {
         uint32_t pid = parse_uint(line_buf + 5);
-        if (pid == foreground_pid) foreground_pid = 0;
-        proc_kill(pid);
+        for (int i = 0; i < fg_count; i++) {
+            if (fg_pids[i] == pid) {
+                fg_pids[i] = fg_pids[--fg_count];
+                break;
+            }
+        }
+        if (proc_signal(pid, SIGKILL) != 0)
+            printf("kill: process %d not found\n", pid);
     }
 
     /* ---- meminfo ---- */
@@ -534,16 +822,11 @@ void shell_execute(void) {
     /* ---- exec ---- */
     else if (strncmp(line_buf, "exec ", 5) == 0) {
         const char *name = line_buf + 5;
-        uint32_t file_phys, file_size;
-        if (initrd_find(name, &file_phys, &file_size) != 0) {
-            printf("File not found: '%s'\n", name);
+        struct process *p = elf_spawn(name);
+        if (p) {
+            printf("Started '%s' [PID %d]\n", name, p->pid);
         } else {
-            struct process *p = elf_load_and_exec(file_phys, file_size);
-            if (p) {
-                printf("Started '%s' [PID %d]\n", name, p->pid);
-            } else {
-                printf("Failed to load '%s'\n", name);
-            }
+            printf("Failed to load '%s'\n", name);
         }
     }
 
@@ -566,8 +849,29 @@ void shell_execute(void) {
     else if (strcmp(line_buf, "test waitpid") == 0) {
         run_tests(5);
     }
+    else if (strcmp(line_buf, "test stdin") == 0) {
+        run_tests(6);
+    }
+    else if (strcmp(line_buf, "test mutex") == 0) {
+        run_tests(7);
+    }
+    else if (strcmp(line_buf, "test sem") == 0) {
+        run_tests(8);
+    }
+    else if (strcmp(line_buf, "test signal") == 0) {
+        run_tests(9);
+    }
+    else if (strcmp(line_buf, "test cwd") == 0) {
+        run_tests(10);
+    }
+    else if (strcmp(line_buf, "test condvar") == 0) {
+        run_tests(11);
+    }
+    else if (strcmp(line_buf, "test rwlock") == 0) {
+        run_tests(12);
+    }
     else if (strcmp(line_buf, "test") == 0) {
-        printf("Usage: test <fd|pipe|sleep|stat|waitpid|all>\n");
+        printf("Usage: test <fd|pipe|sleep|stat|stdin|waitpid|mutex|sem|signal|cwd|condvar|rwlock|all>\n");
     }
 
     /* ---- clear ---- */

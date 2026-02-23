@@ -1,6 +1,8 @@
 #include <kernel/process.h>
 #include <kernel/paging.h>
 #include <kernel/isr.h>
+#include <kernel/signal.h>
+#include <kernel/hal.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -36,6 +38,8 @@ void process_init(void) {
         proc_table[i].parent_pid = 0;
         proc_table[i].exit_status = 0;
         proc_table[i].wait_children.head = NULL;
+        proc_table[i].cwd = 0;
+        proc_table[i].pending_signals = 0;
         for (int j = 0; j < MAX_FDS; j++)
             proc_table[i].fds[j] = -1;
     }
@@ -54,6 +58,9 @@ void process_init(void) {
     idle->ctx.ebp = idle->kstack_top;
 
     idle->tf = NULL;
+
+    idle->cwd = 0;  /* root directory */
+    idle->pending_signals = 0;
 
     // Init fds for idle process (kernel shell runs here)
     fd_init_process(idle->fds);
@@ -108,6 +115,10 @@ struct process *proc_create_kernel_thread(void (*entry)(void)) {
             p->exit_status = 0;
             p->wait_children.head = NULL;
 
+            /* Inherit parent's cwd */
+            p->cwd = current_process ? current_process->cwd : 0;
+            p->pending_signals = 0;
+
             /* Inherit parent's fds (kernel threads share console) */
             fd_init_process(p->fds);
 
@@ -161,6 +172,10 @@ struct process *proc_create_user_process(uint32_t pd_phys,
             p->exit_status = 0;
             p->wait_children.head = NULL;
 
+            /* Inherit parent's cwd */
+            p->cwd = current_process ? current_process->cwd : 0;
+            p->pending_signals = 0;
+
             /* Give user process its own console fds */
             fd_init_process(p->fds);
 
@@ -199,4 +214,45 @@ struct process *proc_create_user_process(uint32_t pd_phys,
         }
     }
     return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Signals                                                            */
+/* ------------------------------------------------------------------ */
+
+int proc_signal(uint32_t pid, int sig) {
+    if (sig < 1 || sig >= NSIG) return -1;
+
+    for (int i = 0; i < MAX_PROCS; i++) {
+        if (proc_table[i].pid == pid &&
+            proc_table[i].state != PROC_ZOMBIE) {
+            proc_table[i].pending_signals |= SIG_BIT(sig);
+
+            /* If process is blocked, wake it so it can be killed */
+            if (proc_table[i].state == PROC_BLOCKED) {
+                proc_table[i].state = PROC_READY;
+            }
+            return 0;
+        }
+    }
+    return -1;
+}
+
+void signal_check_pending(void) {
+    if (!current_process) return;
+    if (current_process->pending_signals == 0) return;
+
+    /* Find the first pending signal */
+    uint32_t sigs = current_process->pending_signals;
+    current_process->pending_signals = 0;
+
+    int sig = 0;
+    for (int i = 1; i < NSIG; i++) {
+        if (sigs & SIG_BIT(i)) { sig = i; break; }
+    }
+
+    printf("[signal] PID %d killed by signal %d\n",
+           current_process->pid, sig);
+
+    proc_kill(current_process->pid);
 }

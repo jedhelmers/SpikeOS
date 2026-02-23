@@ -1,6 +1,7 @@
 #include <kernel/pipe.h>
 #include <kernel/fd.h>
 #include <kernel/process.h>
+#include <kernel/signal.h>
 #include <string.h>
 
 /* ------------------------------------------------------------------ */
@@ -118,6 +119,8 @@ int32_t pipe_write(pipe_t *p, const void *buf, uint32_t count) {
     while (total < count) {
         /* No readers left → broken pipe */
         if (p->readers <= 0) {
+            if (current_process)
+                proc_signal(current_process->pid, SIGPIPE);
             return total > 0 ? (int32_t)total : -1;
         }
 
@@ -127,6 +130,8 @@ int32_t pipe_write(pipe_t *p, const void *buf, uint32_t count) {
         }
 
         if (p->readers <= 0) {
+            if (current_process)
+                proc_signal(current_process->pid, SIGPIPE);
             return total > 0 ? (int32_t)total : -1;
         }
 

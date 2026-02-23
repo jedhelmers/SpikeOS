@@ -2,6 +2,7 @@
 #include <kernel/heap.h>
 #include <kernel/initrd.h>
 #include <kernel/paging.h>
+#include <kernel/process.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -16,6 +17,13 @@ static int          dirty       = 0;     /* set on any VFS mutation */
 
 #define VFS_PATH_MAX   256
 static char cwd_path_buf[VFS_PATH_MAX];
+
+/* Per-process CWD: use process's cwd if available, else global fallback */
+static uint32_t effective_cwd(void) {
+    if (current_process)
+        return current_process->cwd;
+    return cwd_inode;  /* early boot, before process_init */
+}
 
 #define DIR_INIT_CAP   8   /* initial dirent slots per directory */
 
@@ -173,7 +181,7 @@ int32_t vfs_resolve(const char *path, uint32_t *parent_out, char *leaf_out) {
     if (!path) return -1;
 
     /* Starting inode: root if absolute, cwd if relative */
-    uint32_t cur = (path[0] == '/') ? 0 : cwd_inode;
+    uint32_t cur = (path[0] == '/') ? 0 : effective_cwd();
 
     /* Handle empty path or bare "/" */
     const char *p = path;
@@ -417,7 +425,7 @@ int vfs_remove(const char *path) {
     }
 
     /* Cannot remove cwd */
-    if ((uint32_t)ino == cwd_inode) {
+    if ((uint32_t)ino == effective_cwd()) {
         printf("[vfs] rm: cannot remove current directory\n");
         return -1;
     }
@@ -625,25 +633,30 @@ int vfs_list(uint32_t dir_ino) {
 /* ------------------------------------------------------------------ */
 
 uint32_t vfs_get_cwd(void) {
-    return cwd_inode;
+    return effective_cwd();
 }
 
 int vfs_chdir(const char *path) {
     int32_t ino = vfs_resolve(path, NULL, NULL);
     if (ino < 0) return -1;
     if (inode_table[ino].type != VFS_TYPE_DIR) return -1;
-    cwd_inode = (uint32_t)ino;
+
+    if (current_process)
+        current_process->cwd = (uint32_t)ino;
+    else
+        cwd_inode = (uint32_t)ino;
     return 0;
 }
 
 const char *vfs_get_cwd_path(void) {
-    if (cwd_inode == 0) return "/";
+    uint32_t cwd = effective_cwd();
+    if (cwd == 0) return "/";
 
     /* Build path by walking ".." to root */
     /* Collect components in reverse, then reverse */
     char components[16][VFS_MAX_NAME + 1];
     int depth = 0;
-    uint32_t cur = cwd_inode;
+    uint32_t cur = cwd;
 
     while (cur != 0 && depth < 16) {
         /* Find parent */
@@ -709,6 +722,8 @@ void vfs_reset(void) {
     dir_add_entry(0, "..", 0);
 
     cwd_inode = 0;
+    if (current_process)
+        current_process->cwd = 0;
     dirty = 0;
 }
 

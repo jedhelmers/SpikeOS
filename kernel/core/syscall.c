@@ -9,6 +9,7 @@
 #include <kernel/wait.h>
 #include <kernel/timer.h>
 #include <kernel/tty.h>
+#include <kernel/signal.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -323,6 +324,18 @@ static int32_t sys_dup(trapframe *tf) {
 }
 
 /* ------------------------------------------------------------------ */
+/*  SYS_KILL (18) — send a signal to a process                       */
+/*  EBX = pid, ECX = signal number                                    */
+/* ------------------------------------------------------------------ */
+
+static int32_t sys_kill(trapframe *tf) {
+    uint32_t pid = tf->ebx;
+    int sig      = (int)tf->ecx;
+
+    return (int32_t)proc_signal(pid, sig);
+}
+
+/* ------------------------------------------------------------------ */
 /*  Dispatch table                                                    */
 /* ------------------------------------------------------------------ */
 
@@ -347,6 +360,7 @@ static syscall_fn syscall_table[NUM_SYSCALLS] = {
     [SYS_GETCWD]  = sys_getcwd,
     [SYS_PIPE]    = sys_pipe,
     [SYS_DUP]     = sys_dup,
+    [SYS_KILL]    = sys_kill,
 };
 
 void syscall_dispatch(trapframe *tf) {
@@ -361,4 +375,7 @@ void syscall_dispatch(trapframe *tf) {
 
     int32_t ret = syscall_table[num](tf);
     tf->eax = (uint32_t)ret;
+
+    /* Check for pending signals before returning to user mode */
+    signal_check_pending();
 }
