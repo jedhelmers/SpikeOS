@@ -1,5 +1,15 @@
 #!/bin/sh
 set -e
+
+# Parse flags
+for arg in "$@"; do
+    case "$arg" in
+        -v|--verbose)
+            export KERNEL_CPPFLAGS="-DVERBOSE_BOOT"
+            ;;
+    esac
+done
+
 . ./iso.sh
 
 # Create disk image if it doesn't exist (64 MiB = 131072 sectors)

@@ -20,6 +20,7 @@
 #include <kernel/vfs.h>
 #include <kernel/ata.h>
 #include <kernel/spikefs.h>
+#include <kernel/boot_splash.h>
 
 extern void kprint_howdy(void);
 extern void paging_enable(uint32_t);
@@ -158,148 +159,147 @@ void ring3_test_perprocess(void) {
 
 void kernel_main(void) {
     terminal_initialize();
-    printf("\nHello,\n\tkernels!\n");
 
-    /*
-        GDT setup.
-        We're using a flat-model GDT so we can later
-        implement paging. Securoty will largely be handled
-        by the pages.
-    */
+#ifdef VERBOSE_BOOT
+    printf("\nHello,\n\tkernels!\n");
+#endif
+
     gdt_init();
+#ifdef VERBOSE_BOOT
     printf("INIT Global Descriptor Table (GDT)\n");
+#endif
 
     tss_init();
+#ifdef VERBOSE_BOOT
     printf("INIT Task State Segment (TSS)\n");
 
-    /*
-        TESTING GDT
-    */
     printf("Testing  GDT\n");
     uint16_t cs, ds, ss;
     asm volatile ("mov %%cs, %0" : "=r"(cs));
     asm volatile ("mov %%ds, %0" : "=r"(ds));
     asm volatile ("mov %%ss, %0" : "=r"(ss));
     printf("CS=%x DS=%x SS=%x\n", cs, ds, ss);
+#endif
 
     idt_init();
+#ifdef VERBOSE_BOOT
     printf("INIT Interrupt Descriptor Table (IDT)\n");
+#endif
 
     /* Remap PIC immediately after IDT so that any accidental STI
        (e.g. from kmalloc) won't deliver IRQs on exception vectors.
        Default BIOS mapping: IRQ0→vec8, IRQ1→vec9, etc. which collide
        with CPU exceptions.  After remap: IRQ0→vec32, IRQ1→vec33, etc. */
     pic_remap(0x20, 0x28);
-    /* Mask all IRQs until handlers are ready */
     for (int i = 0; i < 16; i++) pic_set_mask(i);
-    printf("REMAP PIC (IRQs → vectors 32-47, all masked)\n");
+#ifdef VERBOSE_BOOT
+    printf("REMAP PIC (IRQs -> vectors 32-47, all masked)\n");
+#endif
 
+#ifdef VERBOSE_BOOT
     printf("INIT Paging\n");
+#endif
     paging_init();
-    printf("ENABLE Paging\n");
-    // CR3 requires a physical address; page_directory lives in the higher half,
-    // so subtract KERNEL_VMA_OFFSET to convert VMA → physical.
     paging_enable((uint32_t)page_directory - KERNEL_VMA_OFFSET);
-
+#ifdef VERBOSE_BOOT
+    printf("ENABLE Paging\n");
     uint32_t cr0;
     asm volatile("mov %%cr0, %0" : "=r"(cr0));
     printf("CR0 = %x\n", cr0);
+#endif
 
     heap_init();
+#ifdef VERBOSE_BOOT
     printf("INIT Kernel Heap\n");
+#endif
 
-    /* Parse Multiboot info to find initrd module.
-       multiboot_info_ptr is a global set in boot.S from GRUB's EBX.
-       It's in .boot.bss (low physical address, identity-mapped). */
+    /* Parse Multiboot info to find initrd module */
     uint32_t mb_info_phys = multiboot_info_ptr;
     if (mb_info_phys != 0) {
         struct multiboot_info *mb = (struct multiboot_info *)mb_info_phys;
         if ((mb->flags & MB_FLAG_MODS) && mb->mods_count > 0) {
             struct multiboot_mod_entry *mods =
                 (struct multiboot_mod_entry *)mb->mods_addr;
+#ifdef VERBOSE_BOOT
             printf("INIT initrd (phys 0x%x-0x%x)\n",
                    mods[0].mod_start, mods[0].mod_end);
+#endif
             initrd_init(mods[0].mod_start, mods[0].mod_end);
-        } else {
+        }
+#ifdef VERBOSE_BOOT
+        else {
             printf("[initrd] no modules loaded\n");
         }
     } else {
         printf("[initrd] no multiboot info\n");
+#endif
     }
 
+#ifdef VERBOSE_BOOT
     printf("INIT ATA disk driver\n");
+#endif
     ata_init();
 
-    /* Start with a small inode table — grows on demand (btrfs/XFS-style) */
     vfs_init(64);
+#ifdef VERBOSE_BOOT
     printf("INIT Virtual File System (VFS)\n");
+#endif
     vfs_import_initrd();
 
+#ifdef VERBOSE_BOOT
     printf("INIT SpikeFS\n");
+#endif
     spikefs_init();
 
+#ifdef VERBOSE_BOOT
     printf("INIT IRQ0 (Timer)\n");
-    timer_init(100); // 100Hz
-    pic_clear_mask(0); // timer IRQ0
+#endif
+    timer_init(100);
+    pic_clear_mask(0);
+#ifdef VERBOSE_BOOT
     printf("PIC: UNMASK Timer (enable hardware interrupt)\n");
+#endif
 
-
+#ifdef VERBOSE_BOOT
     printf("INIT Process\n");
+#endif
     process_init();
 
+#ifdef VERBOSE_BOOT
     printf("INIT Scheduler\n");
+#endif
     scheduler_init();
 
+#ifdef VERBOSE_BOOT
     printf("INIT IRQ1 (Keyboard)\n");
+#endif
     keyboard_init();
-    pic_clear_mask(1); // keybaord IRQ1
+    pic_clear_mask(1);
+#ifdef VERBOSE_BOOT
     printf("PIC: UNMASK Keyboard (enable hardware interrupt)\n");
+#endif
 
+#ifdef VERBOSE_BOOT
     printf("INIT UART (COM1)\n");
+#endif
     uart_init();
     irq_install_handler(4, uart_irq_handler);
-    pic_clear_mask(4);   // UNMASK IRQ4 (COM1)
+    pic_clear_mask(4);
+#ifdef VERBOSE_BOOT
     printf("PIC: UNMASK UART (IRQ4)\n");
+    printf("Kernel end: %x\n", (uint32_t)&endkernel);
+#endif
 
-    /*
-        TESTING INTERRUPTS
-    */
-    // volatile int x = 1;
-    // volatile int y = 0;
-    // volatile int z = x / y; // EIP=002008F5 CS=00000008 EFLAGS=00010006
-    // (void)z;
+    /* Show boot splash (only in non-verbose mode) */
+#ifndef VERBOSE_BOOT
+    boot_splash();
+    terminal_clear();
+#endif
 
-    // asm volatile ("ud2"); // EIP=002008DD CS=00000008 EFLAGS=00010046
-
-    // asm volatile("int $3"); // EIP=002008DE CS=00000008 EFLAGS=00000046
-
-    /*
-        Start Kernel Shell
-    */
-
-    // uint32_t virt = 0x0060cc24;
-    // uint32_t phys = virt_to_phys(virt);
-
-    // printf("Alias Virtual:  %x\n", virt);
-    // printf("Alias Physical: %x\n", phys);
-
-    printf("Kernel end: %x\n", (uint32_t)&endkernel); // THIS PRINTS: 0022F800
-
-    /* Per-process page directory test: creates a user process with its
-       own page directory, proving CR3 switching + ring-3 works.
-       Comment out to boot normally into the shell. */
     // ring3_test_perprocess();
-
-    // proc_create_kernel_thread(thread_inc);
-    // proc_create_kernel_thread(thread_mid);
-    // proc_create_kernel_thread(thread_dec);
     proc_create_kernel_thread(shell_run);
-    
-
-    // kprint_howdy();
 
     shell_run();
-    // printf("INIT K-SHELL\n");
 
     asm volatile ("sti");
 }

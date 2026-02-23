@@ -78,12 +78,14 @@ static void keyboard_irq(trapframe* r) {
     e.ch   = 0;
 
     if (extended) {
-        /* Arrow keys (E0-prefixed) */
+        /* Extended keys (E0-prefixed) */
         switch (sc) {
-            case 0x48: e.type = KEY_UP;    break;
-            case 0x50: e.type = KEY_DOWN;  break;
-            case 0x4B: e.type = KEY_LEFT;  break;
-            case 0x4D: e.type = KEY_RIGHT; break;
+            case 0x48: e.type = KEY_UP;        break;
+            case 0x50: e.type = KEY_DOWN;      break;
+            case 0x4B: e.type = KEY_LEFT;      break;
+            case 0x4D: e.type = KEY_RIGHT;     break;
+            case 0x49: e.type = KEY_PAGE_UP;   break;
+            case 0x51: e.type = KEY_PAGE_DOWN; break;
         }
         extended = 0;
     } else if (ctrl_held && sc == 0x2E) {

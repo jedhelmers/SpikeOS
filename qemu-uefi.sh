@@ -7,6 +7,16 @@
 #
 # Requires: hybrid ISO built with EFI support (run setup-efi.sh first)
 set -e
+
+# Parse flags
+for arg in "$@"; do
+    case "$arg" in
+        -v|--verbose)
+            export KERNEL_CPPFLAGS="-DVERBOSE_BOOT"
+            ;;
+    esac
+done
+
 . ./iso.sh
 
 # OVMF firmware bundled with QEMU (Homebrew)

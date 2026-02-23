@@ -19,6 +19,17 @@ static size_t terminal_column;
 static uint8_t terminal_color;
 static uint16_t* terminal_buffer = (uint16_t*)VGA_MEMORY;
 
+/* Scrollback ring buffer */
+#define SCROLLBACK_LINES 200
+static uint16_t scrollback[SCROLLBACK_LINES][80];
+static size_t sb_head  = 0;   /* next write slot in ring */
+static size_t sb_count = 0;   /* lines stored (capped at SCROLLBACK_LINES) */
+static int    sb_offset = 0;  /* view offset: 0 = bottom, >0 = scrolled back */
+
+/* Saved screen snapshot when entering scrollback mode */
+static uint16_t saved_screen[25 * 80];
+static int sb_saved = 0;
+
 
 static void terminal_update_cursor(void) {
     if (vga_busy) return;   /* VGA mid-switch; skip to avoid port 0x3D4/5 race */
@@ -155,10 +166,34 @@ void terminal_initialize(void) {
 }
 
 void terminal_clear(void) {
+    sb_head = 0;
+    sb_count = 0;
+    sb_offset = 0;
+    sb_saved = 0;
     terminal_initialize();
 }
 
+/* Restore saved screen and exit scrollback mode */
+static void terminal_snap_to_bottom(void) {
+    if (sb_offset > 0 && sb_saved) {
+        for (size_t i = 0; i < VGA_HEIGHT * VGA_WIDTH; i++)
+            terminal_buffer[i] = saved_screen[i];
+        sb_offset = 0;
+        sb_saved = 0;
+        terminal_update_cursor();
+    }
+}
+
 void terminal_scroll(void) {
+    /* If scrolled back, snap to bottom first */
+    terminal_snap_to_bottom();
+
+    /* Save the top row into scrollback ring before it's lost */
+    for (size_t x = 0; x < VGA_WIDTH; x++)
+        scrollback[sb_head][x] = terminal_buffer[x];
+    sb_head = (sb_head + 1) % SCROLLBACK_LINES;
+    if (sb_count < SCROLLBACK_LINES) sb_count++;
+
     // Shift the terminal buffer index
     for (size_t y = 1; y < VGA_HEIGHT; y++) {
         for (size_t x = 0; x < VGA_WIDTH; x++) {
@@ -190,13 +225,20 @@ void terminal_tab() {
 }
 
 void terminal_newline() {
+    terminal_snap_to_bottom();
     terminal_column = 0;
     terminal_row++;
+
+    if (terminal_row >= VGA_HEIGHT) {
+        terminal_scroll();
+        terminal_row = VGA_HEIGHT - 1;
+    }
 
     terminal_update_cursor();
 }
 
 void terminal_putchar(char c) {
+    terminal_snap_to_bottom();
     terminal_putentryat(c, terminal_color, terminal_column, terminal_row);
     terminal_column++;
 
@@ -249,4 +291,72 @@ void terminal_setforeground(uint8_t fg) {
 
 void terminal_setbackground(uint8_t bg) {
     terminal_color = vga_entry_color((terminal_color & VGA_FG_MASK), (enum vga_color)bg);
+}
+
+void terminal_setcursor(size_t x, size_t y) {
+    terminal_column = x;
+    terminal_row = y;
+    terminal_update_cursor();
+}
+
+/* Redraw screen from scrollback + saved screen snapshot */
+static void terminal_redraw_scrollback(void) {
+    for (int y = 0; y < (int)VGA_HEIGHT; y++) {
+        /* virtual line index: 0 = oldest scrollback line */
+        int vline = (int)sb_count - sb_offset + y;
+
+        if (vline < 0) {
+            /* Past beginning of history — blank line */
+            for (size_t x = 0; x < VGA_WIDTH; x++)
+                terminal_buffer[y * VGA_WIDTH + x] = vga_entry(' ', terminal_color);
+        } else if (vline < (int)sb_count) {
+            /* From scrollback ring buffer */
+            int idx = ((int)sb_head - (int)sb_count + vline
+                       + SCROLLBACK_LINES) % SCROLLBACK_LINES;
+            for (size_t x = 0; x < VGA_WIDTH; x++)
+                terminal_buffer[y * VGA_WIDTH + x] = scrollback[idx][x];
+        } else {
+            /* From saved screen snapshot */
+            int sy = vline - (int)sb_count;
+            if (sy < (int)VGA_HEIGHT) {
+                for (size_t x = 0; x < VGA_WIDTH; x++)
+                    terminal_buffer[y * VGA_WIDTH + x] = saved_screen[sy * VGA_WIDTH + x];
+            }
+        }
+    }
+}
+
+void terminal_page_up(void) {
+    if (sb_count == 0) return;
+
+    /* Save current screen on first scroll-back */
+    if (sb_offset == 0) {
+        for (size_t i = 0; i < VGA_HEIGHT * VGA_WIDTH; i++)
+            saved_screen[i] = terminal_buffer[i];
+        sb_saved = 1;
+    }
+
+    sb_offset += (int)VGA_HEIGHT;
+    if (sb_offset > (int)sb_count) sb_offset = (int)sb_count;
+
+    terminal_redraw_scrollback();
+}
+
+void terminal_page_down(void) {
+    if (sb_offset == 0) return;
+
+    sb_offset -= (int)VGA_HEIGHT;
+    if (sb_offset <= 0) {
+        /* Snap back to live view */
+        sb_offset = 0;
+        if (sb_saved) {
+            for (size_t i = 0; i < VGA_HEIGHT * VGA_WIDTH; i++)
+                terminal_buffer[i] = saved_screen[i];
+            sb_saved = 0;
+        }
+        terminal_update_cursor();
+        return;
+    }
+
+    terminal_redraw_scrollback();
 }
