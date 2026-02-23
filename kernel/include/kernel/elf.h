@@ -72,7 +72,14 @@ typedef struct {
 struct process *elf_load_and_exec(uint32_t file_phys, uint32_t file_size);
 
 /*
- * Load an ELF binary by name (looks up in initrd).
+ * Load an ELF binary from the VFS by path.
+ * path: VFS path (e.g. "/hello.elf" or "hello.elf")
+ * Returns pointer to the created process, or NULL on failure.
+ */
+struct process *elf_load_from_vfs(const char *path);
+
+/*
+ * Load an ELF binary by name (tries VFS first, falls back to initrd).
  * name: filename (e.g. "hello.elf")
  * Returns pointer to the created process, or NULL on failure.
  */

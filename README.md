@@ -105,13 +105,13 @@ All init `printf` calls are wrapped in `#ifdef VERBOSE_BOOT`. Without the flag, 
 | `kernel/mm/` | Paging (page directory/tables, frame allocator, page fault handler) and heap allocator |
 | `kernel/fs/` | VFS, SpikeFS on-disk filesystem, initrd, file descriptors, pipes |
 | `kernel/drivers/` | ATA disk, keyboard, UART, PIC, timer, VGA mode 13h, debug log |
-| `kernel/proc/` | Process table, scheduler, ELF loader, wait queues |
+| `kernel/proc/` | Process table, scheduler, ELF loader, wait queues, mutex/semaphore |
 | `kernel/shell/` | Kernel shell, Tetris, boot splash |
 | `kernel/include/kernel/` | All kernel headers (flat) |
 | `libc/` | Freestanding kernel libc (`libk.a`): printf, string, stdlib/abort |
 | `scripts/` | Build, run, and setup scripts |
 | `tools/` | Host-side build tools (mkinitrd) |
-| `userland/` | User-mode test programs |
+| `userland/` | User-mode programs and libc (crt0, syscall wrappers, stdio, string) |
 | `sysroot/` | Staging install directory (headers + libraries) |
 | `isodir/` | ISO staging directory with GRUB config |
 
@@ -164,7 +164,7 @@ All init `printf` calls are wrapped in `#ifdef VERBOSE_BOOT`. Without the flag, 
 |---|------|------|-------------|
 | 0 | `SYS_EXIT` | EBX=status | Close fds, free PD, wake parent, mark ZOMBIE |
 | 1 | `SYS_WRITE` | EBX=fd, ECX=buf, EDX=len | Write to fd (console, VFS file, or pipe) |
-| 2 | `SYS_READ` | EBX=fd, ECX=buf, EDX=len | Read from fd (blocks if pipe empty) |
+| 2 | `SYS_READ` | EBX=fd, ECX=buf, EDX=len | Read from fd (VFS, pipe, or console; blocks if empty) |
 | 3 | `SYS_OPEN` | EBX=path, ECX=flags | Open VFS file, returns fd |
 | 4 | `SYS_CLOSE` | EBX=fd | Close file descriptor |
 | 5 | `SYS_SEEK` | EBX=fd, ECX=off, EDX=whence | Seek within VFS file |
@@ -172,24 +172,26 @@ All init `printf` calls are wrapped in `#ifdef VERBOSE_BOOT`. Without the flag, 
 | 7 | `SYS_GETPID` | — | Return current PID |
 | 8 | `SYS_SLEEP` | EBX=ticks | Sleep for N ticks (10ms each) |
 | 9 | `SYS_BRK` | EBX=addr | Adjust process break (stub) |
-| 10 | `SYS_SPAWN` | EBX=name | Spawn ELF from initrd |
+| 10 | `SYS_SPAWN` | EBX=name | Spawn ELF (VFS first, then initrd) |
 | 11 | `SYS_WAITPID` | EBX=pid, ECX=&status | Wait for child to exit |
 | 12 | `SYS_MKDIR` | EBX=path | Create directory |
 | 13 | `SYS_UNLINK` | EBX=path | Remove file or empty directory |
-| 14 | `SYS_CHDIR` | EBX=path | Change working directory |
+| 14 | `SYS_CHDIR` | EBX=path | Change per-process working directory |
 | 15 | `SYS_GETCWD` | EBX=buf, ECX=size | Get current working directory |
 | 16 | `SYS_PIPE` | EBX=int[2] | Create pipe (read/write fd pair) |
 | 17 | `SYS_DUP` | EBX=fd | Duplicate file descriptor |
+| 18 | `SYS_KILL` | EBX=pid, ECX=sig | Send signal to process |
 
 ### Process & Scheduling
 
 - Process states: `NEW -> READY -> RUNNING -> BLOCKED -> ZOMBIE`
-- Each process has its own kernel stack (4 KB), saved CPU context (ESP/EBP), page directory (CR3), and file descriptor table (16 fds)
+- Each process has its own kernel stack (4 KB), saved CPU context (ESP/EBP), page directory (CR3), file descriptor table (16 fds), cwd inode, and pending signal bitmask
 - Process hierarchy: parent_pid, exit_status, wait queue for waitpid blocking
 - Round-robin scheduler, timer-driven (fires on each IRQ0 tick at 100 Hz)
 - `proc_create_kernel_thread(fn)` — create a kernel-mode thread, initializes stdin/stdout/stderr
 - `proc_create_user_process(pd_phys, eip, esp)` — create a ring-3 process with its own page directory
-- `elf_spawn(name)` — spawn user process from initrd ELF, sets parent_pid
+- `elf_spawn(name)` — spawn user process (VFS first, then initrd fallback), sets parent_pid
+- `proc_signal(pid, sig)` — send signal to process (all signals currently fatal)
 - Context switch: saves trapframe + ESP, picks next READY process, updates TSS esp0, switches CR3 via HAL
 
 ### Virtual File System (VFS)
@@ -202,7 +204,8 @@ In-memory inode-based filesystem (like Linux's page cache). All data lives in km
 - **Directories**: `data` points to a dynamic array of dirents (name + inode number), grows via krealloc
 - **Directory entries**: 64 bytes each (60-byte name + 4-byte inode number)
 - **Root directory**: always inode 0, contains `.` and `..` entries pointing to itself
-- **Path resolution**: iterative walk, starts from root (absolute) or cwd (relative), handles `.` and `..`
+- **Path resolution**: iterative walk, starts from root (absolute) or per-process cwd (relative), handles `.` and `..`
+- **Per-process CWD**: each process has its own `cwd` inode (inherited from parent); falls back to global during early boot
 - **Dirty tracking**: global dirty flag set on any mutation; supports write-back to disk
 - **Link counting**: inodes freed when link count reaches 0
 
@@ -244,15 +247,39 @@ Per-process fd table (16 fds) backed by a system-wide open file pool (64 entries
 
 ### Pipes
 
-Kernel IPC via 512-byte circular buffer. Blocking: read sleeps when empty (via wait queue), write sleeps when full. EOF on read when no writers remain; broken pipe on write when no readers remain. Created via `pipe_create()` which returns a read/write fd pair.
+Kernel IPC via 512-byte circular buffer. Blocking: read sleeps when empty (via wait queue), write sleeps when full. EOF on read when no writers remain; writing to closed reader sends `SIGPIPE` and returns -1. Created via `pipe_create()` which returns a read/write fd pair.
 
 ### Wait Queues
 
-Blocking mechanism for processes. `sleep_on(wq)` sets process to BLOCKED and spins until woken. `wake_up_one(wq)` / `wake_up_all(wq)` set blocked processes back to READY. Used by pipes (read/write blocking) and waitpid (parent waits for child exit).
+Blocking mechanism for processes. `sleep_on(wq)` sets process to BLOCKED and spins until woken. `wake_up_one(wq)` / `wake_up_all(wq)` set blocked processes back to READY. Used by pipes, waitpid, keyboard blocking, and mutex/semaphore blocking.
+
+### Synchronization Primitives
+
+Kernel-level locking in `kernel/proc/mutex.c`. Built on interrupt-disabling (uniprocessor — no CAS needed) and wait queues.
+
+- **Spinlock**: disables interrupts on lock, restores on unlock. For short critical sections.
+- **Mutex**: blocking lock via wait queue when contended. Tracks owner process.
+- **Semaphore**: counting semaphore — blocks if count <= 0, wakes one waiter on post.
+- **Condition Variable**: `condvar_wait(cv, mutex)` releases mutex, sleeps, re-acquires on wakeup. Signal wakes one, broadcast wakes all.
+- **Read-Write Lock**: multiple readers OR one writer. Writer starvation prevention via pending writer count. Separate read/write wait queues.
+- These are kernel primitives. C11/POSIX mutex APIs are userland wrappers that call into these.
+
+### Signals
+
+Basic signal delivery (`kernel/include/kernel/signal.h`, `kernel/proc/process.c`).
+
+- Supported: `SIGKILL` (9), `SIGSEGV` (11), `SIGPIPE` (13)
+- `proc_signal(pid, sig)` sets a bit in `pending_signals`, wakes BLOCKED processes
+- `signal_check_pending()` called after every syscall — all signals currently fatal (no user handlers)
+- Sources: `SYS_KILL` syscall, page fault handler (SIGSEGV), pipe broken-write (SIGPIPE)
+
+### Blocking Console Read
+
+`fd_read()` on stdin now blocks via `keyboard_get_event_blocking()` instead of returning -1. Keyboard IRQ wakes the wait queue; returns one character at a time (raw mode).
 
 ### Page Fault Handler
 
-ISR 14 handler reads CR2 (faulting address). User-mode faults kill the process and yield to the scheduler. Kernel-mode faults print a register dump and halt (unrecoverable).
+ISR 14 handler reads CR2 (faulting address). User-mode faults send `SIGSEGV` (kills the process) and yield to the scheduler. Kernel-mode faults print a register dump and halt (unrecoverable).
 
 ### Terminal & Scrollback
 
@@ -271,6 +298,17 @@ VGA 80x25 text mode driver with color output, cursor management, and a 200-line 
 - Animated progress bar that fills character-by-character
 - "Press any key to continue..." prompt — temporarily enables interrupts for keyboard input
 - Busy-wait timing for animations (interrupts enabled only for the key-press wait)
+
+### Userland Libc
+
+Freestanding C library for user-mode programs (`userland/libc/`). Built with `-nostdlib -ffreestanding`, linked statically at `0x08048000`.
+
+- `crt0.S` — C runtime startup (`_start` → `main()` → `_exit()`)
+- `syscall.h` — inline `int $0x80` wrappers for all 19 syscalls
+- `unistd.h` — POSIX-like function wrappers (write, read, getpid, spawn, kill, etc.)
+- `stdio.h/c` — `printf` (`%d`, `%u`, `%x`, `%s`, `%c`, `%%`), `putchar`, `puts`
+- `string.h/c` — `strlen`, `memcpy`, `memset`, `strcmp`, `strcpy`
+- Build: `make -C userland` (called automatically by `scripts/iso.sh`)
 
 ### UEFI Boot Support
 
@@ -300,13 +338,14 @@ Shell prompt shows current working directory: `jedhelmers:/path> `
 | `cp <src> <dst>` | Copy file |
 | `sync` | Immediately persist filesystem to disk |
 | `format` | Reformat disk (erases all data!) |
-| `exec <name>` | Run ELF binary from initrd |
+| `exec <name>` | Run ELF binary (VFS first, then initrd) |
 | `run` | Start test thread |
+| `run concurrent` | Mutex demo: two threads inc/dec a shared counter |
 | `run tetris` | Play Tetris (WASD=move, Space=drop, Q=quit) |
 | `ps` | List processes |
-| `kill <pid>` | Kill process by PID |
+| `kill <pid>` | Send SIGKILL to process by PID |
 | `meminfo` | Show heap info |
-| `test <name>` | Run kernel tests: `fd`, `pipe`, `sleep`, `stat`, `waitpid`, or `all` |
+| `test <name>` | Run kernel tests: `fd`, `pipe`, `sleep`, `stat`, `stdin`, `waitpid`, `mutex`, `sem`, `signal`, `cwd`, `condvar`, `rwlock`, or `all` |
 | `clear` | Clear screen |
 
 ## Key Files
@@ -316,7 +355,7 @@ Shell prompt shows current working directory: `jedhelmers:/path> `
 | `kernel/core/kernel.c` | Kernel entry point, init sequence, test functions |
 | `kernel/core/gdt.c` | GDT with kernel + user segments + TSS |
 | `kernel/core/isr.c` | Interrupt/exception/syscall dispatcher |
-| `kernel/core/syscall.c` | Syscall dispatcher and 18 syscall implementations |
+| `kernel/core/syscall.c` | Syscall dispatcher and 19 syscall implementations |
 | `kernel/mm/paging.c` | Page directory/table management, frame allocator, temp mapping, per-process PDs, page fault handler |
 | `kernel/mm/heap.c` | Kernel heap allocator (kmalloc/kfree) |
 | `kernel/fs/vfs.c` | In-memory VFS: growable inode table, directories, path resolution, file I/O, dirty tracking |
@@ -328,12 +367,19 @@ Shell prompt shows current working directory: `jedhelmers:/path> `
 | `kernel/proc/process.c` | Process table, kernel thread + user process creation, fd init, process kill |
 | `kernel/proc/scheduler.c` | Round-robin scheduler with CR3 switching (via HAL) |
 | `kernel/proc/wait.c` | Wait queue implementation: sleep_on, wake_up_one, wake_up_all |
+| `kernel/proc/mutex.c` | Spinlock, mutex, and counting semaphore implementations |
+| `kernel/proc/condvar.c` | Condition variable implementation |
+| `kernel/proc/rwlock.c` | Read-write lock implementation |
 | `kernel/shell/shell.c` | Kernel shell with command parsing, filesystem commands, test commands, auto write-back |
 | `kernel/shell/boot_splash.c` | 1980s-style retro boot splash |
 | `kernel/arch/i386/hal.c` | HAL implementation for i386: interrupt, I/O, TLB, MMU wrappers |
 | `kernel/arch/i386/isr_stub.S` | ISR/IRQ/syscall assembly stubs, context switch via stack swap |
 | `kernel/arch/i386/boot.S` | Multiboot entry, bootstrap paging, jump to higher-half |
 | `kernel/arch/i386/linker.ld` | Linker script: physical load at 0x200000, VMA at 0xC0000000+ |
+| `userland/hello.c` | User-mode test program using libc |
+| `userland/Makefile` | Build rules for userland libc + user programs |
+| `userland/libc/syscall.h` | Inline `int $0x80` syscall wrappers |
+| `userland/libc/stdio.c` | User-mode printf/putchar/puts |
 | `scripts/qemu.sh` | Build + run in QEMU (BIOS) |
 | `scripts/qemu-uefi.sh` | Build + run in QEMU with UEFI firmware (OVMF/EDK2) |
 | `scripts/setup-efi.sh` | One-time setup: symlinks x86_64-efi GRUB modules for hybrid ISO |

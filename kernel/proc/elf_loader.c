@@ -2,6 +2,7 @@
 #include <kernel/paging.h>
 #include <kernel/process.h>
 #include <kernel/initrd.h>
+#include <kernel/vfs.h>
 #include <kernel/heap.h>
 #include <string.h>
 #include <stdio.h>
@@ -208,11 +209,140 @@ fail:
     return NULL;
 }
 
-struct process *elf_spawn(const char *name) {
-    uint32_t file_phys, file_size;
+/*
+ * Load an ELF binary from the VFS and create a user process.
+ * VFS file data (node->data) is already a contiguous heap buffer,
+ * so we can parse ELF headers directly via pointer arithmetic.
+ */
+struct process *elf_load_from_vfs(const char *path) {
+    int32_t ino = vfs_resolve(path, NULL, NULL);
+    if (ino < 0) return NULL;
 
+    vfs_inode_t *node = vfs_get_inode((uint32_t)ino);
+    if (!node || node->type != VFS_TYPE_FILE || node->size == 0)
+        return NULL;
+
+    uint8_t *file_data = (uint8_t *)node->data;
+    uint32_t file_size = node->size;
+
+    /* ---- 1. Validate ELF header ---- */
+    if (file_size < sizeof(Elf32_Ehdr)) return NULL;
+
+    Elf32_Ehdr *ehdr = (Elf32_Ehdr *)file_data;
+
+    if (ehdr->e_ident[EI_MAG0] != ELFMAG0 ||
+        ehdr->e_ident[EI_MAG1] != ELFMAG1 ||
+        ehdr->e_ident[EI_MAG2] != ELFMAG2 ||
+        ehdr->e_ident[EI_MAG3] != ELFMAG3)
+        return NULL;
+
+    if (ehdr->e_ident[EI_CLASS] != ELFCLASS32 ||
+        ehdr->e_ident[EI_DATA]  != ELFDATA2LSB ||
+        ehdr->e_type    != ET_EXEC ||
+        ehdr->e_machine != EM_386 ||
+        ehdr->e_phnum   == 0)
+        return NULL;
+
+    /* ---- 2. Locate program headers ---- */
+    uint32_t ph_off  = ehdr->e_phoff;
+    uint16_t ph_num  = ehdr->e_phnum;
+    uint16_t ph_entsz = ehdr->e_phentsize;
+
+    if (ph_off + ph_num * ph_entsz > file_size)
+        return NULL;
+
+    Elf32_Phdr *phdrs = (Elf32_Phdr *)(file_data + ph_off);
+
+    /* ---- 3. Create a new page directory ---- */
+    uint32_t pd_phys = pgdir_create();
+    if (pd_phys == 0) return NULL;
+
+    /* ---- 4. Map each PT_LOAD segment ---- */
+    for (uint16_t i = 0; i < ph_num; i++) {
+        Elf32_Phdr *ph = &phdrs[i];
+        if (ph->p_type != PT_LOAD || ph->p_memsz == 0) continue;
+
+        if (ph->p_vaddr >= 0xC0000000u) goto fail;
+
+        uint32_t start_page = ph->p_vaddr & ~0xFFFu;
+        uint32_t end_addr   = ph->p_vaddr + ph->p_memsz;
+        uint32_t end_page   = (end_addr + PAGE_SIZE - 1) & ~0xFFFu;
+
+        for (uint32_t pv = start_page; pv < end_page; pv += PAGE_SIZE) {
+            uint32_t frame = alloc_frame();
+            if (frame == 0) goto fail;
+
+            if (pgdir_map_user_page(pd_phys, pv, frame,
+                                    PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER) != 0) {
+                free_frame(frame);
+                goto fail;
+            }
+
+            memset(elf_staging, 0, PAGE_SIZE);
+
+            uint32_t seg_file_start = ph->p_vaddr;
+            uint32_t seg_file_end   = ph->p_vaddr + ph->p_filesz;
+            uint32_t page_end       = pv + PAGE_SIZE;
+
+            uint32_t copy_start = (pv > seg_file_start) ? pv : seg_file_start;
+            uint32_t copy_end   = (page_end < seg_file_end) ? page_end : seg_file_end;
+
+            if (copy_start < copy_end) {
+                uint32_t off_in_page = copy_start - pv;
+                uint32_t off_in_file = copy_start - ph->p_vaddr;
+
+                memcpy(elf_staging + off_in_page,
+                       file_data + ph->p_offset + off_in_file,
+                       copy_end - copy_start);
+            }
+
+            uint8_t *dest = (uint8_t *)temp_map(frame);
+            memcpy(dest, elf_staging, PAGE_SIZE);
+            temp_unmap();
+        }
+    }
+
+    /* ---- 5. Allocate and map user stack ---- */
+    {
+        uint32_t stack_frame = alloc_frame();
+        if (stack_frame == 0) goto fail;
+
+        if (pgdir_map_user_page(pd_phys, USER_STACK_VADDR, stack_frame,
+                                PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER) != 0) {
+            free_frame(stack_frame);
+            goto fail;
+        }
+
+        uint8_t *sp = (uint8_t *)temp_map(stack_frame);
+        memset(sp, 0, PAGE_SIZE);
+        temp_unmap();
+    }
+
+    /* ---- 6. Create the user process ---- */
+    {
+        struct process *p = proc_create_user_process(pd_phys, ehdr->e_entry,
+                                                      USER_STACK_TOP);
+        if (!p) {
+            pgdir_destroy(pd_phys);
+            return NULL;
+        }
+        return p;
+    }
+
+fail:
+    pgdir_destroy(pd_phys);
+    return NULL;
+}
+
+struct process *elf_spawn(const char *name) {
+    /* Try VFS first (files are imported from initrd at boot) */
+    struct process *p = elf_load_from_vfs(name);
+    if (p) return p;
+
+    /* Fall back to initrd for files not yet in VFS */
+    uint32_t file_phys, file_size;
     if (initrd_find(name, &file_phys, &file_size) != 0) {
-        printf("[elf] '%s' not found in initrd\n", name);
+        printf("[elf] '%s' not found\n", name);
         return NULL;
     }
 

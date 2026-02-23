@@ -8,5 +8,6 @@
 
 void keyboard_init(void);
 key_event_t keyboard_get_event(void);
+key_event_t keyboard_get_event_blocking(void);
 
 #endif

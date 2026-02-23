@@ -10,7 +10,7 @@ fi
 cc -o tools/mkinitrd tools/mkinitrd.c
 
 # Build userland programs
-i686-elf-gcc -nostdlib -ffreestanding -static -Wl,-Ttext=0x08048000 -o userland/hello.elf userland/hello.c
+make -C userland
 
 # Create initrd
 tools/mkinitrd initrd.img userland/hello.elf

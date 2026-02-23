@@ -167,10 +167,33 @@ int32_t fd_read(int fd, void *buf, uint32_t count) {
     open_file_t *of = &open_file_table[ofi];
 
     switch (of->type) {
-    case FD_TYPE_CONSOLE:
-        /* Console read: read from keyboard buffer */
-        /* For now, return -1 (will be replaced with blocking read) */
-        return -1;
+    case FD_TYPE_CONSOLE: {
+        /* Blocking character-at-a-time read from keyboard */
+        uint8_t *out = (uint8_t *)buf;
+        uint32_t total = 0;
+
+        while (total < count) {
+            key_event_t e = keyboard_get_event_blocking();
+
+            switch (e.type) {
+            case KEY_CHAR:
+                out[total++] = (uint8_t)e.ch;
+                break;
+            case KEY_ENTER:
+                out[total++] = '\n';
+                break;
+            case KEY_BACKSPACE:
+                out[total++] = '\b';
+                break;
+            default:
+                break;
+            }
+
+            /* Return after first character (raw mode) */
+            if (total > 0) break;
+        }
+        return (int32_t)total;
+    }
 
     case FD_TYPE_VFS: {
         int32_t n = vfs_read(of->ino, buf, of->offset, count);

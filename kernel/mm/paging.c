@@ -2,6 +2,7 @@
 #include <kernel/process.h>
 #include <kernel/isr.h>
 #include <kernel/hal.h>
+#include <kernel/signal.h>
 #include <stdint.h>
 
 uint32_t page_directory[PAGE_ENTRIES] __attribute__((aligned(PAGE_SIZE)));
@@ -316,22 +317,17 @@ void page_fault_handler(trapframe *tf) {
     int user     = tf->err_code & 0x4;
 
     if (user) {
-        /* User-mode page fault: kill the offending process */
+        /* User-mode page fault: send SIGSEGV */
         printf("\n[PAGE FAULT] PID %d: %s %s at 0x%x (EIP=0x%x)\n",
                current_process->pid,
                write ? "write" : "read",
                present ? "protection violation" : "not-present page",
                fault_addr, tf->eip);
 
-        current_process->state = PROC_ZOMBIE;
+        proc_signal(current_process->pid, SIGSEGV);
+        signal_check_pending();
 
-        if (current_process->cr3 != 0) {
-            hal_set_cr3(get_kernel_cr3());
-            pgdir_destroy(current_process->cr3);
-            current_process->cr3 = 0;
-        }
-
-        /* Yield — scheduler will pick next process */
+        /* If still running (shouldn't be), halt */
         hal_irq_enable();
         for (;;) hal_halt();
     }

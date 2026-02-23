@@ -33,8 +33,9 @@ struct trapframe;
 #define SYS_GETCWD  15
 #define SYS_PIPE    16
 #define SYS_DUP     17
+#define SYS_KILL    18
 
-#define NUM_SYSCALLS 18
+#define NUM_SYSCALLS 19
 
 /*
  * Stat struct — returned by SYS_STAT.

@@ -1,4 +1,5 @@
 #include <kernel/keyboard.h>
+#include <kernel/wait.h>
 
 #define KBD_BUF_SIZE 128
 
@@ -6,6 +7,8 @@
 static key_event_t kbd_buf[KBD_BUF_SIZE];
 static volatile uint8_t kbd_head = 0;
 static volatile uint8_t kbd_tail = 0;
+
+static wait_queue_t keyboard_wq = WAIT_QUEUE_INIT;
 
 static int ctrl_held = 0;
 static int extended  = 0;  /* set when 0xE0 prefix received */
@@ -40,6 +43,16 @@ key_event_t keyboard_get_event(void) {
     kbd_tail = (kbd_tail + 1) % KBD_BUF_SIZE;
 
     return o;
+}
+
+key_event_t keyboard_get_event_blocking(void) {
+    key_event_t e;
+    while (1) {
+        e = keyboard_get_event();
+        if (e.type != KEY_NONE)
+            return e;
+        sleep_on(&keyboard_wq);
+    }
 }
 
 static void keyboard_irq(trapframe* r) {
@@ -106,6 +119,7 @@ static void keyboard_irq(trapframe* r) {
 
     if (e.type != KEY_NONE) {
         kbd_push(e);
+        wake_up_one(&keyboard_wq);
     }
 }
 
