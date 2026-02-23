@@ -10,7 +10,11 @@ for arg in "$@"; do
     esac
 done
 
-. ./iso.sh
+if [ -z "${SPIKEOS_ROOT:-}" ]; then
+    SPIKEOS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+    cd "$SPIKEOS_ROOT"
+fi
+. scripts/iso.sh
 
 # Create disk image if it doesn't exist (64 MiB = 131072 sectors)
 if [ ! -f disk.img ]; then
@@ -20,8 +24,8 @@ fi
 
 # -serial pty allows for PTY psuedo-terminal
 # This is required when developing UART interrupts
-# qemu-system-$(./target-triplet-to-arch.sh $HOST) -cdrom myos.iso -serial pty
-qemu-system-$(./target-triplet-to-arch.sh $HOST) \
+# qemu-system-$(scripts/target-triplet-to-arch.sh $HOST) -cdrom myos.iso -serial pty
+qemu-system-$(scripts/target-triplet-to-arch.sh $HOST) \
     -drive file=disk.img,format=raw,if=ide,index=0,media=disk \
     -cdrom myos.iso \
     -device virtio-gpu-pci \

@@ -2,9 +2,9 @@ CC := i686-elf-gcc
 AS := i686-elf-as
 LD := i686-elf-ld
 
-DEFAULT_HOST := $(shell ../default-host.sh)
+DEFAULT_HOST := $(shell ../scripts/default-host.sh)
 HOST ?= $(DEFAULT_HOST)
-HOSTARCH := $(shell ../target-triplet-to-arch.sh $(HOST))
+HOSTARCH := $(shell ../scripts/target-triplet-to-arch.sh $(HOST))
 
 CFLAGS?=-O2 -g
 CPPFLAGS?=
@@ -31,7 +31,7 @@ CPPFLAGS:=$(CPPFLAGS) $(KERNEL_ARCH_CPPFLAGS)
 LDFLAGS:=$(LDFLAGS) $(KERNEL_ARCH_LDFLAGS)
 LIBS:=$(LIBS) -nostdlib -L../sysroot/usr/lib -lk -lgcc
 
-KERNEL_OBJS := $(KERNEL_ARCH_OBJS) kernel/kernel.o
+KERNEL_OBJS := $(KERNEL_ARCH_OBJS) core/kernel.o
 
 OBJS := $(ARCHDIR)/crti.o $(ARCHDIR)/crtbegin.o $(KERNEL_OBJS) $(ARCHDIR)/crtend.o $(ARCHDIR)/crtn.o
 

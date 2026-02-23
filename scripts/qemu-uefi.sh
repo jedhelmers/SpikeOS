@@ -5,7 +5,7 @@
 # GRUB (x86_64-efi) on the ISO handles the transition from 64-bit long mode
 # to 32-bit protected mode before loading the Multiboot kernel.
 #
-# Requires: hybrid ISO built with EFI support (run setup-efi.sh first)
+# Requires: hybrid ISO built with EFI support (run scripts/setup-efi.sh first)
 set -e
 
 # Parse flags
@@ -17,7 +17,11 @@ for arg in "$@"; do
     esac
 done
 
-. ./iso.sh
+if [ -z "${SPIKEOS_ROOT:-}" ]; then
+    SPIKEOS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+    cd "$SPIKEOS_ROOT"
+fi
+. scripts/iso.sh
 
 # OVMF firmware bundled with QEMU (Homebrew)
 OVMF_CODE="/opt/homebrew/share/qemu/edk2-x86_64-code.fd"

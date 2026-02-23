@@ -7,6 +7,10 @@
 # Prerequisites:
 #   brew install x86_64-elf-grub mtools
 set -e
+if [ -z "${SPIKEOS_ROOT:-}" ]; then
+    SPIKEOS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+    cd "$SPIKEOS_ROOT"
+fi
 
 # Resolve i686-elf-grub's module directory
 I686_PREFIX="$(brew --prefix i686-elf-grub)"
