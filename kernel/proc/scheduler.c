@@ -2,10 +2,8 @@
 #include <kernel/process.h>
 #include <kernel/isr.h>
 #include <kernel/tss.h>
+#include <kernel/hal.h>
 #include <stddef.h>
-
-// REMOVE
-#include <kernel/tty.h>
 
 // Round-robbin
 static uint32_t sched_index = 0;
@@ -60,7 +58,7 @@ uint32_t scheduler_tick(trapframe *tf) {
     uint32_t next_cr3 = proc_get_cr3(next);
     uint32_t prev_cr3 = proc_get_cr3(prev);
     if (next_cr3 != prev_cr3) {
-        asm volatile("mov %0, %%cr3" :: "r"(next_cr3) : "memory");
+        hal_set_cr3(next_cr3);
     }
 
     // Return the stack pointer of the next process's interrupt frame

@@ -71,4 +71,11 @@ typedef struct {
  */
 struct process *elf_load_and_exec(uint32_t file_phys, uint32_t file_size);
 
+/*
+ * Load an ELF binary by name (looks up in initrd).
+ * name: filename (e.g. "hello.elf")
+ * Returns pointer to the created process, or NULL on failure.
+ */
+struct process *elf_spawn(const char *name);
+
 #endif

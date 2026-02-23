@@ -1,4 +1,7 @@
 #include <kernel/paging.h>
+#include <kernel/process.h>
+#include <kernel/isr.h>
+#include <kernel/hal.h>
 #include <stdint.h>
 
 uint32_t page_directory[PAGE_ENTRIES] __attribute__((aligned(PAGE_SIZE)));
@@ -128,13 +131,13 @@ void free_frame(uint32_t phys) {
 
 void *temp_map(uint32_t phys_frame) {
     first_page_table[TEMP_MAP_PTE_INDEX] = phys_frame | PAGE_PRESENT | PAGE_WRITABLE;
-    asm volatile("invlpg (%0)" :: "r"(TEMP_MAP_VADDR) : "memory");
+    hal_tlb_invalidate(TEMP_MAP_VADDR);
     return (void *)TEMP_MAP_VADDR;
 }
 
 void temp_unmap(void) {
     first_page_table[TEMP_MAP_PTE_INDEX] = 0;
-    asm volatile("invlpg (%0)" :: "r"(TEMP_MAP_VADDR) : "memory");
+    hal_tlb_invalidate(TEMP_MAP_VADDR);
 }
 
 /*
@@ -292,5 +295,57 @@ void map_page(uint32_t virt, uint32_t phys, uint32_t flags) {
     uint32_t* table = (uint32_t*)(page_directory[pd_index] & 0xFFFFF000);
     table[pt_index] = phys | flags;
 
-    asm("invlpg (%0)" :: "r"(virt) : "memory");
+    hal_tlb_invalidate(virt);
+}
+
+/*
+ * Page fault handler (ISR 14).
+ *
+ * Error code bits (pushed by CPU):
+ *   bit 0: 0 = not-present fault, 1 = protection violation
+ *   bit 1: 0 = read, 1 = write
+ *   bit 2: 0 = kernel mode, 1 = user mode
+ *
+ * CR2 holds the faulting linear address.
+ */
+void page_fault_handler(trapframe *tf) {
+    uint32_t fault_addr = hal_get_fault_addr();
+
+    int present  = tf->err_code & 0x1;
+    int write    = tf->err_code & 0x2;
+    int user     = tf->err_code & 0x4;
+
+    if (user) {
+        /* User-mode page fault: kill the offending process */
+        printf("\n[PAGE FAULT] PID %d: %s %s at 0x%x (EIP=0x%x)\n",
+               current_process->pid,
+               write ? "write" : "read",
+               present ? "protection violation" : "not-present page",
+               fault_addr, tf->eip);
+
+        current_process->state = PROC_ZOMBIE;
+
+        if (current_process->cr3 != 0) {
+            hal_set_cr3(get_kernel_cr3());
+            pgdir_destroy(current_process->cr3);
+            current_process->cr3 = 0;
+        }
+
+        /* Yield — scheduler will pick next process */
+        hal_irq_enable();
+        for (;;) hal_halt();
+    }
+
+    /* Kernel-mode page fault — unrecoverable */
+    printf("\n[KERNEL PAGE FAULT] %s %s at 0x%x\n",
+           write ? "write" : "read",
+           present ? "protection violation" : "not-present page",
+           fault_addr);
+    printf("EIP=0x%x CS=0x%x EFLAGS=0x%x\n", tf->eip, tf->cs, tf->eflags);
+    printf("EAX=0x%x EBX=0x%x ECX=0x%x EDX=0x%x\n",
+           tf->eax, tf->ebx, tf->ecx, tf->edx);
+    printf("ESP=0x%x EBP=0x%x ESI=0x%x EDI=0x%x\n",
+           tf->esp_dummy, tf->ebp, tf->esi, tf->edi);
+
+    hal_halt_forever();
 }

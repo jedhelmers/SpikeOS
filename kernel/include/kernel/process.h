@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <kernel/fd.h>
+#include <kernel/wait.h>
 
 #define MAX_PROCS 32
 
@@ -32,6 +34,14 @@ struct process {
 
     uint32_t cr3;               // physical address of page directory
                                 // 0 = use kernel's page directory
+
+    /* File descriptor table (indexes into open_file_table, -1 = free) */
+    int fds[MAX_FDS];
+
+    /* Process hierarchy */
+    uint32_t parent_pid;        /* PID of parent (0 = no parent / init) */
+    int32_t  exit_status;       /* set on exit, read by waitpid */
+    wait_queue_t wait_children; /* parent sleeps here for waitpid */
 };
 
 extern struct process *current_process;

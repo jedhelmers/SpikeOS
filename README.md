@@ -88,23 +88,24 @@ All init `printf` calls are wrapped in `#ifdef VERBOSE_BOOT`. Without the flag, 
 11. `vfs_import_initrd()` — copy initrd files into VFS root
 12. `spikefs_init()` — load filesystem from disk (or format if blank/incompatible)
 13. `timer_init(100)` — 100 Hz preemptive timer on IRQ0
-14. `process_init()` / `scheduler_init()` — process table (max 32) + round-robin scheduler
-15. `keyboard_init()` — keyboard on IRQ1
-16. `uart_init()` — COM1 serial on IRQ4
-17. `boot_splash()` — 1980s-style animated boot screen (only without `VERBOSE_BOOT`)
-18. `proc_create_kernel_thread(shell_run)` — start the kernel shell
-19. `sti` — enable interrupts
+14. `fd_init()` / `pipe_init()` — zero the system-wide open file table and pipe pool
+15. `process_init()` / `scheduler_init()` — process table (max 32) + round-robin scheduler
+16. `keyboard_init()` — keyboard on IRQ1
+17. `uart_init()` — COM1 serial on IRQ4
+18. `boot_splash()` — 1980s-style animated boot screen (only without `VERBOSE_BOOT`), waits for key press
+19. `proc_create_kernel_thread(shell_run)` — start the kernel shell
+20. `sti` — enable interrupts
 
 ### Directory Structure
 
 | Path | Purpose |
 |------|---------|
-| `kernel/arch/i386/` | Boot stub (`boot.S`), GDT/IDT/TSS flush stubs, paging enable, linker script, VGA driver |
+| `kernel/arch/i386/` | Boot stub (`boot.S`), GDT/IDT/TSS flush stubs, paging enable, HAL, linker script, VGA driver |
 | `kernel/core/` | Kernel entry, GDT, IDT, ISR, TSS, syscall dispatch |
-| `kernel/mm/` | Paging (page directory/tables, frame allocator) and heap allocator |
-| `kernel/fs/` | VFS, SpikeFS on-disk filesystem, initrd |
+| `kernel/mm/` | Paging (page directory/tables, frame allocator, page fault handler) and heap allocator |
+| `kernel/fs/` | VFS, SpikeFS on-disk filesystem, initrd, file descriptors, pipes |
 | `kernel/drivers/` | ATA disk, keyboard, UART, PIC, timer, VGA mode 13h, debug log |
-| `kernel/proc/` | Process table, scheduler, ELF loader |
+| `kernel/proc/` | Process table, scheduler, ELF loader, wait queues |
 | `kernel/shell/` | Kernel shell, Tetris, boot splash |
 | `kernel/include/kernel/` | All kernel headers (flat) |
 | `libc/` | Freestanding kernel libc (`libk.a`): printf, string, stdlib/abort |
@@ -120,7 +121,7 @@ All init `printf` calls are wrapped in `#ifdef VERBOSE_BOOT`. Without the flag, 
 
 - `isr_stub.S` — 32 exception stubs (vectors 0-31) + syscall stub (vector 128)
 - `irq_stub.S` — 16 hardware IRQ stubs (vectors 32-47)
-- `isr.c` — dispatcher: routes syscalls to `syscall_dispatch()`, exceptions to halt, IRQs to registered handlers
+- `isr.c` — dispatcher: routes syscalls to `syscall_dispatch()`, page faults (ISR 14) to `page_fault_handler()`, other exceptions to halt, IRQs to registered handlers
 - Register handlers via `irq_install_handler(irq_num, handler_fn)`
 
 ### Paging
@@ -161,17 +162,35 @@ All init `printf` calls are wrapped in `#ifdef VERBOSE_BOOT`. Without the flag, 
 
 | # | Name | Args | Description |
 |---|------|------|-------------|
-| 0 | `SYS_EXIT` | EBX=status | Marks process ZOMBIE, frees per-process PD, halts |
-| 1 | `SYS_WRITE` | EBX=fd, ECX=buf, EDX=len | Writes to terminal (fd=1 only), returns bytes written |
+| 0 | `SYS_EXIT` | EBX=status | Close fds, free PD, wake parent, mark ZOMBIE |
+| 1 | `SYS_WRITE` | EBX=fd, ECX=buf, EDX=len | Write to fd (console, VFS file, or pipe) |
+| 2 | `SYS_READ` | EBX=fd, ECX=buf, EDX=len | Read from fd (blocks if pipe empty) |
+| 3 | `SYS_OPEN` | EBX=path, ECX=flags | Open VFS file, returns fd |
+| 4 | `SYS_CLOSE` | EBX=fd | Close file descriptor |
+| 5 | `SYS_SEEK` | EBX=fd, ECX=off, EDX=whence | Seek within VFS file |
+| 6 | `SYS_STAT` | EBX=path, ECX=&stat | Get file info (type, size, inode, nlink) |
+| 7 | `SYS_GETPID` | — | Return current PID |
+| 8 | `SYS_SLEEP` | EBX=ticks | Sleep for N ticks (10ms each) |
+| 9 | `SYS_BRK` | EBX=addr | Adjust process break (stub) |
+| 10 | `SYS_SPAWN` | EBX=name | Spawn ELF from initrd |
+| 11 | `SYS_WAITPID` | EBX=pid, ECX=&status | Wait for child to exit |
+| 12 | `SYS_MKDIR` | EBX=path | Create directory |
+| 13 | `SYS_UNLINK` | EBX=path | Remove file or empty directory |
+| 14 | `SYS_CHDIR` | EBX=path | Change working directory |
+| 15 | `SYS_GETCWD` | EBX=buf, ECX=size | Get current working directory |
+| 16 | `SYS_PIPE` | EBX=int[2] | Create pipe (read/write fd pair) |
+| 17 | `SYS_DUP` | EBX=fd | Duplicate file descriptor |
 
 ### Process & Scheduling
 
 - Process states: `NEW -> READY -> RUNNING -> BLOCKED -> ZOMBIE`
-- Each process has its own kernel stack (4 KB), saved CPU context (ESP/EBP), and page directory (CR3)
+- Each process has its own kernel stack (4 KB), saved CPU context (ESP/EBP), page directory (CR3), and file descriptor table (16 fds)
+- Process hierarchy: parent_pid, exit_status, wait queue for waitpid blocking
 - Round-robin scheduler, timer-driven (fires on each IRQ0 tick at 100 Hz)
-- `proc_create_kernel_thread(fn)` — create a kernel-mode thread (CS=0x08, shared kernel PD)
+- `proc_create_kernel_thread(fn)` — create a kernel-mode thread, initializes stdin/stdout/stderr
 - `proc_create_user_process(pd_phys, eip, esp)` — create a ring-3 process with its own page directory
-- Context switch: saves trapframe + ESP, picks next READY process, updates TSS esp0, switches CR3 if needed
+- `elf_spawn(name)` — spawn user process from initrd ELF, sets parent_pid
+- Context switch: saves trapframe + ESP, picks next READY process, updates TSS esp0, switches CR3 via HAL
 
 ### Virtual File System (VFS)
 
@@ -215,6 +234,26 @@ Sectors B+1..end:    Data pool (inode chunks + file data, unified)
 - **Auto write-back**: shell prompt checks dirty flag + 5-second cooldown, auto-syncs if needed
 - **Version detection**: auto-reformats disks with incompatible versions on boot
 
+### Hardware Abstraction Layer (HAL)
+
+Arch-independent interface (`kernel/include/kernel/hal.h`) with i386 implementation (`kernel/arch/i386/hal.c`). Wraps x86 instructions (CLI/STI, IN/OUT, INVLPG, CR3/CR2 access) behind portable function calls. An ARM/RISC-V port would replace `hal.c` with equivalent implementations.
+
+### File Descriptors
+
+Per-process fd table (16 fds) backed by a system-wide open file pool (64 entries). Supports VFS files, console (terminal), and pipe endpoints. Each process starts with stdin (0), stdout (1), stderr (2) pointing to the console. Operations: open, close, read, write, seek, dup.
+
+### Pipes
+
+Kernel IPC via 512-byte circular buffer. Blocking: read sleeps when empty (via wait queue), write sleeps when full. EOF on read when no writers remain; broken pipe on write when no readers remain. Created via `pipe_create()` which returns a read/write fd pair.
+
+### Wait Queues
+
+Blocking mechanism for processes. `sleep_on(wq)` sets process to BLOCKED and spins until woken. `wake_up_one(wq)` / `wake_up_all(wq)` set blocked processes back to READY. Used by pipes (read/write blocking) and waitpid (parent waits for child exit).
+
+### Page Fault Handler
+
+ISR 14 handler reads CR2 (faulting address). User-mode faults kill the process and yield to the scheduler. Kernel-mode faults print a register dump and halt (unrecoverable).
+
 ### Terminal & Scrollback
 
 VGA 80x25 text mode driver with color output, cursor management, and a 200-line scrollback buffer.
@@ -230,7 +269,8 @@ VGA 80x25 text mode driver with color output, cursor management, and a 200-line 
 - "SPIKE OS" logo in large block characters (5 rows tall)
 - 4 animated system check stages with progress bar and `[ OK ]` results
 - Animated progress bar that fills character-by-character
-- Busy-wait timing (interrupts not yet enabled during splash)
+- "Press any key to continue..." prompt — temporarily enables interrupts for keyboard input
+- Busy-wait timing for animations (interrupts enabled only for the key-press wait)
 
 ### UEFI Boot Support
 
@@ -266,6 +306,7 @@ Shell prompt shows current working directory: `jedhelmers:/path> `
 | `ps` | List processes |
 | `kill <pid>` | Kill process by PID |
 | `meminfo` | Show heap info |
+| `test <name>` | Run kernel tests: `fd`, `pipe`, `sleep`, `stat`, `waitpid`, or `all` |
 | `clear` | Clear screen |
 
 ## Key Files
@@ -275,17 +316,21 @@ Shell prompt shows current working directory: `jedhelmers:/path> `
 | `kernel/core/kernel.c` | Kernel entry point, init sequence, test functions |
 | `kernel/core/gdt.c` | GDT with kernel + user segments + TSS |
 | `kernel/core/isr.c` | Interrupt/exception/syscall dispatcher |
-| `kernel/core/syscall.c` | Syscall dispatcher and implementations |
-| `kernel/mm/paging.c` | Page directory/table management, frame allocator, temp mapping, per-process PD functions |
+| `kernel/core/syscall.c` | Syscall dispatcher and 18 syscall implementations |
+| `kernel/mm/paging.c` | Page directory/table management, frame allocator, temp mapping, per-process PDs, page fault handler |
 | `kernel/mm/heap.c` | Kernel heap allocator (kmalloc/kfree) |
 | `kernel/fs/vfs.c` | In-memory VFS: growable inode table, directories, path resolution, file I/O, dirty tracking |
 | `kernel/fs/spikefs.c` | SpikeFS v3: inode chunks in unified data pool, imap chain, full write-back sync/load |
+| `kernel/fs/fd.c` | File descriptor subsystem: per-process fd table, open/close/read/write/seek |
+| `kernel/fs/pipe.c` | Pipe IPC: circular buffer, blocking read/write |
 | `kernel/fs/initrd.c` | Initial ramdisk: parse GRUB module, file lookup, VFS import |
 | `kernel/drivers/ata.c` | ATA PIO disk driver (primary master, 28-bit LBA) |
-| `kernel/proc/process.c` | Process table, kernel thread + user process creation |
-| `kernel/proc/scheduler.c` | Round-robin scheduler with CR3 switching |
-| `kernel/shell/shell.c` | Kernel shell with command parsing, filesystem commands, auto write-back |
+| `kernel/proc/process.c` | Process table, kernel thread + user process creation, fd init, process kill |
+| `kernel/proc/scheduler.c` | Round-robin scheduler with CR3 switching (via HAL) |
+| `kernel/proc/wait.c` | Wait queue implementation: sleep_on, wake_up_one, wake_up_all |
+| `kernel/shell/shell.c` | Kernel shell with command parsing, filesystem commands, test commands, auto write-back |
 | `kernel/shell/boot_splash.c` | 1980s-style retro boot splash |
+| `kernel/arch/i386/hal.c` | HAL implementation for i386: interrupt, I/O, TLB, MMU wrappers |
 | `kernel/arch/i386/isr_stub.S` | ISR/IRQ/syscall assembly stubs, context switch via stack swap |
 | `kernel/arch/i386/boot.S` | Multiboot entry, bootstrap paging, jump to higher-half |
 | `kernel/arch/i386/linker.ld` | Linker script: physical load at 0x200000, VMA at 0xC0000000+ |
