@@ -15,9 +15,11 @@ static uint32_t g_total_sectors = 0;
 static int ata_poll_bsy(void) {
     for (int i = 0; i < ATA_TIMEOUT; i++) {
         uint8_t st = inb(ATA_PRIMARY_IO + ATA_REG_STATUS);
-        if (!(st & ATA_SR_BSY))
+        if (!(st & ATA_SR_BSY)) {
             return 0;
+        }
     }
+
     return -1;
 }
 
@@ -25,11 +27,16 @@ static int ata_poll_bsy(void) {
 static int ata_poll_drq(void) {
     for (int i = 0; i < ATA_TIMEOUT; i++) {
         uint8_t st = inb(ATA_PRIMARY_IO + ATA_REG_STATUS);
+
         if (st & ATA_SR_ERR) return -1;
+
         if (st & ATA_SR_DF)  return -1;
-        if (!(st & ATA_SR_BSY) && (st & ATA_SR_DRQ))
+
+        if (!(st & ATA_SR_BSY) && (st & ATA_SR_DRQ)) {
             return 0;
+        }
     }
+
     return -1;
 }
 
