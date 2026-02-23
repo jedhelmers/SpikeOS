@@ -23,6 +23,8 @@
 #include <kernel/boot_splash.h>
 #include <kernel/fd.h>
 #include <kernel/pipe.h>
+#include <kernel/framebuffer.h>
+#include <kernel/fb_console.h>
 
 extern void kprint_howdy(void);
 extern void paging_enable(uint32_t);
@@ -210,15 +212,31 @@ void kernel_main(void) {
     printf("CR0 = %x\n", cr0);
 #endif
 
+    /* Save framebuffer info from multiboot before heap (just stores values) */
+    {
+        uint32_t mb_phys = multiboot_info_ptr;
+        if (mb_phys != 0)
+            fb_save_info((struct multiboot_info *)mb_phys);
+    }
+
     heap_init();
 #ifdef VERBOSE_BOOT
     printf("INIT Kernel Heap\n");
+#endif
+
+    /* Map framebuffer into kernel VA (needs paging + heap) */
+    fb_init();
+#ifdef VERBOSE_BOOT
+    if (fb_info.available)
+        printf("INIT Framebuffer (%dx%dx%d at 0x%x)\n",
+               fb_info.width, fb_info.height, fb_info.bpp, fb_info.phys_addr);
 #endif
 
     /* Parse Multiboot info to find initrd module */
     uint32_t mb_info_phys = multiboot_info_ptr;
     if (mb_info_phys != 0) {
         struct multiboot_info *mb = (struct multiboot_info *)mb_info_phys;
+
         if ((mb->flags & MB_FLAG_MODS) && mb->mods_count > 0) {
             struct multiboot_mod_entry *mods =
                 (struct multiboot_mod_entry *)mb->mods_addr;
@@ -298,11 +316,18 @@ void kernel_main(void) {
     printf("Kernel end: %x\n", (uint32_t)&endkernel);
 #endif
 
+    /* Enable framebuffer before boot splash so the splash renders on it */
+    fb_enable();
+
     /* Show boot splash (only in non-verbose mode) */
 #ifndef VERBOSE_BOOT
     boot_splash();
-    terminal_clear();
 #endif
+
+    /* Init framebuffer console for shell use */
+    fb_console_init();
+    terminal_switch_to_fb();
+    terminal_clear();
 
     // ring3_test_perprocess();
     proc_create_kernel_thread(shell_run);

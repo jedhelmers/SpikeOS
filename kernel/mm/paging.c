@@ -8,6 +8,7 @@
 uint32_t page_directory[PAGE_ENTRIES] __attribute__((aligned(PAGE_SIZE)));
 uint32_t first_page_table[PAGE_ENTRIES] __attribute__((aligned(PAGE_SIZE)));
 uint32_t second_page_table[PAGE_ENTRIES] __attribute__((aligned(PAGE_SIZE)));
+uint32_t third_page_table[PAGE_ENTRIES] __attribute__((aligned(PAGE_SIZE)));
 
 static uint32_t frame_bitmap[MAX_FRAMES / 32];
 
@@ -64,6 +65,13 @@ void paging_init() {
     memset(second_page_table, 0, sizeof(second_page_table));
     uint32_t spt_phys = (uint32_t)second_page_table - KERNEL_VMA_OFFSET;
     page_directory[769] = spt_phys | PAGE_PRESENT | PAGE_WRITABLE;
+
+    // Pre-allocate PDE[770] for the framebuffer region (0xC0800000–0xC0BFFFFF).
+    // Same reason: map_page() can't handle dynamically-allocated page tables
+    // whose physical address is above 4MB (not identity-mapped).
+    memset(third_page_table, 0, sizeof(third_page_table));
+    uint32_t tpt_phys = (uint32_t)third_page_table - KERNEL_VMA_OFFSET;
+    page_directory[770] = tpt_phys | PAGE_PRESENT | PAGE_WRITABLE;
 
     // Optional: map page dir itself recursively (helps later for dynamic mapping)
     // page_directory[1023] = (uint32_t)page_directory | PAGE_PRESENT | PAGE_WRITABLE;
@@ -166,6 +174,7 @@ void pgdir_destroy(uint32_t pd_phys) {
 
     uint32_t fpt_phys = (uint32_t)first_page_table - KERNEL_VMA_OFFSET;
     uint32_t spt_phys = (uint32_t)second_page_table - KERNEL_VMA_OFFSET;
+    uint32_t tpt_phys = (uint32_t)third_page_table - KERNEL_VMA_OFFSET;
 
     for (int i = 1; i < 768; i++) {
         /* Temp-map PD, read one PDE, temp-unmap */
@@ -178,7 +187,7 @@ void pgdir_destroy(uint32_t pd_phys) {
         uint32_t pt_phys = pde & 0xFFFFF000;
 
         /* Skip shared kernel page tables */
-        if (pt_phys == fpt_phys || pt_phys == spt_phys) continue;
+        if (pt_phys == fpt_phys || pt_phys == spt_phys || pt_phys == tpt_phys) continue;
 
         /* Free all frames referenced by this page table */
         for (int j = 0; j < PAGE_ENTRIES; j++) {
@@ -206,7 +215,7 @@ void pgdir_destroy(uint32_t pd_phys) {
         uint32_t pt_phys = pde & 0xFFFFF000;
 
         /* Only free if it's NOT a shared kernel page table */
-        if (pt_phys != fpt_phys && pt_phys != spt_phys) {
+        if (pt_phys != fpt_phys && pt_phys != spt_phys && pt_phys != tpt_phys) {
             /* This is a cloned kernel PT — free the clone but NOT the frames
                (they're kernel frames, still in use by the kernel's PD) */
             free_frame(pt_phys);
@@ -229,6 +238,7 @@ int pgdir_map_user_page(uint32_t pd_phys, uint32_t virt, uint32_t phys,
 
     uint32_t fpt_phys = (uint32_t)first_page_table - KERNEL_VMA_OFFSET;
     uint32_t spt_phys = (uint32_t)second_page_table - KERNEL_VMA_OFFSET;
+    uint32_t tpt_phys = (uint32_t)third_page_table - KERNEL_VMA_OFFSET;
 
     /* Read the PDE */
     uint32_t *pd = (uint32_t *)temp_map(pd_phys);
@@ -254,7 +264,7 @@ int pgdir_map_user_page(uint32_t pd_phys, uint32_t virt, uint32_t phys,
 
     /* If PDE points to a shared kernel PT and we need PAGE_USER, clone it */
     if ((flags & PAGE_USER) &&
-        (pt_phys == fpt_phys || pt_phys == spt_phys)) {
+        (pt_phys == fpt_phys || pt_phys == spt_phys || pt_phys == tpt_phys)) {
         uint32_t new_pt_phys = alloc_frame();
         if (new_pt_phys == 0) { temp_unmap(); return -1; }
 
@@ -264,7 +274,8 @@ int pgdir_map_user_page(uint32_t pd_phys, uint32_t virt, uint32_t phys,
 
         /* Copy from the original kernel PT (accessible via identity map) */
         uint32_t *orig_pt = (pt_phys == fpt_phys) ? first_page_table
-                                                   : second_page_table;
+                          : (pt_phys == spt_phys)  ? second_page_table
+                                                   : third_page_table;
 
         uint32_t *new_pt = (uint32_t *)temp_map(new_pt_phys);
         memcpy(new_pt, orig_pt, PAGE_SIZE);

@@ -59,6 +59,7 @@ cat .debug.log    # Inspect UART debug output during or after a run
 - Physical frame allocator: bitmap over `MAX_FRAMES = 16384` frames (64 MB addressable)
 - `endkernel` linker symbol marks end of kernel image (used to reserve physical frames)
 - Kernel heap at `0xC0400000` (PDE[769]), up to 4 MB, first-fit free-list allocator
+- Framebuffer at `0xC0800000` (PDE[770]), up to 4 MB, mapped when GRUB provides GOP/VBE framebuffer
 
 ### GDT Layout
 
@@ -82,7 +83,8 @@ All init `printf` calls are wrapped in `#ifdef VERBOSE_BOOT`. Without the flag, 
 5. `pic_remap(0x20, 0x28)` — remap PIC IRQs away from CPU exceptions
 6. `paging_init()` + `paging_enable()` — enable CR0.PG, switch to higher-half
 7. `heap_init()` — kernel heap allocator (kmalloc/kfree)
-8. `initrd_init()` — parse GRUB module into file entry table
+7a. `fb_init()` — map framebuffer into kernel VA (no-op if unavailable)
+8. `fb_save_info()` + `initrd_init()` — save framebuffer info, parse GRUB module
 9. `ata_init()` — ATA PIO disk driver (primary master, 28-bit LBA)
 10. `vfs_init(64)` — in-memory inode filesystem (starts with 64 slots, grows on demand up to 8192)
 11. `vfs_import_initrd()` — copy initrd files into VFS root
@@ -92,9 +94,11 @@ All init `printf` calls are wrapped in `#ifdef VERBOSE_BOOT`. Without the flag, 
 15. `process_init()` / `scheduler_init()` — process table (max 32) + round-robin scheduler
 16. `keyboard_init()` — keyboard on IRQ1
 17. `uart_init()` — COM1 serial on IRQ4
-18. `boot_splash()` — 1980s-style animated boot screen (only without `VERBOSE_BOOT`), waits for key press
-19. `proc_create_kernel_thread(shell_run)` — start the kernel shell
-20. `sti` — enable interrupts
+18. `boot_splash()` — 1980s-style animated boot screen (only without `VERBOSE_BOOT`)
+19. `fb_console_init()` + `terminal_switch_to_fb()` — switch to framebuffer console (no-op if FB unavailable)
+20. `terminal_clear()` — clear screen
+21. `proc_create_kernel_thread(shell_run)` — start the kernel shell
+22. `sti` — enable interrupts
 
 ### Directory Structure
 
@@ -104,7 +108,7 @@ All init `printf` calls are wrapped in `#ifdef VERBOSE_BOOT`. Without the flag, 
 | `kernel/core/` | Kernel entry, GDT, IDT, ISR, TSS, syscall dispatch |
 | `kernel/mm/` | Paging (page directory/tables, frame allocator, page fault handler) and heap allocator |
 | `kernel/fs/` | VFS, SpikeFS on-disk filesystem, initrd, file descriptors, pipes |
-| `kernel/drivers/` | ATA disk, keyboard, UART, PIC, timer, VGA mode 13h, debug log |
+| `kernel/drivers/` | ATA disk, keyboard, UART, PIC, timer, VGA mode 13h, framebuffer, FB console, debug log |
 | `kernel/proc/` | Process table, scheduler, ELF loader, wait queues, mutex/semaphore |
 | `kernel/shell/` | Kernel shell, Tetris, boot splash |
 | `kernel/include/kernel/` | All kernel headers (flat) |
@@ -281,6 +285,16 @@ Basic signal delivery (`kernel/include/kernel/signal.h`, `kernel/proc/process.c`
 
 ISR 14 handler reads CR2 (faulting address). User-mode faults send `SIGSEGV` (kills the process) and yield to the scheduler. Kernel-mode faults print a register dump and halt (unrecoverable).
 
+### Framebuffer Console
+
+GOP/VBE linear framebuffer console that activates after the boot splash. The boot splash runs in VGA text mode; after it completes, the kernel switches to pixel-rendered text on the framebuffer (if GRUB provided one).
+
+- Framebuffer driver maps physical FB at `0xC0800000` (PDE[770]) with cache-disable
+- Renders 8x16 CP437 glyphs from embedded font onto pixel framebuffer
+- Character grid: `width/8` cols × `height/16` rows (e.g., 128×48 at 1024×768)
+- 16 VGA colors mapped to 32-bit RGB
+- BIOS fallback: stays in VGA text mode when framebuffer info is unavailable
+
 ### Terminal & Scrollback
 
 VGA 80x25 text mode driver with color output, cursor management, and a 200-line scrollback buffer.
@@ -317,7 +331,8 @@ The ISO is a hybrid BIOS+UEFI image. GRUB handles both boot paths — the kernel
 - **BIOS path**: GRUB uses i386-pc modules, loads kernel via Multiboot, VGA already in text mode
 - **UEFI path**: GRUB uses x86_64-efi modules, transitions CPU from long mode to 32-bit protected mode before loading the Multiboot kernel
 - `vga_set_mode3()` handles the UEFI display: disables Bochs VBE, reprograms VGA registers for mode 3 (80x25 text), and loads the embedded 8x16 font into VGA plane 2
-- Known limitation: `vga_set_mode3()` relies on Bochs VBE I/O ports, which only exist on QEMU/Bochs. Real UEFI hardware would need a framebuffer console.
+- After the boot splash, the kernel switches to the GOP framebuffer console for higher-resolution text output
+- Known limitation: `vga_set_mode3()` relies on Bochs VBE I/O ports, which only exist on QEMU/Bochs. The framebuffer console path will work on real UEFI hardware.
 
 ## Shell Commands
 
@@ -363,6 +378,8 @@ Shell prompt shows current working directory: `jedhelmers:/path> `
 | `kernel/fs/fd.c` | File descriptor subsystem: per-process fd table, open/close/read/write/seek |
 | `kernel/fs/pipe.c` | Pipe IPC: circular buffer, blocking read/write |
 | `kernel/fs/initrd.c` | Initial ramdisk: parse GRUB module, file lookup, VFS import |
+| `kernel/drivers/framebuffer.c` | GOP/VBE framebuffer driver: map to kernel VA, pixel operations |
+| `kernel/drivers/fb_console.c` | Framebuffer text console: glyph rendering, cursor, scroll |
 | `kernel/drivers/ata.c` | ATA PIO disk driver (primary master, 28-bit LBA) |
 | `kernel/proc/process.c` | Process table, kernel thread + user process creation, fd init, process kill |
 | `kernel/proc/scheduler.c` | Round-robin scheduler with CR3 switching (via HAL) |

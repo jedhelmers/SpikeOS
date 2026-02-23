@@ -3,6 +3,8 @@
 #include <kernel/keyboard.h>
 #include <kernel/key_event.h>
 #include <kernel/hal.h>
+#include <kernel/framebuffer.h>
+#include <kernel/fb_console.h>
 #include <stdint.h>
 #include <stddef.h>
 
@@ -40,10 +42,27 @@ static void splash_delay(uint32_t n) {
 #define DELAY_LONG    9000000
 #define DELAY_TINY     500000
 
+/* Framebuffer centering offsets (character grid units) */
+static uint32_t fb_off_x;
+static uint32_t fb_off_y;
+static int use_fb_splash;
+
+/* Core rendering primitive — dispatches to FB or VGA */
+static void splash_put(char ch, uint8_t vga_color, size_t x, size_t y) {
+    if (use_fb_splash) {
+        uint8_t fg_idx = vga_color & 0x0F;
+        uint8_t bg_idx = (vga_color >> 4) & 0x0F;
+        fb_render_char((uint32_t)x + fb_off_x, (uint32_t)y + fb_off_y,
+                       (uint8_t)ch, fb_vga_color(fg_idx), fb_vga_color(bg_idx));
+    } else {
+        terminal_putentryat(ch, vga_color, x, y);
+    }
+}
+
 /* Write a string at (x, y) with given color — no cursor movement */
 static void splash_puts(size_t x, size_t y, uint8_t color, const char *s) {
     while (*s) {
-        terminal_putentryat(*s, color, x, y);
+        splash_put(*s, color, x, y);
         s++;
         x++;
     }
@@ -52,35 +71,39 @@ static void splash_puts(size_t x, size_t y, uint8_t color, const char *s) {
 /* Fill a horizontal run with a character */
 static void splash_fill(size_t x, size_t y, size_t len, char ch, uint8_t color) {
     for (size_t i = 0; i < len; i++)
-        terminal_putentryat(ch, color, x + i, y);
+        splash_put(ch, color, x + i, y);
 }
 
 /* Clear entire screen to black */
 static void splash_clear(void) {
-    uint8_t black = mkcolor(COL_BLACK, COL_BLACK);
-    for (size_t y = 0; y < SCREEN_H; y++)
-        for (size_t x = 0; x < SCREEN_W; x++)
-            terminal_putentryat(' ', black, x, y);
+    if (use_fb_splash) {
+        fb_clear(0);
+    } else {
+        uint8_t black = mkcolor(COL_BLACK, COL_BLACK);
+        for (size_t y = 0; y < SCREEN_H; y++)
+            for (size_t x = 0; x < SCREEN_W; x++)
+                terminal_putentryat(' ', black, x, y);
+    }
 }
 
 /* Draw double-line border */
 static void draw_border(uint8_t color) {
     /* Corners */
-    terminal_putentryat(BOX_TL, color, 0, 0);
-    terminal_putentryat(BOX_TR, color, SCREEN_W - 1, 0);
-    terminal_putentryat(BOX_BL, color, 0, SCREEN_H - 1);
-    terminal_putentryat(BOX_BR, color, SCREEN_W - 1, SCREEN_H - 1);
+    splash_put(BOX_TL, color, 0, 0);
+    splash_put(BOX_TR, color, SCREEN_W - 1, 0);
+    splash_put(BOX_BL, color, 0, SCREEN_H - 1);
+    splash_put(BOX_BR, color, SCREEN_W - 1, SCREEN_H - 1);
 
     /* Horizontal edges */
     for (size_t x = 1; x < SCREEN_W - 1; x++) {
-        terminal_putentryat(BOX_H, color, x, 0);
-        terminal_putentryat(BOX_H, color, x, SCREEN_H - 1);
+        splash_put(BOX_H, color, x, 0);
+        splash_put(BOX_H, color, x, SCREEN_H - 1);
     }
 
     /* Vertical edges */
     for (size_t y = 1; y < SCREEN_H - 1; y++) {
-        terminal_putentryat(BOX_V, color, 0, y);
-        terminal_putentryat(BOX_V, color, SCREEN_W - 1, y);
+        splash_put(BOX_V, color, 0, y);
+        splash_put(BOX_V, color, SCREEN_W - 1, y);
     }
 }
 
@@ -105,7 +128,7 @@ static void draw_logo(uint8_t color) {
         const char *line = logo_rows[row];
         for (int col = 0; col < LOGO_W; col++) {
             if (line[col] == '#')
-                terminal_putentryat(BLOCK, color, LOGO_X + col, LOGO_Y + row);
+                splash_put(BLOCK, color, LOGO_X + col, LOGO_Y + row);
         }
         splash_delay(DELAY_LONG);
     }
@@ -117,8 +140,8 @@ static void draw_logo(uint8_t color) {
 #define BAR_ROW     19
 
 static void draw_progress_frame(uint8_t color) {
-    terminal_putentryat('[', color, BAR_X - 1, BAR_ROW);
-    terminal_putentryat(']', color, BAR_X + BAR_W, BAR_ROW);
+    splash_put('[', color, BAR_X - 1, BAR_ROW);
+    splash_put(']', color, BAR_X + BAR_W, BAR_ROW);
     /* Fill empty */
     splash_fill(BAR_X, BAR_ROW, BAR_W, SHADE_LT, mkcolor(COL_DARK_GREY, COL_BLACK));
 }
@@ -129,7 +152,7 @@ static void fill_progress(int target_pct, uint8_t color) {
     static int current_chars = 0;
 
     for (int i = current_chars; i < target_chars; i++) {
-        terminal_putentryat(BLOCK, color, BAR_X + i, BAR_ROW);
+        splash_put(BLOCK, color, BAR_X + i, BAR_ROW);
         splash_delay(DELAY_TINY);
     }
     current_chars = target_chars;
@@ -169,14 +192,14 @@ static void draw_stage(int idx, uint8_t text_color, uint8_t ok_color, uint8_t do
     /* Draw message text */
     size_t x = STAGE_X + 2;
     while (*msg) {
-        terminal_putentryat(*msg, text_color, x, y);
+        splash_put(*msg, text_color, x, y);
         msg++;
         x++;
     }
 
     /* Animate dots */
     for (size_t dx = x; dx <= DOT_END; dx++) {
-        terminal_putentryat('.', dot_color, dx, y);
+        splash_put('.', dot_color, dx, y);
         splash_delay(DELAY_TINY / 4);
     }
 
@@ -187,6 +210,15 @@ static void draw_stage(int idx, uint8_t text_color, uint8_t ok_color, uint8_t do
 }
 
 void boot_splash(void) {
+    /* Detect framebuffer and compute centering offsets */
+    if (fb_info.available) {
+        use_fb_splash = 1;
+        fb_off_x = (fb_info.width / 8 - SCREEN_W) / 2;
+        fb_off_y = (fb_info.height / 16 - SCREEN_H) / 2;
+    } else {
+        use_fb_splash = 0;
+    }
+
     uint8_t border_color = mkcolor(COL_CYAN,        COL_BLACK);
     uint8_t logo_color   = mkcolor(COL_LIGHT_GREEN, COL_BLACK);
     uint8_t ver_color    = mkcolor(COL_DARK_GREY,   COL_BLACK);
