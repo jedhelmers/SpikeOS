@@ -41,6 +41,9 @@ void fb_console_page_down(void);
 /* Returns 1 if framebuffer console is active */
 int fb_console_active(void);
 
+/* Check and clear dirty flag (content changed while not frontmost) */
+int fb_console_check_dirty(void);
+
 /* Get console grid dimensions (character columns and rows) */
 uint32_t fb_console_get_cols(void);
 uint32_t fb_console_get_rows(void);
