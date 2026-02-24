@@ -117,7 +117,7 @@ All init `printf` calls are wrapped in `#ifdef VERBOSE_BOOT`. Without the flag, 
 | `kernel/fs/` | VFS, SpikeFS on-disk filesystem, initrd, file descriptors, pipes |
 | `kernel/drivers/` | ATA disk, keyboard, UART, PIC, timer, VGA mode 13h, framebuffer, FB console, mouse, event queue, window manager, debug log |
 | `kernel/proc/` | Process table, scheduler, ELF loader, wait queues, mutex/semaphore |
-| `kernel/shell/` | Kernel shell, Tetris, boot splash |
+| `kernel/shell/` | Kernel shell, text editors (shell + GUI), Tetris, boot splash |
 | `kernel/include/kernel/` | All kernel headers (flat) |
 | `libc/` | Freestanding kernel libc (`libk.a`): printf, string, stdlib/abort |
 | `scripts/` | Build, run, and setup scripts |
@@ -317,6 +317,32 @@ VGA 80x25 text mode driver with color output, cursor management, and a 200-line 
 - **Page Up / Page Down**: scroll through terminal history; any new output snaps back to the live view
 - **Clear resets scrollback**: the `clear` command zeros the ring buffer
 
+### Window Manager
+
+Compositing window manager (`kernel/drivers/window.c`) with a doubly-linked window list, z-ordering, and mouse-driven interaction.
+
+- **Focus**: exclusive — only one window may have `WIN_FLAG_FOCUSED` at a time. Click-to-focus raises windows to the top.
+- **Title bar**: 28px tall, macOS-style traffic light dots (close/minimize/maximize), centered title, anti-aliased rounded top corners
+- **Corner-only resize**: windows resize only from corners (not edges), with a 10px grip zone
+- **Desktop menu bar**: 22px bar at screen top showing focused window's title and menu labels (macOS-style global menu bar)
+- **Per-window menu bar**: 20px bar below title bar for windows that register menus. Content area adjusts automatically.
+- **Dropdown menus**: click a menu label to open a dropdown with action items; click elsewhere to close
+- **Repaint callback**: each window can set a `repaint` function pointer, called by `wm_redraw_all()` for content refresh
+- **Desktop icons**: files in the Desktop directory appear as icons below the deskbar. Double-clicking a text file opens the GUI editor.
+- **API**: `wm_create_window()`, `wm_destroy_window()`, `wm_focus_window()`, `wm_process_events()`, `wm_redraw_all()`, `wm_window_add_menu()`, `wm_menu_add_item()`
+
+### Text Editors
+
+Two text editors: a nano-like shell editor and a GUI windowed editor.
+
+**Shell editor** (`edit <filename>`): runs in the shell window. Arrow keys, Home/End, Page Up/Down for navigation. Ctrl+S to save, Ctrl+X to quit, Ctrl+K to cut line. Status bar at bottom.
+
+**GUI editor** (double-click a desktop file icon): runs as its own kernel thread in a separate window (up to 4 concurrent instances). Features:
+- File menu with Save and Quit actions
+- Mouse click-to-position cursor (converts pixel coords to text grid position)
+- Focus-gated keyboard (only receives keys when its window is focused)
+- Same editing keys as the shell editor
+
 ### Boot Splash
 
 1980s-style retro boot screen shown by default (suppressed with `-v` flag). Green-on-black color scheme using CP437 box drawing and block characters.
@@ -362,6 +388,7 @@ Shell prompt shows current working directory: `jedhelmers:/path> `
 | `touch <name>` | Create empty file |
 | `rm <name>` | Remove file or empty directory |
 | `cat <name>` | Display file contents |
+| `edit <name>` | Open nano-like text editor (Ctrl+S save, Ctrl+X quit) |
 | `write <name> <text>` | Write text to file (auto-creates if missing) |
 | `mv <src> <dst>` | Move/rename file or directory |
 | `cp <src> <dst>` | Copy file |
@@ -397,14 +424,16 @@ Shell prompt shows current working directory: `jedhelmers:/path> `
 | `kernel/drivers/ata.c` | ATA PIO disk driver (primary master, 28-bit LBA), interrupt-safe via HAL |
 | `kernel/drivers/mouse.c` | PS/2 mouse driver on IRQ12, software cursor |
 | `kernel/drivers/event.c` | Unified event queue (keyboard + mouse), interrupt-safe, blocking wait |
-| `kernel/drivers/window.c` | Window manager: linked window list, z-order, click-to-focus, dirty-rect drag, traffic light dots, AA rounded corners |
+| `kernel/drivers/window.c` | Window manager: z-order list, click-to-focus, corner-only resize, desktop/per-window menu bars, dropdown menus, repaint callbacks, desktop icons, traffic light dots, AA rounded corners |
 | `kernel/proc/process.c` | Process table, kernel thread + user process creation, fd init, process kill |
 | `kernel/proc/scheduler.c` | Round-robin scheduler with CR3 switching (via HAL) |
 | `kernel/proc/wait.c` | Wait queue implementation: sleep_on, wake_up_one, wake_up_all |
 | `kernel/proc/mutex.c` | Spinlock, mutex, and counting semaphore implementations |
 | `kernel/proc/condvar.c` | Condition variable implementation |
 | `kernel/proc/rwlock.c` | Read-write lock implementation |
-| `kernel/shell/shell.c` | Kernel shell with command parsing, filesystem commands, test commands, auto write-back |
+| `kernel/shell/shell.c` | Kernel shell with command parsing, filesystem commands, test commands, auto write-back, focus-gated keyboard |
+| `kernel/shell/editor.c` | Nano-like shell text editor (`edit` command) |
+| `kernel/shell/gui_editor.c` | GUI windowed text editor (kernel thread, own window, mouse click-to-cursor, File menu) |
 | `kernel/shell/boot_splash.c` | 1980s-style retro boot splash |
 | `kernel/arch/i386/hal.c` | HAL implementation for i386: interrupt, I/O, TLB, MMU wrappers |
 | `kernel/arch/i386/isr_stub.S` | ISR/IRQ/syscall assembly stubs, context switch via stack swap |

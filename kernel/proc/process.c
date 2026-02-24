@@ -103,13 +103,11 @@ void proc_kill(uint32_t pid) {
             }
 
             hal_irq_restore(irq_flags);
-            printf("[proc] killed PID %d\n", pid);
             return;
         }
     }
 
     hal_irq_restore(irq_flags);
-    printf("[proc] PID %d not found\n", pid);
 }
 
 /*
@@ -198,8 +196,6 @@ struct process *proc_create_kernel_thread(void (*entry)(void)) {
             p->ctx.ebp = (uint32_t)tf;
 
             p->state = PROC_READY;
-
-            printf("Thread %x stack top: %x\n", p->pid, p->kstack_top);
 
             return p;
         }
