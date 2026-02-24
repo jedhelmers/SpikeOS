@@ -1,6 +1,7 @@
 #include <kernel/shell.h>
 #include <kernel/process.h>
 #include <kernel/tetris.h>
+#include <kernel/editor.h>
 #include <kernel/heap.h>
 #include <kernel/initrd.h>
 #include <kernel/elf.h>
@@ -604,6 +605,7 @@ void shell_execute(void) {
         printf("  rm -r <name>   - remove directory recursively\n");
         printf("  rename <o> <n> - rename file or directory\n");
         printf("  cat <name>     - display file contents\n");
+        printf("  edit <name>    - open text editor (^S save, ^X exit)\n");
         printf("  write <n> <t>  - write text to file\n");
         printf("  mv <src> <dst> - move/rename\n");
         printf("  cp <src> <dst> - copy file\n");
@@ -762,6 +764,16 @@ void shell_execute(void) {
                     }
                 }
             }
+        }
+    }
+
+    /* ---- edit <name> ---- */
+    else if (strncmp(line_buf, "edit ", 5) == 0) {
+        const char *name = shell_arg(line_buf, 4);
+        if (!name) {
+            printf("Usage: edit <filename>\n");
+        } else {
+            editor_run(name);
         }
     }
 

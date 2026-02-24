@@ -448,3 +448,6 @@ void fb_console_page_down(void) {
 int fb_console_active(void) {
     return fb_active;
 }
+
+uint32_t fb_console_get_cols(void) { return cols; }
+uint32_t fb_console_get_rows(void) { return rows; }
