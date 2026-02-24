@@ -79,10 +79,18 @@ void shell_readline(void) {
     line_len = 0;
 
     while (1) {
+        wm_process_events();
+
+        /* Focus-gated keyboard: only consume keys when shell window is focused */
+        window_t *sw = wm_get_shell_window();
+        if (sw && !(sw->flags & WIN_FLAG_FOCUSED)) {
+            __asm__ volatile ("hlt");
+            continue;
+        }
+
         key_event_t c = keyboard_get_event();
 
         if (c.type == KEY_NONE) {
-            wm_process_events();
             __asm__ volatile ("hlt");
             continue;
         }

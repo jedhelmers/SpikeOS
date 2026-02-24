@@ -332,7 +332,8 @@ void kernel_main(void) {
     wm_init();
     fb_console_init();
 
-    /* Create shell window — 80% width, 50% height, centered horizontally */
+    /* Create shell window — 80% width, 50% height, centered horizontally.
+       Position below the desktop menu bar (WM_DESKBAR_H). */
     if (fb_info.available) {
         uint32_t content_w = (fb_info.width * 4 / 5);
         uint32_t content_h = (fb_info.height / 2);
@@ -343,6 +344,8 @@ void kernel_main(void) {
         uint32_t outer_h = content_h + WIN_TITLEBAR_H + 2 * WIN_BORDER_W;
         int32_t  outer_x = ((int32_t)fb_info.width - (int32_t)outer_w) / 2;
         int32_t  outer_y = (int32_t)fb_info.height - (int32_t)outer_h - 16;
+        if (outer_y < (int32_t)WM_DESKBAR_H)
+            outer_y = (int32_t)WM_DESKBAR_H;
 
         window_t *win = wm_create_window(outer_x, outer_y,
                                          outer_w, outer_h, "SpikeOS Shell");
