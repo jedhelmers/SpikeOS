@@ -120,9 +120,14 @@ static void keyboard_irq(trapframe* r) {
             case 0x53: e.type = KEY_DELETE;    break;
         }
         extended = 0;
-    } else if (ctrl_held && sc == 0x2E) {
-        /* Ctrl+C (scancode 0x2E = 'c') */
-        e.type = KEY_CTRL_C;
+    } else if (ctrl_held) {
+        /* Ctrl+letter combinations */
+        switch (sc) {
+            case 0x2E: e.type = KEY_CTRL_C; break;  /* Ctrl+C */
+            case 0x1F: e.type = KEY_CTRL_S; break;  /* Ctrl+S */
+            case 0x2D: e.type = KEY_CTRL_X; break;  /* Ctrl+X */
+            case 0x25: e.type = KEY_CTRL_K; break;  /* Ctrl+K */
+        }
     } else if (sc == 0x0E) {
         /* Backspace */
         e.type = KEY_BACKSPACE;
