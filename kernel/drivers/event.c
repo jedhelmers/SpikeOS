@@ -17,6 +17,7 @@ void event_init(void) {
 }
 
 static void event_push(event_t *e) {
+    uint32_t flags = hal_irq_save();
     uint32_t next = (event_head + 1) % EVENT_BUF_SIZE;
     if (next == event_tail) {
         /* Buffer full — drop oldest event */
@@ -24,6 +25,7 @@ static void event_push(event_t *e) {
     }
     event_buf[event_head] = *e;
     event_head = next;
+    hal_irq_restore(flags);
     wake_up_one(&event_wq);
 }
 
@@ -31,11 +33,15 @@ event_t event_poll(void) {
     event_t e;
     e.type = EVENT_NONE;
 
-    if (event_head == event_tail)
+    uint32_t flags = hal_irq_save();
+    if (event_head == event_tail) {
+        hal_irq_restore(flags);
         return e;
+    }
 
     e = event_buf[event_tail];
     event_tail = (event_tail + 1) % EVENT_BUF_SIZE;
+    hal_irq_restore(flags);
     return e;
 }
 

@@ -73,7 +73,7 @@ static int heap_grow(uint32_t pages) {
 
     for (uint32_t i = 0; i < pages; i++) {
         uint32_t phys = alloc_frame();
-        if (phys == 0) {
+        if (phys == FRAME_ALLOC_FAIL) {
             /* Rollback: free frames from pages we already mapped */
             for (uint32_t j = 0; j < i; j++) {
                 uint32_t mapped_phys = virt_to_phys(grow_virt + j * PAGE_SIZE);
@@ -82,7 +82,15 @@ static int heap_grow(uint32_t pages) {
             printf("[heap] ERROR: alloc_frame() failed\n");
             return -1;
         }
-        map_page(grow_virt + i * PAGE_SIZE, phys, PAGE_PRESENT | PAGE_WRITABLE);
+        if (map_page(grow_virt + i * PAGE_SIZE, phys, PAGE_PRESENT | PAGE_WRITABLE) != 0) {
+            free_frame(phys);
+            for (uint32_t j = 0; j < i; j++) {
+                uint32_t mapped_phys = virt_to_phys(grow_virt + j * PAGE_SIZE);
+                if (mapped_phys) free_frame(mapped_phys);
+            }
+            printf("[heap] ERROR: map_page() failed\n");
+            return -1;
+        }
     }
 
     heap_end += new_bytes;

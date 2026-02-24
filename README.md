@@ -139,9 +139,9 @@ All init `printf` calls are wrapped in `#ifdef VERBOSE_BOOT`. Without the flag, 
 
 - Two-level page tables: `page_directory[1024]` -> `page_table[1024]`
 - `paging_init()` sets up identity map (PDE[0]) + higher-half map (PDE[768]) + heap table (PDE[769])
-- `map_page(virt, phys, flags)` — dynamic mapping with `invlpg` TLB invalidation
-- `alloc_frame()` / `free_frame()` — bitmap physical frame allocator
-- `virt_to_phys(vaddr)` — walk page tables to resolve physical address
+- `map_page(virt, phys, flags)` — dynamic mapping with `invlpg` TLB invalidation; uses `temp_map()` for safe page table access; returns 0 on success, -1 on failure
+- `alloc_frame()` / `free_frame()` — bitmap physical frame allocator; returns `FRAME_ALLOC_FAIL` (0xFFFFFFFF) on OOM
+- `virt_to_phys(vaddr)` — walk page tables via `temp_map()` for safe access
 - `temp_map(phys)` / `temp_unmap()` — interrupt-safe temporary mapping window at `0xC03FF000` for accessing physical frames that aren't identity-mapped
 
 ### Per-Process Page Directories
@@ -183,7 +183,7 @@ All init `printf` calls are wrapped in `#ifdef VERBOSE_BOOT`. Without the flag, 
 | 6 | `SYS_STAT` | EBX=path, ECX=&stat | Get file info (type, size, inode, nlink) |
 | 7 | `SYS_GETPID` | — | Return current PID |
 | 8 | `SYS_SLEEP` | EBX=ticks | Sleep for N ticks (10ms each) |
-| 9 | `SYS_BRK` | EBX=addr | Adjust process break (stub) |
+| 9 | `SYS_BRK` | EBX=addr | Adjust user heap break (maps new pages; `brk(0)` queries current break) |
 | 10 | `SYS_SPAWN` | EBX=name | Spawn ELF (VFS first, then initrd) |
 | 11 | `SYS_WAITPID` | EBX=pid, ECX=&status | Wait for child to exit |
 | 12 | `SYS_MKDIR` | EBX=path | Create directory |
@@ -197,12 +197,13 @@ All init `printf` calls are wrapped in `#ifdef VERBOSE_BOOT`. Without the flag, 
 ### Process & Scheduling
 
 - Process states: `NEW -> READY -> RUNNING -> BLOCKED -> ZOMBIE`
-- Each process has its own kernel stack (4 KB), saved CPU context (ESP/EBP), page directory (CR3), file descriptor table (16 fds), cwd inode, and pending signal bitmask
+- Each process has its own kernel stack (4 KB), saved CPU context (ESP/EBP), page directory (CR3), file descriptor table (16 fds), cwd inode, pending signal bitmask, and `brk` (program break for user heap)
 - Process hierarchy: parent_pid, exit_status, wait queue for waitpid blocking
+- Zombie reaping: process creation reaps orphan zombies when the table is full before failing
 - Round-robin scheduler, timer-driven (fires on each IRQ0 tick at 100 Hz)
 - `proc_create_kernel_thread(fn)` — create a kernel-mode thread, initializes stdin/stdout/stderr
 - `proc_create_user_process(pd_phys, eip, esp)` — create a ring-3 process with its own page directory
-- `elf_spawn(name)` — spawn user process (VFS first, then initrd fallback), sets parent_pid
+- `elf_spawn(name)` — spawn user process (VFS first, then initrd fallback), sets parent_pid; ELF loader initializes `p->brk` to end of highest PT_LOAD segment
 - `proc_kill(pid)` — interrupt-safe, switches to kernel CR3 before destroying user PD, closes all fds
 - `proc_signal(pid, sig)` — send signal to process (all signals currently fatal); zombie guard prevents double-kill
 - `scheduler_tick()` — NULL guard returns 0 if `current_process` uninitialized; `pick_next()` falls back to idle (PID 0)
@@ -219,7 +220,7 @@ In-memory inode-based filesystem (like Linux's page cache). All data lives in km
 - **Directories**: `data` points to a dynamic array of dirents (name + inode number), grows via krealloc
 - **Directory entries**: 64 bytes each (60-byte name + 4-byte inode number)
 - **Root directory**: always inode 0, contains `.` and `..` entries pointing to itself
-- **Path resolution**: iterative walk, starts from root (absolute) or per-process cwd (relative), handles `.` and `..`
+- **Path resolution**: iterative walk, starts from root (absolute) or per-process cwd (relative), handles `.` and `..`; rejects path components exceeding 59 chars
 - **Per-process CWD**: each process has its own `cwd` inode (inherited from parent); falls back to global during early boot
 - **Dirty tracking**: global dirty flag set on any mutation; supports write-back to disk
 - **Link counting**: inodes freed when link count reaches 0
@@ -266,7 +267,7 @@ Kernel IPC via 512-byte circular buffer. Blocking: read sleeps when empty (via w
 
 ### Wait Queues
 
-Blocking mechanism for processes. `sleep_on(wq)` sets process to BLOCKED and spins until woken. `wake_up_one(wq)` / `wake_up_all(wq)` set blocked processes back to READY. Used by pipes, waitpid, keyboard blocking, and mutex/semaphore blocking.
+Blocking mechanism for processes. `sleep_on(wq)` sets process to BLOCKED and spins until woken (uses `hal_irq_save/restore` for queue manipulation). `wake_up_one(wq)` / `wake_up_all(wq)` set blocked processes back to READY. Used by pipes, waitpid, keyboard blocking, and mutex/semaphore blocking.
 
 ### Synchronization Primitives
 
@@ -302,8 +303,10 @@ GOP/VBE linear framebuffer console that activates after the boot splash. The boo
 
 - Framebuffer driver maps physical FB at `0xC0800000` (PDE[770]) with cache-disable
 - Renders 8x16 CP437 glyphs from embedded font onto pixel framebuffer
+- Visible cursor (solid block) rendered at current position
 - Character grid: `width/8` cols × `height/16` rows (e.g., 128×48 at 1024×768)
 - 16 VGA colors mapped to 32-bit RGB
+- 200-line scrollback ring buffer with Page Up/Down navigation; snaps back to live view on new output
 - BIOS fallback: stays in VGA text mode when framebuffer info is unavailable
 
 ### Terminal & Scrollback
@@ -390,11 +393,11 @@ Shell prompt shows current working directory: `jedhelmers:/path> `
 | `kernel/fs/pipe.c` | Pipe IPC: circular buffer, blocking read/write |
 | `kernel/fs/initrd.c` | Initial ramdisk: parse GRUB module, file lookup, VFS import |
 | `kernel/drivers/framebuffer.c` | GOP/VBE framebuffer driver: map to kernel VA, pixel operations, XRGB8888 color |
-| `kernel/drivers/fb_console.c` | Framebuffer text console: glyph rendering, cursor, scroll |
+| `kernel/drivers/fb_console.c` | Framebuffer text console: glyph rendering, visible cursor, 200-line scrollback |
 | `kernel/drivers/ata.c` | ATA PIO disk driver (primary master, 28-bit LBA), interrupt-safe via HAL |
 | `kernel/drivers/mouse.c` | PS/2 mouse driver on IRQ12, software cursor |
-| `kernel/drivers/event.c` | Unified event queue (keyboard + mouse), blocking wait |
-| `kernel/drivers/window.c` | Window manager: desktop, title bars, window chrome |
+| `kernel/drivers/event.c` | Unified event queue (keyboard + mouse), interrupt-safe, blocking wait |
+| `kernel/drivers/window.c` | Window manager: linked window list, z-order, click-to-focus, dirty-rect drag |
 | `kernel/proc/process.c` | Process table, kernel thread + user process creation, fd init, process kill |
 | `kernel/proc/scheduler.c` | Round-robin scheduler with CR3 switching (via HAL) |
 | `kernel/proc/wait.c` | Wait queue implementation: sleep_on, wake_up_one, wake_up_all |

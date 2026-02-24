@@ -170,8 +170,11 @@ static int path_next_component(const char **pp, char *comp) {
     }
     comp[len] = '\0';
 
-    /* Skip trailing chars if name was truncated */
-    while (*p && *p != '/') p++;
+    /* Reject names that exceed VFS_MAX_NAME instead of silently truncating */
+    if (*p && *p != '/') {
+        printf("[vfs] name too long (max %d chars)\n", VFS_MAX_NAME);
+        return -2;  /* distinct from 0 (end) and 1 (ok) */
+    }
 
     *pp = p;
     return 1;
@@ -207,12 +210,16 @@ int32_t vfs_resolve(const char *path, uint32_t *parent_out, char *leaf_out) {
     }
 
     /* Extract the first component */
-    if (!path_next_component(&p, comp))
-        return (int32_t)cur;
+    {
+        int rc = path_next_component(&p, comp);
+        if (rc == 0) return (int32_t)cur;
+        if (rc < 0) return -1;  /* name too long */
+    }
 
     while (1) {
         /* Peek ahead: is there another component? */
         int has_next = path_next_component(&p, next_comp);
+        if (has_next < 0) return -1;  /* name too long */
 
         if (!has_next) {
             /* comp is the last component */

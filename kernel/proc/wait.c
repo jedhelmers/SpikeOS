@@ -28,8 +28,10 @@ void sleep_on(wait_queue_t *wq) {
     entry.proc = current_process;
     entry.next = NULL;
 
-    /* Disable interrupts while modifying the queue and process state */
-    hal_irq_disable();
+    /* Save and disable interrupts while modifying the queue and process
+       state.  Using hal_irq_save/restore preserves the caller's
+       interrupt state (matches the pattern used by wake_up_one/all). */
+    uint32_t flags = hal_irq_save();
 
     /* Append to tail of queue */
     if (!wq->head) {
@@ -42,11 +44,12 @@ void sleep_on(wait_queue_t *wq) {
 
     current_process->state = PROC_BLOCKED;
 
-    /* Re-enable interrupts and wait — the scheduler (on next timer tick)
-       will see us as BLOCKED and skip us. When wake_up sets us back to
-       PROC_READY, the scheduler will resume us here. */
-    hal_irq_enable();
+    hal_irq_restore(flags);
+
+    /* Spin-wait with interrupts enabled so the scheduler (IRQ0) can
+       fire and eventually wake us via wake_up_one/all. */
     while (current_process->state == PROC_BLOCKED) {
+        hal_irq_enable();
         hal_halt();
     }
 }

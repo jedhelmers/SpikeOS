@@ -14,8 +14,8 @@ Process management, scheduling, and synchronization for SpikeOS.
 
 ## How It Fits Together
 
-The process table holds up to 32 processes. The scheduler runs round-robin at 100Hz (timer IRQ), switching between READY processes by saving/restoring kernel stack pointers and switching CR3 for per-process page directories.
+The process table holds up to 32 processes. When the table is full, process creation attempts to reap orphan zombies (dead processes whose parent already exited) before failing. The scheduler runs round-robin at 100Hz (timer IRQ), switching between READY processes by saving/restoring kernel stack pointers and switching CR3 for per-process page directories.
 
-Wait queues are the foundation for all blocking primitives: mutex, semaphore, condition variable, rwlock, and pipe I/O. A process calls `sleep_on()` to block, and another process or IRQ handler calls `wake_up_one()`/`wake_up_all()` to unblock.
+Wait queues are the foundation for all blocking primitives: mutex, semaphore, condition variable, rwlock, and pipe I/O. A process calls `sleep_on()` to block (uses `hal_irq_save/restore` for queue manipulation), and another process or IRQ handler calls `wake_up_one()`/`wake_up_all()` to unblock.
 
-The ELF loader creates user-mode processes with their own page directories, mapping code/data segments and a user stack at the top of user address space.
+The ELF loader creates user-mode processes with their own page directories, mapping code/data segments and a user stack at the top of user address space. It initializes `p->brk` to the page-aligned end of the highest PT_LOAD segment, enabling `sys_brk()` for user-mode dynamic memory allocation.

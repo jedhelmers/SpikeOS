@@ -29,6 +29,15 @@ void fb_console_setcolor(uint8_t fg, uint8_t bg);
 /* Set cursor position (character grid coordinates) */
 void fb_console_setcursor(size_t x, size_t y);
 
+/* Redraw the visible cursor at the current position */
+void fb_console_update_cursor(void);
+
+/* Scroll back through history (Page Up) */
+void fb_console_page_up(void);
+
+/* Scroll forward through history (Page Down) */
+void fb_console_page_down(void);
+
 /* Returns 1 if framebuffer console is active */
 int fb_console_active(void);
 
