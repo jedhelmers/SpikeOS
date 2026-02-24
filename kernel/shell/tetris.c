@@ -439,6 +439,12 @@ void tetris_run(void) {
         /* --- Process window manager events (mouse drag, etc.) --- */
         wm_process_events();
 
+        /* Close dot was clicked — exit gracefully */
+        if (tetris_win->flags & WIN_FLAG_CLOSE_REQ) {
+            g.alive = 0;
+            break;
+        }
+
         /* --- Input (non-blocking) --- */
         key_event_t k = keyboard_get_event();
         if (k.type == KEY_CHAR) {
