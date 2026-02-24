@@ -19,17 +19,22 @@ static window_t *win_bottom = NULL;
 static window_t *win_top    = NULL;
 
 /* Desktop icon constants */
-#define DESKTOP_PATH "/Desktop"
-#define ICON_W       30
-#define ICON_H       50
+#define DESKTOP_PATH "/Users/jedhelmers/Desktop"
+#define ICON_W       64
+#define ICON_H       68
 #define ICON_PAD_X   10
 #define ICON_PAD_Y   10
-#define ICON_RECT_W  22
-#define ICON_RECT_H  28
-#define ICON_MAX_LABEL 4
+#define ICON_RECT_W  32
+#define ICON_RECT_H  32
+#define ICON_MAX_LABEL 8
+#define ICON_LABEL_ROWS 2
 
 static uint32_t desktop_dir_ino = 0;
 static int desktop_dir_valid = 0;
+
+/* Track which window is currently being dragged or resized */
+static window_t *dragging_win = NULL;
+static window_t *resizing_win = NULL;
 
 /* ------------------------------------------------------------------ */
 /*  Content rect                                                       */
@@ -51,6 +56,11 @@ void wm_update_content_rect(window_t *win) {
 /* ------------------------------------------------------------------ */
 
 static void desktop_ensure_path(void) {
+    /* Create intermediate directories if they don't exist */
+    if (vfs_resolve("/Users", NULL, NULL) < 0)
+        vfs_mkdir("/Users");
+    if (vfs_resolve("/Users/jedhelmers", NULL, NULL) < 0)
+        vfs_mkdir("/Users/jedhelmers");
     if (vfs_resolve(DESKTOP_PATH, NULL, NULL) < 0)
         vfs_mkdir(DESKTOP_PATH);
 
@@ -109,19 +119,28 @@ static void wm_draw_desktop_icons(void) {
         fb_fill_rect(rx, ry, ICON_RECT_W, ICON_RECT_H, fill);
         fb_draw_rect(rx, ry, ICON_RECT_W, ICON_RECT_H, outline);
 
-        /* Draw filename label below rect */
-        uint32_t label_y = ry + ICON_RECT_H + 2;
-        int len = 0;
-        while (entries[i].name[len] && len < ICON_MAX_LABEL) len++;
+        /* Draw filename label below rect (up to 2 rows of ICON_MAX_LABEL chars) */
+        int total_len = 0;
+        while (entries[i].name[total_len]) total_len++;
 
-        /* Center label under icon */
-        uint32_t label_w = (uint32_t)len * FONT_W;
-        uint32_t label_x = cx + (ICON_W - label_w) / 2;
+        int max_chars_per_row = ICON_W / FONT_W;
+        if (max_chars_per_row > ICON_MAX_LABEL) max_chars_per_row = ICON_MAX_LABEL;
 
-        for (int j = 0; j < len; j++) {
-            fb_render_char_px(label_x + (uint32_t)j * FONT_W, label_y,
-                              (uint8_t)entries[i].name[j],
-                              label_fg, desktop_color);
+        int pos = 0;
+        for (int lr = 0; lr < ICON_LABEL_ROWS && pos < total_len; lr++) {
+            int row_len = total_len - pos;
+            if (row_len > max_chars_per_row) row_len = max_chars_per_row;
+
+            uint32_t label_y = ry + ICON_RECT_H + 2 + (uint32_t)lr * FONT_H;
+            uint32_t label_w = (uint32_t)row_len * FONT_W;
+            uint32_t label_x = cx + (ICON_W - label_w) / 2;
+
+            for (int j = 0; j < row_len; j++) {
+                fb_render_char_px(label_x + (uint32_t)j * FONT_W, label_y,
+                                  (uint8_t)entries[i].name[pos + j],
+                                  label_fg, desktop_color);
+            }
+            pos += row_len;
         }
 
         icon_idx++;
@@ -199,7 +218,7 @@ window_t *wm_create_window(int32_t x, int32_t y, uint32_t w, uint32_t h,
     win->body_bg_color  = fb_pack_color(0, 0, 0);
     win->border_color   = fb_pack_color(100, 102, 110);
 
-    win->flags = WIN_FLAG_VISIBLE | WIN_FLAG_FOCUSED | WIN_FLAG_DRAGGABLE;
+    win->flags = WIN_FLAG_VISIBLE | WIN_FLAG_FOCUSED | WIN_FLAG_DRAGGABLE | WIN_FLAG_RESIZABLE;
     win->next = NULL;
     win->prev = NULL;
 
@@ -217,6 +236,38 @@ window_t *wm_create_window(int32_t x, int32_t y, uint32_t w, uint32_t h,
     if (!shell_win) shell_win = win;
 
     return win;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Window destruction                                                 */
+/* ------------------------------------------------------------------ */
+
+void wm_destroy_window(window_t *win) {
+    if (!win) return;
+
+    /* Unlink from doubly-linked z-order list */
+    if (win->prev) win->prev->next = win->next;
+    else           win_bottom = win->next;
+    if (win->next) win->next->prev = win->prev;
+    else           win_top = win->prev;
+
+    /* Clear shell_win if this was it (shouldn't happen, but safety) */
+    if (win == shell_win) shell_win = NULL;
+
+    /* Clear drag/resize tracking if this window was active */
+    if (win == dragging_win)  dragging_win = NULL;
+    if (win == resizing_win)  resizing_win = NULL;
+
+    kfree(win);
+
+    /* Focus the new top window */
+    if (win_top) {
+        for (window_t *w = win_bottom; w; w = w->next)
+            w->flags &= ~WIN_FLAG_FOCUSED;
+        win_top->flags |= WIN_FLAG_FOCUSED;
+    }
+
+    wm_redraw_all();
 }
 
 /* ------------------------------------------------------------------ */
@@ -273,6 +324,22 @@ static int hit_titlebar(window_t *win, int32_t mx, int32_t my) {
 static int hit_window(window_t *win, int32_t mx, int32_t my) {
     return mx >= win->x && mx < win->x + (int32_t)win->w &&
            my >= win->y && my < win->y + (int32_t)win->h;
+}
+
+/* Detect which resize edges the mouse is near. Returns 0 if not on any edge. */
+static uint32_t hit_resize_edges(window_t *win, int32_t mx, int32_t my) {
+    if (!(win->flags & WIN_FLAG_RESIZABLE)) return 0;
+    if (!hit_window(win, mx, my)) return 0;
+
+    uint32_t edges = 0;
+    int32_t grip = WIN_RESIZE_GRIP;
+
+    if (mx < win->x + grip)                          edges |= RESIZE_LEFT;
+    if (mx >= win->x + (int32_t)win->w - grip)       edges |= RESIZE_RIGHT;
+    if (my < win->y + grip)                           edges |= RESIZE_TOP;
+    if (my >= win->y + (int32_t)win->h - grip)        edges |= RESIZE_BOTTOM;
+
+    return edges;
 }
 
 /* Find the topmost window at (mx, my), searching top-to-bottom */
@@ -374,11 +441,98 @@ static void drag_end(window_t *win) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Event processing                                                   */
+/*  Resize handling                                                    */
 /* ------------------------------------------------------------------ */
 
-/* Track which window is currently being dragged */
-static window_t *dragging_win = NULL;
+static void resize_begin(window_t *win, int32_t mx, int32_t my, uint32_t edges) {
+    win->flags |= WIN_FLAG_RESIZING;
+    win->resize_edges = edges;
+    win->resize_anchor_x = mx;
+    win->resize_anchor_y = my;
+    win->resize_orig_x = win->x;
+    win->resize_orig_y = win->y;
+    win->resize_orig_w = win->w;
+    win->resize_orig_h = win->h;
+}
+
+static void resize_move(window_t *win, int32_t mx, int32_t my) {
+    int32_t dx = mx - win->resize_anchor_x;
+    int32_t dy = my - win->resize_anchor_y;
+
+    int32_t new_x = win->resize_orig_x;
+    int32_t new_y = win->resize_orig_y;
+    int32_t new_w = (int32_t)win->resize_orig_w;
+    int32_t new_h = (int32_t)win->resize_orig_h;
+
+    if (win->resize_edges & RESIZE_RIGHT)  new_w += dx;
+    if (win->resize_edges & RESIZE_BOTTOM) new_h += dy;
+    if (win->resize_edges & RESIZE_LEFT) {
+        new_x += dx;
+        new_w -= dx;
+    }
+    if (win->resize_edges & RESIZE_TOP) {
+        new_y += dy;
+        new_h -= dy;
+    }
+
+    /* Enforce minimum size */
+    if (new_w < WIN_MIN_W) {
+        if (win->resize_edges & RESIZE_LEFT)
+            new_x = win->resize_orig_x + (int32_t)win->resize_orig_w - WIN_MIN_W;
+        new_w = WIN_MIN_W;
+    }
+    if (new_h < WIN_MIN_H) {
+        if (win->resize_edges & RESIZE_TOP)
+            new_y = win->resize_orig_y + (int32_t)win->resize_orig_h - WIN_MIN_H;
+        new_h = WIN_MIN_H;
+    }
+
+    if (new_x == win->x && new_y == win->y &&
+        new_w == (int32_t)win->w && new_h == (int32_t)win->h)
+        return;
+
+    mouse_hide_cursor();
+
+    /* Erase old window area */
+    {
+        int32_t ox = win->x, oy = win->y;
+        int32_t ow = (int32_t)win->w, oh = (int32_t)win->h;
+        if (ox < 0) { ow += ox; ox = 0; }
+        if (oy < 0) { oh += oy; oy = 0; }
+        if (ox + ow > (int32_t)fb_info.width)  ow = (int32_t)fb_info.width - ox;
+        if (oy + oh > (int32_t)fb_info.height) oh = (int32_t)fb_info.height - oy;
+        if (ow > 0 && oh > 0)
+            fb_fill_rect((uint32_t)ox, (uint32_t)oy,
+                         (uint32_t)ow, (uint32_t)oh, desktop_color);
+    }
+
+    wm_draw_desktop_icons();
+
+    /* Apply new geometry */
+    win->x = new_x;
+    win->y = new_y;
+    win->w = (uint32_t)new_w;
+    win->h = (uint32_t)new_h;
+    wm_update_content_rect(win);
+
+    /* Rebind console to new size if this is the shell window */
+    if (win == shell_win)
+        fb_console_bind_window(win);
+
+    wm_draw_chrome(win);
+    fb_console_repaint();
+
+    mouse_show_cursor();
+}
+
+static void resize_end(window_t *win) {
+    win->flags &= ~WIN_FLAG_RESIZING;
+    win->resize_edges = 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Event processing                                                   */
+/* ------------------------------------------------------------------ */
 
 int wm_process_events(void) {
     event_t e = event_poll();
@@ -396,6 +550,15 @@ int wm_process_events(void) {
                 wm_redraw_all();
             }
 
+            /* Check for resize grip first (edges/corners) */
+            uint32_t edges = hit_resize_edges(hit,
+                                e.mouse_button.x, e.mouse_button.y);
+            if (edges) {
+                resize_begin(hit, e.mouse_button.x, e.mouse_button.y, edges);
+                resizing_win = hit;
+                return 1;
+            }
+
             /* Start drag if clicked on title bar */
             if ((hit->flags & WIN_FLAG_DRAGGABLE) &&
                 hit_titlebar(hit, e.mouse_button.x, e.mouse_button.y)) {
@@ -406,9 +569,14 @@ int wm_process_events(void) {
         }
     }
 
-    /* Left-release: end drag */
+    /* Left-release: end drag or resize */
     if (e.type == EVENT_MOUSE_BUTTON && !e.mouse_button.pressed &&
         (e.mouse_button.button & MOUSE_BTN_LEFT)) {
+        if (resizing_win && (resizing_win->flags & WIN_FLAG_RESIZING)) {
+            resize_end(resizing_win);
+            resizing_win = NULL;
+            return 1;
+        }
         if (dragging_win && (dragging_win->flags & WIN_FLAG_DRAGGING)) {
             drag_end(dragging_win);
             dragging_win = NULL;
@@ -416,8 +584,12 @@ int wm_process_events(void) {
         }
     }
 
-    /* Mouse move during drag */
+    /* Mouse move during drag or resize */
     if (e.type == EVENT_MOUSE_MOVE) {
+        if (resizing_win && (resizing_win->flags & WIN_FLAG_RESIZING)) {
+            resize_move(resizing_win, e.mouse_move.x, e.mouse_move.y);
+            return 1;
+        }
         if (dragging_win && (dragging_win->flags & WIN_FLAG_DRAGGING)) {
             drag_move(dragging_win, e.mouse_move.x, e.mouse_move.y);
             return 1;

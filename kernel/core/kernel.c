@@ -332,17 +332,17 @@ void kernel_main(void) {
     wm_init();
     fb_console_init();
 
-    /* Create shell window — content area matches old margins (32px sides, 48px top) */
+    /* Create shell window — 80% width, 50% height, centered horizontally */
     if (fb_info.available) {
-        uint32_t content_w = (fb_info.width - 2 * 32);
-        uint32_t content_h = (fb_info.height - 48 - 16);
+        uint32_t content_w = (fb_info.width * 4 / 5);
+        uint32_t content_h = (fb_info.height / 2);
         content_w = (content_w / 8) * 8;
         content_h = (content_h / 16) * 16;
 
-        int32_t  outer_x = 32 - WIN_BORDER_W;
-        int32_t  outer_y = 48 - WIN_TITLEBAR_H - WIN_BORDER_W;
         uint32_t outer_w = content_w + 2 * WIN_BORDER_W;
         uint32_t outer_h = content_h + WIN_TITLEBAR_H + 2 * WIN_BORDER_W;
+        int32_t  outer_x = ((int32_t)fb_info.width - (int32_t)outer_w) / 2;
+        int32_t  outer_y = (int32_t)fb_info.height - (int32_t)outer_h - 16;
 
         window_t *win = wm_create_window(outer_x, outer_y,
                                          outer_w, outer_h, "SpikeOS Shell");

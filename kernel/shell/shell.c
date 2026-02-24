@@ -601,6 +601,8 @@ void shell_execute(void) {
         printf("  mkdir <name>   - create directory\n");
         printf("  touch <name>   - create empty file\n");
         printf("  rm <name>      - remove file or empty directory\n");
+        printf("  rm -r <name>   - remove directory recursively\n");
+        printf("  rename <o> <n> - rename file or directory\n");
         printf("  cat <name>     - display file contents\n");
         printf("  write <n> <t>  - write text to file\n");
         printf("  mv <src> <dst> - move/rename\n");
@@ -675,13 +677,20 @@ void shell_execute(void) {
         }
     }
 
-    /* ---- rm ---- */
+    /* ---- rm [-r] ---- */
     else if (strncmp(line_buf, "rm ", 3) == 0) {
-        const char *name = shell_arg(line_buf, 2);
-        if (!name) {
-            printf("Usage: rm <name>\n");
-        } else if (vfs_remove(name) != 0) {
-            printf("rm: failed to remove '%s'\n", name);
+        const char *args = shell_arg(line_buf, 2);
+        if (!args) {
+            printf("Usage: rm [-r] <name>\n");
+        } else if (strncmp(args, "-r ", 3) == 0) {
+            const char *name = shell_arg(args, 2);
+            if (!name) {
+                printf("Usage: rm -r <name>\n");
+            } else if (vfs_remove_recursive(name) != 0) {
+                printf("rm: failed to remove '%s'\n", name);
+            }
+        } else if (vfs_remove(args) != 0) {
+            printf("rm: failed to remove '%s'\n", args);
         }
     }
 
@@ -768,6 +777,22 @@ void shell_execute(void) {
                 printf("Usage: mv <src> <dst>\n");
             } else if (vfs_rename(src, dst) != 0) {
                 printf("mv: failed\n");
+            }
+        }
+    }
+
+    /* ---- rename <old> <new> ---- */
+    else if (strncmp(line_buf, "rename ", 7) == 0) {
+        const char *args = shell_arg(line_buf, 6);
+        if (!args) {
+            printf("Usage: rename <old> <new>\n");
+        } else {
+            const char *old_name, *new_name;
+            shell_split_args(args, &old_name, &new_name);
+            if (!new_name) {
+                printf("Usage: rename <old> <new>\n");
+            } else if (vfs_rename(old_name, new_name) != 0) {
+                printf("rename: failed\n");
             }
         }
     }
