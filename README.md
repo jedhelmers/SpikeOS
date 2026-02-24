@@ -397,7 +397,7 @@ Shell prompt shows current working directory: `jedhelmers:/path> `
 | `kernel/drivers/ata.c` | ATA PIO disk driver (primary master, 28-bit LBA), interrupt-safe via HAL |
 | `kernel/drivers/mouse.c` | PS/2 mouse driver on IRQ12, software cursor |
 | `kernel/drivers/event.c` | Unified event queue (keyboard + mouse), interrupt-safe, blocking wait |
-| `kernel/drivers/window.c` | Window manager: linked window list, z-order, click-to-focus, dirty-rect drag |
+| `kernel/drivers/window.c` | Window manager: linked window list, z-order, click-to-focus, dirty-rect drag, traffic light dots, AA rounded corners |
 | `kernel/proc/process.c` | Process table, kernel thread + user process creation, fd init, process kill |
 | `kernel/proc/scheduler.c` | Round-robin scheduler with CR3 switching (via HAL) |
 | `kernel/proc/wait.c` | Wait queue implementation: sleep_on, wake_up_one, wake_up_all |

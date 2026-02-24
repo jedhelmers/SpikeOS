@@ -14,9 +14,9 @@ Hardware device drivers for SpikeOS.
 - **fb_console.c** — Framebuffer text console (8x16 CP437 glyph rendering, visible cursor, 200-line scrollback, VGA color mapping)
 - **event.c** — Unified event queue (keyboard + mouse events) with blocking wait support, interrupt-safe via `hal_irq_save/restore`
 - **mouse.c** — PS/2 mouse driver on IRQ12 with software cursor (save/restore background)
-- **window.c** — Window manager: doubly-linked window list with z-order, click-to-focus, dirty-rect drag, title bars, desktop at `/Desktop`
+- **window.c** — Window manager: doubly-linked window list with z-order, click-to-focus, dirty-rect drag, title bars with traffic light dots (close/minimize/maximize), anti-aliased rounded corners, cooperative close via `WIN_FLAG_CLOSE_REQ`, desktop at `/Desktop`
 - **debug_log.c** — NDJSON debug logger over UART
 
 ## How It Fits Together
 
-All drivers register their IRQ handlers through `irq_install_handler()` in `kernel/core/isr.c` and use the HAL (`kernel/arch/i386/hal.c`) for port I/O and interrupt management. The timer drives the scheduler, the keyboard and mouse feed the event queue, the ATA driver backs SpikeFS, VGA13 provides graphics for games, the framebuffer console provides high-resolution text output, and the window manager draws desktop chrome and manages window positioning.
+All drivers register their IRQ handlers through `irq_install_handler()` in `kernel/core/isr.c` and use the HAL (`kernel/arch/i386/hal.c`) for port I/O and interrupt management. The timer drives the scheduler, the keyboard and mouse feed the event queue, the ATA driver backs SpikeFS, the framebuffer console provides high-resolution text output, and the window manager draws desktop chrome (traffic light dots, AA rounded corners) and manages window positioning.

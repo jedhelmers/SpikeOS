@@ -159,29 +159,127 @@ void wm_draw_desktop(void) {
 uint32_t wm_get_desktop_color(void) { return desktop_color; }
 
 /* ------------------------------------------------------------------ */
+/*  Anti-aliased rounded corner                                        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Draw one quarter-circle corner with 2×2 sub-pixel anti-aliasing.
+ * Handles interior fill, 1px border, and exterior mask in a single pass.
+ * (ox, oy) = top-left of the r×r pixel block.
+ * flip_x/flip_y select quadrant: (0,0)=TL, (1,0)=TR, (0,1)=BL, (1,1)=BR
+ */
+static void draw_aa_corner(uint32_t ox, uint32_t oy, uint32_t r,
+                           uint32_t fill_color, uint32_t border_color,
+                           uint32_t outside_color, int flip_x, int flip_y) {
+    if (r == 0) return;
+    int ri = (int)r;
+
+    /* Thresholds in 4× fixed-point (each pixel spans 4 sub-units) */
+    int outer_r2 = 16 * ri * ri;
+    int inner_r2 = 16 * (ri - 1) * (ri - 1);
+
+    /* Pre-extract colour channels for blending */
+    uint32_t rmask = (1u << fb_info.red_mask) - 1;
+    uint32_t gmask = (1u << fb_info.green_mask) - 1;
+    uint32_t bmask = (1u << fb_info.blue_mask) - 1;
+
+    uint32_t fr = (fill_color    >> fb_info.red_pos)   & rmask;
+    uint32_t fg = (fill_color    >> fb_info.green_pos) & gmask;
+    uint32_t fb_ = (fill_color   >> fb_info.blue_pos)  & bmask;
+    uint32_t bdr = (border_color >> fb_info.red_pos)   & rmask;
+    uint32_t bdg = (border_color >> fb_info.green_pos) & gmask;
+    uint32_t bdb = (border_color >> fb_info.blue_pos)  & bmask;
+    uint32_t otr = (outside_color >> fb_info.red_pos)  & rmask;
+    uint32_t otg = (outside_color >> fb_info.green_pos)& gmask;
+    uint32_t otb = (outside_color >> fb_info.blue_pos) & bmask;
+
+    for (int j = 0; j < ri; j++) {
+        for (int i = 0; i < ri; i++) {
+            int nf = 0, nb = 0, no = 0;
+
+            /* 2×2 sub-pixel samples at quarter-pixel offsets */
+            static const int sp[4][2] = {{1,1},{3,1},{1,3},{3,3}};
+            for (int s = 0; s < 4; s++) {
+                int sx = 4 * i + sp[s][0];
+                int sy = 4 * j + sp[s][1];
+                int dx = flip_x ? sx : (4 * ri - sx);
+                int dy = flip_y ? sy : (4 * ri - sy);
+                int d2 = dx * dx + dy * dy;
+
+                if (d2 > outer_r2)      no++;
+                else if (d2 > inner_r2) nb++;
+                else                    nf++;
+            }
+
+            uint32_t color;
+            if (nf == 4)      color = fill_color;
+            else if (no == 4) color = outside_color;
+            else if (nb == 4) color = border_color;
+            else {
+                uint32_t rr = (fr * nf + bdr * nb + otr * no + 2) >> 2;
+                uint32_t gg = (fg * nf + bdg * nb + otg * no + 2) >> 2;
+                uint32_t bb = (fb_ * nf + bdb * nb + otb * no + 2) >> 2;
+                color = fb_pack_color((uint8_t)rr, (uint8_t)gg, (uint8_t)bb);
+            }
+
+            fb_putpixel(ox + (uint32_t)i, oy + (uint32_t)j, color);
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /*  Window chrome                                                      */
 /* ------------------------------------------------------------------ */
 
 void wm_draw_chrome(window_t *win) {
     if (!(win->flags & WIN_FLAG_VISIBLE)) return;
 
-    /* Outer border */
-    fb_draw_rect((uint32_t)win->x, (uint32_t)win->y,
-                 win->w, win->h, win->border_color);
+    uint32_t wx = (uint32_t)win->x;
+    uint32_t wy = (uint32_t)win->y;
+    uint32_t ww = win->w;
+    uint32_t wh = win->h;
+    uint32_t r  = WIN_BORDER_RADIUS;
 
-    /* Title bar background */
-    uint32_t tb_x = (uint32_t)win->x + WIN_BORDER_W;
-    uint32_t tb_y = (uint32_t)win->y + WIN_BORDER_W;
-    uint32_t tb_w = win->w - 2 * WIN_BORDER_W;
+    /* --- Fill body background (rectangular, corners will be masked) --- */
+    fb_fill_rect(wx, wy, ww, wh, win->body_bg_color);
+
+    /* --- Title bar background --- */
+    uint32_t tb_x = wx + WIN_BORDER_W;
+    uint32_t tb_y = wy + WIN_BORDER_W;
+    uint32_t tb_w = ww - 2 * WIN_BORDER_W;
     uint32_t tb_h = WIN_TITLEBAR_H - WIN_BORDER_W;
-
     fb_fill_rect(tb_x, tb_y, tb_w, tb_h, win->title_bg_color);
 
-    /* Title bar bottom separator line */
+    /* --- Anti-aliased rounded corners (fill + border + mask in one pass) --- */
+    draw_aa_corner(wx, wy, r,
+                   win->title_bg_color, win->border_color, desktop_color, 0, 0);
+    draw_aa_corner(wx + ww - r, wy, r,
+                   win->title_bg_color, win->border_color, desktop_color, 1, 0);
+    draw_aa_corner(wx, wy + wh - r, r,
+                   win->body_bg_color, win->border_color, desktop_color, 0, 1);
+    draw_aa_corner(wx + ww - r, wy + wh - r, r,
+                   win->body_bg_color, win->border_color, desktop_color, 1, 1);
+
+    /* --- Straight border edges (between rounded corners) --- */
+    fb_draw_hline(wx + r, wy, ww - 2 * r, win->border_color);           /* top */
+    fb_draw_hline(wx + r, wy + wh - 1, ww - 2 * r, win->border_color);  /* bottom */
+    fb_draw_vline(wx, wy + r, wh - 2 * r, win->border_color);           /* left */
+    fb_draw_vline(wx + ww - 1, wy + r, wh - 2 * r, win->border_color);  /* right */
+
+    /* --- Title bar separator line --- */
     fb_draw_hline(tb_x, tb_y + tb_h, tb_w, win->border_color);
 
-    /* Title text (pixel-positioned, 2px top padding, 8px left padding) */
-    uint32_t text_px = tb_x + 8;
+    /* --- Traffic light dots --- */
+    uint32_t dot_cy = wy + WIN_DOT_Y_OFF;
+    fb_fill_circle(wx + WIN_DOT_CLOSE_X, dot_cy, WIN_DOT_RADIUS,
+                   fb_pack_color(255, 95, 87));    /* close — red */
+    fb_fill_circle(wx + WIN_DOT_MIN_X, dot_cy, WIN_DOT_RADIUS,
+                   fb_pack_color(255, 189, 46));   /* minimize — yellow */
+    fb_fill_circle(wx + WIN_DOT_MAX_X, dot_cy, WIN_DOT_RADIUS,
+                   fb_pack_color(39, 201, 63));    /* maximize — green */
+
+    /* --- Title text (shifted right past the dots) --- */
+    uint32_t text_px = tb_x + 60;
     uint32_t text_py = tb_y + 2;
 
     for (int i = 0; win->title[i] != '\0'; i++) {
@@ -559,11 +657,62 @@ int wm_process_events(void) {
                 return 1;
             }
 
-            /* Start drag if clicked on title bar */
-            if ((hit->flags & WIN_FLAG_DRAGGABLE) &&
-                hit_titlebar(hit, e.mouse_button.x, e.mouse_button.y)) {
-                drag_begin(hit, e.mouse_button.x, e.mouse_button.y);
-                dragging_win = hit;
+            /* Check traffic light dots before starting drag */
+            if (hit_titlebar(hit, e.mouse_button.x, e.mouse_button.y)) {
+                int32_t rel_x = e.mouse_button.x - hit->x;
+                int32_t rel_y = e.mouse_button.y - hit->y;
+
+                /* Close dot — set flag; owner checks and cleans up */
+                if ((rel_x - WIN_DOT_CLOSE_X) * (rel_x - WIN_DOT_CLOSE_X) +
+                    (rel_y - WIN_DOT_Y_OFF) * (rel_y - WIN_DOT_Y_OFF) <=
+                    WIN_DOT_RADIUS * WIN_DOT_RADIUS) {
+                    if (hit != shell_win)
+                        hit->flags |= WIN_FLAG_CLOSE_REQ;
+                    return 1;
+                }
+
+                /* Minimize dot */
+                if ((rel_x - WIN_DOT_MIN_X) * (rel_x - WIN_DOT_MIN_X) +
+                    (rel_y - WIN_DOT_Y_OFF) * (rel_y - WIN_DOT_Y_OFF) <=
+                    WIN_DOT_RADIUS * WIN_DOT_RADIUS) {
+                    hit->flags &= ~WIN_FLAG_VISIBLE;
+                    wm_redraw_all();
+                    return 1;
+                }
+
+                /* Maximize dot */
+                if ((rel_x - WIN_DOT_MAX_X) * (rel_x - WIN_DOT_MAX_X) +
+                    (rel_y - WIN_DOT_Y_OFF) * (rel_y - WIN_DOT_Y_OFF) <=
+                    WIN_DOT_RADIUS * WIN_DOT_RADIUS) {
+                    if (hit->flags & WIN_FLAG_MAXIMIZED) {
+                        hit->x = hit->saved_x;
+                        hit->y = hit->saved_y;
+                        hit->w = hit->saved_w;
+                        hit->h = hit->saved_h;
+                        hit->flags &= ~WIN_FLAG_MAXIMIZED;
+                    } else {
+                        hit->saved_x = hit->x;
+                        hit->saved_y = hit->y;
+                        hit->saved_w = hit->w;
+                        hit->saved_h = hit->h;
+                        hit->x = 0;
+                        hit->y = 0;
+                        hit->w = fb_info.width;
+                        hit->h = fb_info.height;
+                        hit->flags |= WIN_FLAG_MAXIMIZED;
+                    }
+                    wm_update_content_rect(hit);
+                    if (hit == shell_win)
+                        fb_console_bind_window(hit);
+                    wm_redraw_all();
+                    return 1;
+                }
+
+                /* No dot hit — start drag */
+                if (hit->flags & WIN_FLAG_DRAGGABLE) {
+                    drag_begin(hit, e.mouse_button.x, e.mouse_button.y);
+                    dragging_win = hit;
+                }
             }
             return 1;
         }
