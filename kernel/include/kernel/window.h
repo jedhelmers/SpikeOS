@@ -9,6 +9,14 @@
 #define WIN_RESIZE_GRIP   6   /* resize grip zone in pixels */
 #define WIN_MIN_W       120   /* minimum window width */
 #define WIN_MIN_H        80   /* minimum window height */
+#define WIN_BORDER_RADIUS  4  /* corner radius in pixels */
+
+/* Traffic light dot layout (relative to window top-left) */
+#define WIN_DOT_RADIUS     5
+#define WIN_DOT_Y_OFF     10  /* center Y offset from window top */
+#define WIN_DOT_CLOSE_X   14  /* close dot center X */
+#define WIN_DOT_MIN_X     30  /* minimize dot center X */
+#define WIN_DOT_MAX_X     46  /* maximize dot center X */
 
 /* Window flags */
 #define WIN_FLAG_VISIBLE    (1 << 0)
@@ -17,6 +25,8 @@
 #define WIN_FLAG_DRAGGING   (1 << 3)
 #define WIN_FLAG_RESIZABLE  (1 << 4)
 #define WIN_FLAG_RESIZING   (1 << 5)
+#define WIN_FLAG_MAXIMIZED  (1 << 6)
+#define WIN_FLAG_CLOSE_REQ  (1 << 7)  /* close dot was clicked; owner should clean up */
 
 /* Resize edge mask (which edges are being dragged) */
 #define RESIZE_LEFT    (1 << 0)
@@ -51,6 +61,10 @@ typedef struct window {
     int32_t  resize_anchor_x, resize_anchor_y;
     int32_t  resize_orig_x, resize_orig_y;
     uint32_t resize_orig_w, resize_orig_h;
+
+    /* Saved geometry for maximize/restore toggle */
+    int32_t  saved_x, saved_y;
+    uint32_t saved_w, saved_h;
 
     /* Window list — bottom to top z-order (next = above, prev = below) */
     struct window *next;

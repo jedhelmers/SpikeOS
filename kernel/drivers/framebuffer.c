@@ -7,8 +7,9 @@
 framebuffer_info_t fb_info;
 
 /*
- * FB virtual address: PDE[770] = 0xC0800000
- * This gives us a 4MB window, enough for up to 1024x1024x32bpp.
+ * FB virtual address: starts at PDE[770] = 0xC0800000.
+ * fb_init() maps as many pages as needed, spanning multiple PDEs
+ * for large resolutions (e.g. 1920x1080x32 = ~8MB).
  */
 #define FB_VIRT_BASE 0xC0800000u
 
@@ -156,6 +157,23 @@ uint32_t fb_pack_color(uint8_t r, uint8_t g, uint8_t b) {
     color |= ((uint32_t)g & ((1u << fb_info.green_mask) - 1)) << fb_info.green_pos;
     color |= ((uint32_t)b & ((1u << fb_info.blue_mask) - 1))  << fb_info.blue_pos;
     return color;
+}
+
+void fb_fill_circle(uint32_t cx, uint32_t cy, uint32_t r, uint32_t color) {
+    if (!fb_info.available || r == 0) return;
+    int ri = (int)r;
+    for (int dy = -ri; dy <= ri; dy++) {
+        /* Integer sqrt: find largest dx where dx² + dy² <= r² */
+        int r2 = ri * ri;
+        int dy2 = dy * dy;
+        int dx = 0;
+        while ((dx + 1) * (dx + 1) + dy2 <= r2) dx++;
+        int py = (int)cy + dy;
+        if (py < 0) continue;
+        int px = (int)cx - dx;
+        if (px < 0) px = 0;
+        fb_fill_rect((uint32_t)px, (uint32_t)py, (uint32_t)(2 * dx + 1), 1, color);
+    }
 }
 
 void fb_draw_hline(uint32_t x, uint32_t y, uint32_t w, uint32_t color) {
