@@ -291,7 +291,7 @@ uint32_t wm_get_desktop_color(void) { return desktop_color; }
 /* ------------------------------------------------------------------ */
 
 /*
- * Draw one quarter-circle corner with 2×2 sub-pixel anti-aliasing.
+ * Draw one quarter-circle corner with 4×4 sub-pixel anti-aliasing.
  * Handles interior fill, 1px border, and exterior mask in a single pass.
  * (ox, oy) = top-left of the r×r pixel block.
  * flip_x/flip_y select quadrant: (0,0)=TL, (1,0)=TR, (0,1)=BL, (1,1)=BR
@@ -302,9 +302,9 @@ static void draw_aa_corner(uint32_t ox, uint32_t oy, uint32_t r,
     if (r == 0) return;
     int ri = (int)r;
 
-    /* Thresholds in 4× fixed-point (each pixel spans 4 sub-units) */
-    int outer_r2 = 16 * ri * ri;
-    int inner_r2 = 16 * (ri - 1) * (ri - 1);
+    /* Thresholds in 8× fixed-point (each pixel spans 8 sub-units) */
+    int outer_r2 = 64 * ri * ri;
+    int inner_r2 = 64 * (ri - 1) * (ri - 1);
 
     /* Pre-extract colour channels for blending */
     uint32_t rmask = (1u << fb_info.red_mask) - 1;
@@ -325,13 +325,18 @@ static void draw_aa_corner(uint32_t ox, uint32_t oy, uint32_t r,
         for (int i = 0; i < ri; i++) {
             int nf = 0, nb = 0, no = 0;
 
-            /* 2×2 sub-pixel samples at quarter-pixel offsets */
-            static const int sp[4][2] = {{1,1},{3,1},{1,3},{3,3}};
-            for (int s = 0; s < 4; s++) {
-                int sx = 4 * i + sp[s][0];
-                int sy = 4 * j + sp[s][1];
-                int dx = flip_x ? sx : (4 * ri - sx);
-                int dy = flip_y ? sy : (4 * ri - sy);
+            /* 4×4 sub-pixel samples at eighth-pixel offsets */
+            static const int sp[16][2] = {
+                {1,1},{3,1},{5,1},{7,1},
+                {1,3},{3,3},{5,3},{7,3},
+                {1,5},{3,5},{5,5},{7,5},
+                {1,7},{3,7},{5,7},{7,7}
+            };
+            for (int s = 0; s < 16; s++) {
+                int sx = 8 * i + sp[s][0];
+                int sy = 8 * j + sp[s][1];
+                int dx = flip_x ? sx : (8 * ri - sx);
+                int dy = flip_y ? sy : (8 * ri - sy);
                 int d2 = dx * dx + dy * dy;
 
                 if (d2 > outer_r2)      no++;
@@ -340,13 +345,13 @@ static void draw_aa_corner(uint32_t ox, uint32_t oy, uint32_t r,
             }
 
             uint32_t color;
-            if (nf == 4)      color = fill_color;
-            else if (no == 4) color = outside_color;
-            else if (nb == 4) color = border_color;
+            if (nf == 16)      color = fill_color;
+            else if (no == 16) color = outside_color;
+            else if (nb == 16) color = border_color;
             else {
-                uint32_t rr = (fr * nf + bdr * nb + otr * no + 2) >> 2;
-                uint32_t gg = (fg * nf + bdg * nb + otg * no + 2) >> 2;
-                uint32_t bb = (fb_ * nf + bdb * nb + otb * no + 2) >> 2;
+                uint32_t rr = (fr * nf + bdr * nb + otr * no + 8) >> 4;
+                uint32_t gg = (fg * nf + bdg * nb + otg * no + 8) >> 4;
+                uint32_t bb = (fb_ * nf + bdb * nb + otb * no + 8) >> 4;
                 color = fb_pack_color((uint8_t)rr, (uint8_t)gg, (uint8_t)bb);
             }
 
@@ -430,14 +435,14 @@ void wm_draw_chrome(window_t *win) {
     /* --- Title bar separator line --- */
     fb_draw_hline(tb_x, tb_y + tb_h, tb_w, win->border_color);
 
-    /* --- Traffic light dots --- */
+    /* --- Traffic light dots (anti-aliased) --- */
     uint32_t dot_cy = wy + WIN_DOT_Y_OFF;
-    fb_fill_circle(wx + WIN_DOT_CLOSE_X, dot_cy, WIN_DOT_RADIUS,
-                   fb_pack_color(255, 95, 87));    /* close — red */
-    fb_fill_circle(wx + WIN_DOT_MIN_X, dot_cy, WIN_DOT_RADIUS,
-                   fb_pack_color(255, 189, 46));   /* minimize — yellow */
-    fb_fill_circle(wx + WIN_DOT_MAX_X, dot_cy, WIN_DOT_RADIUS,
-                   fb_pack_color(39, 201, 63));    /* maximize — green */
+    fb_fill_circle_aa(wx + WIN_DOT_CLOSE_X, dot_cy, WIN_DOT_RADIUS,
+                      fb_pack_color(255, 95, 87), win->title_bg_color);   /* close — red */
+    fb_fill_circle_aa(wx + WIN_DOT_MIN_X, dot_cy, WIN_DOT_RADIUS,
+                      fb_pack_color(255, 189, 46), win->title_bg_color);  /* minimize — yellow */
+    fb_fill_circle_aa(wx + WIN_DOT_MAX_X, dot_cy, WIN_DOT_RADIUS,
+                      fb_pack_color(39, 201, 63), win->title_bg_color);   /* maximize — green */
 
     /* --- Title text (shifted right past the dots) --- */
     uint32_t text_px = tb_x + 60;
@@ -1033,7 +1038,20 @@ static void resize_end(window_t *win) {
 /*  Event processing                                                   */
 /* ------------------------------------------------------------------ */
 
+/* Throttled background repaint: at most once every 10 ticks (100ms) */
+static uint32_t last_dirty_repaint = 0;
+#define DIRTY_REPAINT_INTERVAL 10
+
 int wm_process_events(void) {
+    /* Check if background shell content has changed and needs a repaint */
+    if (fb_console_check_dirty()) {
+        uint32_t now = timer_ticks();
+        if (now - last_dirty_repaint >= DIRTY_REPAINT_INTERVAL) {
+            last_dirty_repaint = now;
+            wm_redraw_all();
+        }
+    }
+
     event_t e = event_poll();
     if (e.type == EVENT_NONE) return 0;
 

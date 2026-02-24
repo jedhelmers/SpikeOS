@@ -176,6 +176,66 @@ void fb_fill_circle(uint32_t cx, uint32_t cy, uint32_t r, uint32_t color) {
     }
 }
 
+void fb_fill_circle_aa(uint32_t cx, uint32_t cy, uint32_t r,
+                        uint32_t color, uint32_t bg_color) {
+    if (!fb_info.available || r == 0) return;
+    int ri = (int)r;
+
+    /* Pre-extract colour channels for blending */
+    uint32_t rmask = (1u << fb_info.red_mask) - 1;
+    uint32_t gmask = (1u << fb_info.green_mask) - 1;
+    uint32_t bmask = (1u << fb_info.blue_mask) - 1;
+
+    uint32_t cr = (color    >> fb_info.red_pos)   & rmask;
+    uint32_t cg = (color    >> fb_info.green_pos) & gmask;
+    uint32_t cb = (color    >> fb_info.blue_pos)  & bmask;
+    uint32_t br = (bg_color >> fb_info.red_pos)   & rmask;
+    uint32_t bg = (bg_color >> fb_info.green_pos) & gmask;
+    uint32_t bb = (bg_color >> fb_info.blue_pos)  & bmask;
+
+    /* Radius squared in 8x fixed-point */
+    int r2_fp = 64 * ri * ri;
+
+    /* 4x4 subpixel sample offsets within an 8x8 sub-grid per pixel */
+    static const int sp[16][2] = {
+        {1,1},{3,1},{5,1},{7,1},
+        {1,3},{3,3},{5,3},{7,3},
+        {1,5},{3,5},{5,5},{7,5},
+        {1,7},{3,7},{5,7},{7,7}
+    };
+
+    for (int dy = -ri - 1; dy <= ri + 1; dy++) {
+        int py = (int)cy + dy;
+        if (py < 0 || py >= (int)fb_info.height) continue;
+
+        for (int dx = -ri - 1; dx <= ri + 1; dx++) {
+            int px = (int)cx + dx;
+            if (px < 0 || px >= (int)fb_info.width) continue;
+
+            /* Count subpixel samples inside the circle */
+            int inside = 0;
+            for (int s = 0; s < 16; s++) {
+                int sx = 8 * dx + sp[s][0] - 4;  /* center at pixel middle */
+                int sy = 8 * dy + sp[s][1] - 4;
+                if (sx * sx + sy * sy <= r2_fp)
+                    inside++;
+            }
+
+            if (inside == 0) continue;
+            if (inside == 16) {
+                fb_putpixel((uint32_t)px, (uint32_t)py, color);
+            } else {
+                int outside = 16 - inside;
+                uint32_t rr = (cr * inside + br * outside + 8) >> 4;
+                uint32_t gg = (cg * inside + bg * outside + 8) >> 4;
+                uint32_t bbb = (cb * inside + bb * outside + 8) >> 4;
+                fb_putpixel((uint32_t)px, (uint32_t)py,
+                            fb_pack_color((uint8_t)rr, (uint8_t)gg, (uint8_t)bbb));
+            }
+        }
+    }
+}
+
 void fb_draw_hline(uint32_t x, uint32_t y, uint32_t w, uint32_t color) {
     if (!fb_info.available) return;
     if (y >= fb_info.height || x >= fb_info.width) return;
