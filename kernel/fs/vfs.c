@@ -459,6 +459,82 @@ int vfs_remove(const char *path) {
     return 0;
 }
 
+int vfs_remove_recursive(const char *path) {
+    uint32_t parent_ino;
+    char leaf[VFS_MAX_NAME + 1];
+
+    int32_t ino = vfs_resolve(path, &parent_ino, leaf);
+    if (ino < 0) {
+        printf("[vfs] rm: not found\n");
+        return -1;
+    }
+
+    if ((uint32_t)ino == 0) {
+        printf("[vfs] rm: cannot remove root\n");
+        return -1;
+    }
+
+    if (strcmp(leaf, ".") == 0 || strcmp(leaf, "..") == 0) {
+        printf("[vfs] rm: cannot remove '.' or '..'\n");
+        return -1;
+    }
+
+    if ((uint32_t)ino == effective_cwd()) {
+        printf("[vfs] rm: cannot remove current directory\n");
+        return -1;
+    }
+
+    vfs_inode_t *node = &inode_table[ino];
+
+    if (node->type == VFS_TYPE_DIR) {
+        /* Recursively remove all children (skip . and ..) */
+        vfs_dirent_t *entries = (vfs_dirent_t *)node->data;
+        /* Walk backwards since removal shuffles entries */
+        while (node->size > 2) {
+            /* Find a non-dot entry */
+            int found = -1;
+            for (int i = (int)node->size - 1; i >= 0; i--) {
+                if (strcmp(entries[i].name, ".") != 0 &&
+                    strcmp(entries[i].name, "..") != 0) {
+                    found = i;
+                    break;
+                }
+            }
+            if (found < 0) break;
+
+            /* Build child path */
+            char child_path[VFS_PATH_MAX];
+            int plen = strlen(path);
+            if (plen + 1 + strlen(entries[found].name) >= VFS_PATH_MAX) {
+                printf("[vfs] rm -r: path too long\n");
+                return -1;
+            }
+            memcpy(child_path, path, plen);
+            if (plen > 1) child_path[plen++] = '/';
+            strcpy(child_path + plen, entries[found].name);
+
+            /* Recurse */
+            if (vfs_remove_recursive(child_path) != 0)
+                return -1;
+
+            /* Re-fetch entries pointer (may have changed) */
+            entries = (vfs_dirent_t *)node->data;
+        }
+    }
+
+    /* Now remove the (now-empty) node itself */
+    if (node->type == VFS_TYPE_DIR) {
+        inode_table[parent_ino].link_count--;
+    }
+
+    dir_remove_entry(parent_ino, leaf);
+
+    if (node->link_count == 0)
+        inode_free((uint32_t)ino);
+
+    return 0;
+}
+
 int32_t vfs_read(uint32_t ino, void *buf, uint32_t offset, uint32_t count) {
     if (ino >= num_inodes) return -1;
     vfs_inode_t *node = &inode_table[ino];

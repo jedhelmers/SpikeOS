@@ -1,5 +1,7 @@
 #include <kernel/tetris.h>
-#include <kernel/vga13.h>
+#include <kernel/framebuffer.h>
+#include <kernel/window.h>
+#include <kernel/fb_console.h>
 #include <kernel/keyboard.h>
 #include <kernel/timer.h>
 #include <stdint.h>
@@ -11,18 +13,24 @@
 
 #define BOARD_COLS   10
 #define BOARD_ROWS   20
-#define CELL          8   /* pixels per cell */
+#define CELL         16   /* pixels per cell (2x original for framebuffer) */
 
-/* Board top-left corner on the 320x200 screen */
-#define BX  110
-#define BY   20
+/* Board top-left corner relative to window content area */
+#define BX    0
+#define BY    8
 
-/* Info panel origin */
-#define IX  210
-#define IY   20
+/* Info panel origin relative to window content area */
+#define IX  170
+#define IY    8
+
+/* Window outer dimensions — chosen so content area works out exactly:
+   content_w = (322-2) = 320, snapped to 8 → 320
+   content_h = (358-22) = 336, snapped to 16 → 336 */
+#define TETRIS_WIN_W  322
+#define TETRIS_WIN_H  358
 
 /* =========================================================================
- * Palette  (DAC values: R/G/B each 0-63)
+ * Palette  (DAC values: R/G/B each 0-63, scaled to 0-255 for framebuffer)
  * ========================================================================= */
 
 #define COL_BG      0
@@ -51,13 +59,23 @@ static const uint8_t PAL[11][3] = {
     {  7,  7,  7 }, /* 10 grid (dim)  */
 };
 
-static void setup_palette(void) {
+/* Pre-packed 32-bit framebuffer colors (filled at game start) */
+static uint32_t colors[11];
+
+static window_t *tetris_win = NULL;
+
+static void setup_colors(void) {
     for (int i = 0; i < 11; i++)
-        vga13_set_palette((uint8_t)i, PAL[i][0], PAL[i][1], PAL[i][2]);
+        colors[i] = fb_pack_color(PAL[i][0] * 4, PAL[i][1] * 4, PAL[i][2] * 4);
 }
+
+/* Helper: absolute screen X/Y from content-relative offset */
+static inline uint32_t cx(int x) { return tetris_win->content_x + (uint32_t)x; }
+static inline uint32_t cy(int y) { return tetris_win->content_y + (uint32_t)y; }
 
 /* =========================================================================
  * 5x7 pixel font for digits 0-9  (each row = 5 bits, MSB left)
+ * Scaled 2× for readability on the framebuffer.
  * ========================================================================= */
 
 static const uint8_t FONT5X7[10][7] = {
@@ -73,20 +91,20 @@ static const uint8_t FONT5X7[10][7] = {
     { 0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C }, /* 9 */
 };
 
-/* Draw digit d at pixel position (px, py) in the given colour */
-static void draw_digit(int px, int py, int d, uint8_t col) {
+/* Draw digit d at pixel position (px, py) relative to content area, scaled 2× */
+static void draw_digit(int px, int py, int d, uint32_t col) {
     if (d < 0 || d > 9) return;
     const uint8_t *glyph = FONT5X7[d];
     for (int row = 0; row < 7; row++) {
         for (int bit = 4; bit >= 0; bit--) {
-            uint8_t c = (glyph[row] >> bit) & 1 ? col : COL_BG;
-            vga13_putpixel(px + (4 - bit), py + row, c);
+            uint32_t c = (glyph[row] >> bit) & 1 ? col : colors[COL_BG];
+            fb_fill_rect(cx(px + (4 - bit) * 2), cy(py + row * 2), 2, 2, c);
         }
     }
 }
 
-/* Draw a decimal number (up to 7 digits) at (px, py) */
-static void draw_number(int px, int py, uint32_t n, uint8_t col) {
+/* Draw a decimal number (up to 7 digits) at (px, py) relative to content */
+static void draw_number(int px, int py, uint32_t n, uint32_t col) {
     char buf[8];
     int len = 0;
     if (n == 0) { buf[len++] = 0; }
@@ -99,7 +117,7 @@ static void draw_number(int px, int py, uint32_t n, uint8_t col) {
         }
     }
     for (int i = 0; i < len; i++)
-        draw_digit(px + i * 7, py, (int)(uint8_t)buf[i], col);
+        draw_digit(px + i * 12, py, (int)(uint8_t)buf[i], col);
 }
 
 /* =========================================================================
@@ -178,7 +196,8 @@ static int fits(const tetris_t *g, int px, int py, int rot) {
  * ========================================================================= */
 
 static void draw_cell(int col, int row, uint8_t color) {
-    vga13_fill_rect(BX + col * CELL, BY + row * CELL, CELL - 1, CELL - 1, color);
+    fb_fill_rect(cx(BX + col * CELL), cy(BY + row * CELL),
+                 CELL - 1, CELL - 1, colors[color]);
 }
 
 static void draw_board(const tetris_t *g) {
@@ -201,62 +220,64 @@ static void draw_piece(const tetris_t *g, uint8_t col_override, int use_override
 
 static void draw_border(void) {
     /* left wall */
-    vga13_fill_rect(BX - 2, BY, 2, BOARD_ROWS * CELL, COL_BORDER);
+    fb_fill_rect(cx(BX - 2), cy(BY), 2, BOARD_ROWS * CELL, colors[COL_BORDER]);
     /* right wall */
-    vga13_fill_rect(BX + BOARD_COLS * CELL, BY, 2, BOARD_ROWS * CELL, COL_BORDER);
+    fb_fill_rect(cx(BX + BOARD_COLS * CELL), cy(BY), 2, BOARD_ROWS * CELL, colors[COL_BORDER]);
     /* bottom */
-    vga13_fill_rect(BX - 2, BY + BOARD_ROWS * CELL, BOARD_COLS * CELL + 4, 2, COL_BORDER);
+    fb_fill_rect(cx(BX - 2), cy(BY + BOARD_ROWS * CELL),
+                 BOARD_COLS * CELL + 4, 2, colors[COL_BORDER]);
 }
 
 /* Paint the board area with the grid colour once.
    draw_cell() fills CELL-1 × CELL-1 leaving the 1 px borders in COL_GRID. */
 static void draw_board_bg(void) {
-    vga13_fill_rect(BX, BY, BOARD_COLS * CELL, BOARD_ROWS * CELL, COL_GRID);
+    fb_fill_rect(cx(BX), cy(BY),
+                 BOARD_COLS * CELL, BOARD_ROWS * CELL, colors[COL_GRID]);
 }
 
 /* Draw the info panel labels + values */
 static void draw_info(const tetris_t *g) {
-    /* SCORE label */
-    draw_digit(IX,      IY,      5, COL_WHITE);
-    draw_digit(IX + 7,  IY,      2, COL_WHITE);
-    draw_digit(IX + 14, IY,      0, COL_WHITE);
-    draw_digit(IX + 21, IY,      8, COL_WHITE);
-    draw_digit(IX + 28, IY,      3, COL_WHITE);
+    /* SCORE label (digits used as character codes: S=5, C=2, O=0, R=8, E=3) */
+    draw_digit(IX,      IY,      5, colors[COL_WHITE]);
+    draw_digit(IX + 12, IY,      2, colors[COL_WHITE]);
+    draw_digit(IX + 24, IY,      0, colors[COL_WHITE]);
+    draw_digit(IX + 36, IY,      8, colors[COL_WHITE]);
+    draw_digit(IX + 48, IY,      3, colors[COL_WHITE]);
     /* score value */
-    draw_number(IX, IY + 10, g->score, COL_CYAN);
+    draw_number(IX, IY + 18, g->score, colors[COL_CYAN]);
 
-    /* LEVEL label */
-    draw_digit(IX,      IY + 30, 7, COL_WHITE);
-    draw_digit(IX + 7,  IY + 30, 3, COL_WHITE);
-    draw_digit(IX + 14, IY + 30, 5, COL_WHITE);
-    draw_digit(IX + 21, IY + 30, 3, COL_WHITE);
-    draw_digit(IX + 28, IY + 30, 7, COL_WHITE);
+    /* LEVEL label (L=7, E=3, V=5, E=3, L=7) */
+    draw_digit(IX,      IY + 50, 7, colors[COL_WHITE]);
+    draw_digit(IX + 12, IY + 50, 3, colors[COL_WHITE]);
+    draw_digit(IX + 24, IY + 50, 5, colors[COL_WHITE]);
+    draw_digit(IX + 36, IY + 50, 3, colors[COL_WHITE]);
+    draw_digit(IX + 48, IY + 50, 7, colors[COL_WHITE]);
     /* level value */
-    draw_number(IX, IY + 40, (uint32_t)g->level, COL_GREEN);
+    draw_number(IX, IY + 68, (uint32_t)g->level, colors[COL_GREEN]);
 
-    /* LINES label */
-    draw_digit(IX,      IY + 60, 7, COL_WHITE);
-    draw_digit(IX + 7,  IY + 60, 1, COL_WHITE);
-    draw_digit(IX + 14, IY + 60, 1, COL_WHITE);
-    draw_digit(IX + 21, IY + 60, 2, COL_WHITE);
-    draw_digit(IX + 28, IY + 60, 5, COL_WHITE);
+    /* LINES label (L=7, I=1, N=1, E=2, S=5) */
+    draw_digit(IX,      IY + 100, 7, colors[COL_WHITE]);
+    draw_digit(IX + 12, IY + 100, 1, colors[COL_WHITE]);
+    draw_digit(IX + 24, IY + 100, 1, colors[COL_WHITE]);
+    draw_digit(IX + 36, IY + 100, 2, colors[COL_WHITE]);
+    draw_digit(IX + 48, IY + 100, 5, colors[COL_WHITE]);
     /* lines value */
-    draw_number(IX, IY + 70, (uint32_t)g->lines, COL_YELLOW);
+    draw_number(IX, IY + 118, (uint32_t)g->lines, colors[COL_YELLOW]);
 
-    /* NEXT label */
-    draw_digit(IX,      IY + 100, 5, COL_WHITE);
-    draw_digit(IX + 7,  IY + 100, 3, COL_WHITE);
-    draw_digit(IX + 14, IY + 100, 1, COL_WHITE);
-    draw_digit(IX + 21, IY + 100, 4, COL_WHITE);
+    /* NEXT label (N=5, E=3, X=1, T=4) */
+    draw_digit(IX,      IY + 160, 5, colors[COL_WHITE]);
+    draw_digit(IX + 12, IY + 160, 3, colors[COL_WHITE]);
+    draw_digit(IX + 24, IY + 160, 1, colors[COL_WHITE]);
+    draw_digit(IX + 36, IY + 160, 4, colors[COL_WHITE]);
 
-    /* next piece preview (4x4 box) */
-    vga13_fill_rect(IX, IY + 110, 4 * CELL, 4 * CELL, COL_BG);
+    /* next piece preview (4×4 box) */
+    fb_fill_rect(cx(IX), cy(IY + 178), 4 * CELL, 4 * CELL, colors[COL_BG]);
     uint8_t nc = piece_color(g->next);
     for (int r = 0; r < 4; r++)
         for (int c = 0; c < 4; c++)
             if (piece_cell(g->next, 0, r, c))
-                vga13_fill_rect(IX + c * CELL, IY + 110 + r * CELL,
-                                CELL - 1, CELL - 1, nc);
+                fb_fill_rect(cx(IX + c * CELL), cy(IY + 178 + r * CELL),
+                             CELL - 1, CELL - 1, colors[nc]);
 }
 
 static void render(const tetris_t *g) {
@@ -291,7 +312,6 @@ static void tetris_init(tetris_t *g) {
 
 static int try_move(tetris_t *g, int dx, int dy) {
     if (fits(g, g->px + dx, g->py + dy, g->rot)) {
-        /* erase old position from board render, update coords */
         g->px += dx;
         g->py += dy;
         return 1;
@@ -365,15 +385,15 @@ static void draw_game_over(const tetris_t *g) {
                 draw_cell(c, r, COL_BORDER);
 
     /* "GAME" in large digits (re-use digit bitmaps as placeholder) */
-    draw_digit(BX + 10, BY + 70,  6, COL_RED);
-    draw_digit(BX + 20, BY + 70,  0, COL_RED);
-    draw_digit(BX + 30, BY + 70,  7, COL_RED);
-    draw_digit(BX + 40, BY + 70,  3, COL_RED);
+    draw_digit(BX + 20, BY + 130,  6, colors[COL_RED]);
+    draw_digit(BX + 40, BY + 130,  0, colors[COL_RED]);
+    draw_digit(BX + 60, BY + 130,  7, colors[COL_RED]);
+    draw_digit(BX + 80, BY + 130,  3, colors[COL_RED]);
 
-    draw_digit(BX + 10, BY + 80,  0, COL_WHITE);
-    draw_digit(BX + 20, BY + 80,  5, COL_WHITE);
-    draw_digit(BX + 30, BY + 80,  3, COL_WHITE);
-    draw_digit(BX + 40, BY + 80,  8, COL_WHITE);
+    draw_digit(BX + 20, BY + 150,  0, colors[COL_WHITE]);
+    draw_digit(BX + 40, BY + 150,  5, colors[COL_WHITE]);
+    draw_digit(BX + 60, BY + 150,  3, colors[COL_WHITE]);
+    draw_digit(BX + 80, BY + 150,  8, colors[COL_WHITE]);
 }
 
 /* =========================================================================
@@ -381,9 +401,23 @@ static void draw_game_over(const tetris_t *g) {
  * ========================================================================= */
 
 void tetris_run(void) {
-    vga13_enter();
-    setup_palette();
-    vga13_clear(COL_BG);
+    /* Create Tetris window centered on screen */
+    int32_t win_x = ((int32_t)fb_info.width  - TETRIS_WIN_W) / 2;
+    int32_t win_y = ((int32_t)fb_info.height - TETRIS_WIN_H) / 2 - 40;
+    if (win_y < 0) win_y = 0;
+
+    tetris_win = wm_create_window(win_x, win_y, TETRIS_WIN_W, TETRIS_WIN_H, "Tetris");
+    if (!tetris_win) return;
+
+    tetris_win->flags &= ~WIN_FLAG_RESIZABLE;  /* fixed-size game window */
+
+    setup_colors();
+    wm_draw_chrome(tetris_win);
+
+    /* Clear content area */
+    fb_fill_rect(tetris_win->content_x, tetris_win->content_y,
+                 tetris_win->content_w, tetris_win->content_h, colors[COL_BG]);
+
     draw_border();
     draw_board_bg();
 
@@ -402,6 +436,9 @@ void tetris_run(void) {
     static const uint32_t score_table[5] = { 0, 100, 300, 500, 800 };
 
     while (g.alive) {
+        /* --- Process window manager events (mouse drag, etc.) --- */
+        wm_process_events();
+
         /* --- Input (non-blocking) --- */
         key_event_t k = keyboard_get_event();
         if (k.type == KEY_CHAR) {
@@ -456,5 +493,14 @@ void tetris_run(void) {
             asm volatile ("hlt");
     }
 
-    vga13_exit();
+    /* Clean up: destroy window, return focus to shell */
+    wm_destroy_window(tetris_win);
+    tetris_win = NULL;
+
+    window_t *sw = wm_get_shell_window();
+    if (sw) {
+        wm_focus_window(sw);
+        wm_draw_chrome(sw);
+        fb_console_repaint();
+    }
 }

@@ -40,6 +40,7 @@ int32_t vfs_resolve(const char *path, uint32_t *parent_out, char *leaf_out);
 int32_t vfs_create_file(const char *path);
 int32_t vfs_mkdir(const char *path);
 int     vfs_remove(const char *path);
+int     vfs_remove_recursive(const char *path);
 int32_t vfs_read(uint32_t ino, void *buf, uint32_t offset, uint32_t count);
 int32_t vfs_write(uint32_t ino, const void *buf, uint32_t offset, uint32_t count);
 int     vfs_rename(const char *old_path, const char *new_path);
