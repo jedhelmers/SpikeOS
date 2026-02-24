@@ -34,6 +34,10 @@ typedef struct window {
 
     /* Drag tracking */
     int32_t  drag_off_x, drag_off_y;
+
+    /* Window list — bottom to top z-order (next = above, prev = below) */
+    struct window *next;
+    struct window *prev;
 } window_t;
 
 /* Initialize window manager (call after fb_enable) */
@@ -62,8 +66,15 @@ int wm_process_events(void);
 /* Refresh desktop (redraw background + icons + window on top) */
 void wm_refresh_desktop(void);
 
+/* Bring a window to the front of the z-order and set focus */
+void wm_focus_window(window_t *win);
+
+/* Find the topmost window at screen coordinates (mx, my), or NULL */
+window_t *wm_window_at(int32_t mx, int32_t my);
+
 /* Accessors */
 window_t *wm_get_shell_window(void);
+window_t *wm_get_top_window(void);
 uint32_t  wm_get_desktop_color(void);
 
 #endif

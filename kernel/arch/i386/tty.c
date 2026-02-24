@@ -340,6 +340,11 @@ static void terminal_redraw_scrollback(void) {
 }
 
 void terminal_page_up(void) {
+    if (use_fb) {
+        fb_console_page_up();
+        return;
+    }
+
     if (sb_count == 0) return;
 
     /* Save current screen on first scroll-back */
@@ -356,6 +361,11 @@ void terminal_page_up(void) {
 }
 
 void terminal_page_down(void) {
+    if (use_fb) {
+        fb_console_page_down();
+        return;
+    }
+
     if (sb_offset == 0) return;
 
     sb_offset -= (int)VGA_HEIGHT;

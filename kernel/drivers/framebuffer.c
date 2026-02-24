@@ -53,8 +53,12 @@ void fb_init(void) {
     uint32_t mapped = 0;
 
     while (mapped < fb_size) {
-        map_page(virt, phys,
-                 PAGE_PRESENT | PAGE_WRITABLE | PAGE_CACHE_DISABLE);
+        if (map_page(virt, phys,
+                     PAGE_PRESENT | PAGE_WRITABLE | PAGE_CACHE_DISABLE) != 0) {
+            printf("[fb] map_page failed at virt=0x%x\n", virt);
+            fb_info.available = 0;
+            return;
+        }
         virt += PAGE_SIZE;
         phys += PAGE_SIZE;
         mapped += PAGE_SIZE;

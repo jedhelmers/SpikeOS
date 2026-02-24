@@ -13,6 +13,8 @@
 #include <string.h>
 #include <stdio.h>
 
+#define USER_STACK_VADDR 0xBFFFF000u
+
 /* ------------------------------------------------------------------ */
 /*  User pointer validation                                           */
 /* ------------------------------------------------------------------ */
@@ -166,14 +168,50 @@ static int32_t sys_sleep(trapframe *tf) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  SYS_BRK (9) — adjust process break (stub for now)                */
+/*  SYS_BRK (9) — adjust process break                               */
 /*  EBX = new break address (0 = query current break)                 */
+/*  Returns current/new break on success, old break on failure.       */
 /* ------------------------------------------------------------------ */
 
 static int32_t sys_brk(trapframe *tf) {
-    (void)tf;
-    /* Stub: user-mode heap not implemented yet */
-    return -1;
+    uint32_t new_brk = tf->ebx;
+    uint32_t cur_brk = current_process->brk;
+
+    /* Kernel threads have no user address space */
+    if (current_process->cr3 == 0) return -1;
+
+    /* Query: return current break */
+    if (new_brk == 0) return (int32_t)cur_brk;
+
+    /* Reject: can't shrink below initial program image */
+    if (new_brk < cur_brk) return (int32_t)cur_brk;
+
+    /* Reject: can't grow into kernel space or stack region */
+    if (new_brk >= USER_STACK_VADDR) return (int32_t)cur_brk;
+
+    /* Page-align the new break upward */
+    uint32_t new_brk_page = (new_brk + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    uint32_t cur_brk_page = (cur_brk + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+
+    /* Map any new pages needed between old and new break */
+    for (uint32_t pv = cur_brk_page; pv < new_brk_page; pv += PAGE_SIZE) {
+        uint32_t frame = alloc_frame();
+        if (frame == FRAME_ALLOC_FAIL) return (int32_t)cur_brk;
+
+        if (pgdir_map_user_page(current_process->cr3, pv, frame,
+                                PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER) != 0) {
+            free_frame(frame);
+            return (int32_t)cur_brk;
+        }
+
+        /* Zero the new page */
+        uint8_t *p = (uint8_t *)temp_map(frame);
+        memset(p, 0, PAGE_SIZE);
+        temp_unmap();
+    }
+
+    current_process->brk = new_brk;
+    return (int32_t)new_brk;
 }
 
 /* ------------------------------------------------------------------ */

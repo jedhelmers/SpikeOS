@@ -60,21 +60,15 @@ void paging_init() {
     page_directory[KERNEL_PDE_INDEX] = fpt_phys | PAGE_PRESENT | PAGE_WRITABLE;
 
     // Pre-allocate PDE[769] for the kernel heap region (0xC0400000–0xC07FFFFF).
-    // Using the statically-allocated second_page_table avoids the map_page()
-    // new-table-allocation path, which has issues with physical vs virtual addresses.
+    // Using a statically-allocated page table avoids alloc_frame() before heap is ready.
     memset(second_page_table, 0, sizeof(second_page_table));
     uint32_t spt_phys = (uint32_t)second_page_table - KERNEL_VMA_OFFSET;
     page_directory[769] = spt_phys | PAGE_PRESENT | PAGE_WRITABLE;
 
     // Pre-allocate PDE[770] for the framebuffer region (0xC0800000–0xC0BFFFFF).
-    // Same reason: map_page() can't handle dynamically-allocated page tables
-    // whose physical address is above 4MB (not identity-mapped).
     memset(third_page_table, 0, sizeof(third_page_table));
     uint32_t tpt_phys = (uint32_t)third_page_table - KERNEL_VMA_OFFSET;
     page_directory[770] = tpt_phys | PAGE_PRESENT | PAGE_WRITABLE;
-
-    // Optional: map page dir itself recursively (helps later for dynamic mapping)
-    // page_directory[1023] = (uint32_t)page_directory | PAGE_PRESENT | PAGE_WRITABLE;
 }
 uint32_t virt_to_phys(uint32_t virt) {
     uint32_t pd_index = virt >> 22;
@@ -88,9 +82,11 @@ uint32_t virt_to_phys(uint32_t virt) {
         return 0;
     }
 
-    uint32_t* pt = (uint32_t*)(pde & 0xFFFFF000);
-
+    /* Use temp_map to access the page table by its physical address. */
+    uint32_t pt_phys = pde & 0xFFFFF000;
+    uint32_t *pt = (uint32_t *)temp_map(pt_phys);
     uint32_t pte = pt[pt_index];
+    temp_unmap();
 
     if (!(pte & PAGE_PRESENT)) {
         printf("PTE not present!\n");
@@ -123,7 +119,7 @@ uint32_t alloc_frame() {
         }
     }
 
-    return 0;
+    return FRAME_ALLOC_FAIL;
 }
 
 void free_frame(uint32_t phys) {
@@ -163,7 +159,7 @@ void temp_unmap(void) {
  */
 uint32_t pgdir_create(void) {
     uint32_t pd_phys = alloc_frame();
-    if (pd_phys == 0) return 0;
+    if (pd_phys == FRAME_ALLOC_FAIL) return 0;
 
     uint32_t *pd = (uint32_t *)temp_map(pd_phys);
     memcpy(pd, page_directory, PAGE_SIZE);
@@ -255,7 +251,7 @@ int pgdir_map_user_page(uint32_t pd_phys, uint32_t virt, uint32_t phys,
     if (!(pde & PAGE_PRESENT)) {
         /* Allocate a new page table */
         uint32_t pt_phys = alloc_frame();
-        if (pt_phys == 0) { temp_unmap(); return -1; }
+        if (pt_phys == FRAME_ALLOC_FAIL) { temp_unmap(); return -1; }
 
         pd[pd_index] = pt_phys | PAGE_PRESENT | PAGE_WRITABLE | (flags & PAGE_USER);
         temp_unmap();
@@ -274,7 +270,7 @@ int pgdir_map_user_page(uint32_t pd_phys, uint32_t virt, uint32_t phys,
     if ((flags & PAGE_USER) &&
         (pt_phys == fpt_phys || pt_phys == spt_phys || pt_phys == tpt_phys)) {
         uint32_t new_pt_phys = alloc_frame();
-        if (new_pt_phys == 0) { temp_unmap(); return -1; }
+        if (new_pt_phys == FRAME_ALLOC_FAIL) { temp_unmap(); return -1; }
 
         /* Update the PDE to point to the clone */
         pd[pd_index] = new_pt_phys | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
@@ -301,21 +297,30 @@ int pgdir_map_user_page(uint32_t pd_phys, uint32_t virt, uint32_t phys,
     return 0;
 }
 
-void map_page(uint32_t virt, uint32_t phys, uint32_t flags) {
+int map_page(uint32_t virt, uint32_t phys, uint32_t flags) {
     uint32_t pd_index = virt >> 22;
     uint32_t pt_index = (virt >> 12) & 0x3FF;
 
     if (!(page_directory[pd_index] & PAGE_PRESENT)) {
         uint32_t new_table = alloc_frame();
+        if (new_table == FRAME_ALLOC_FAIL) return -1;
         page_directory[pd_index] = new_table | PAGE_PRESENT | PAGE_WRITABLE;
 
-        memset((void*)new_table, 0, PAGE_SIZE);
+        /* Use temp_map to zero the new page table — the physical address
+           may be above 4MB and not identity-mapped. */
+        uint32_t *pt = (uint32_t *)temp_map(new_table);
+        memset(pt, 0, PAGE_SIZE);
+        temp_unmap();
     }
 
-    uint32_t* table = (uint32_t*)(page_directory[pd_index] & 0xFFFFF000);
+    /* Use temp_map to access the page table by its physical address. */
+    uint32_t pt_phys = page_directory[pd_index] & 0xFFFFF000;
+    uint32_t *table = (uint32_t *)temp_map(pt_phys);
     table[pt_index] = phys | flags;
+    temp_unmap();
 
     hal_tlb_invalidate(virt);
+    return 0;
 }
 
 /*

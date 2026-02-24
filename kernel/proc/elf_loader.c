@@ -103,6 +103,8 @@ struct process *elf_load_and_exec(uint32_t file_phys, uint32_t file_size) {
     }
 
     /* ---- 4. Map each PT_LOAD segment ---- */
+    uint32_t max_load_end = 0;  /* track highest PT_LOAD end for brk */
+
     for (uint16_t i = 0; i < ehdr.e_phnum; i++) {
         Elf32_Phdr *ph = &phdrs[i];
 
@@ -119,11 +121,13 @@ struct process *elf_load_and_exec(uint32_t file_phys, uint32_t file_size) {
         uint32_t end_addr   = ph->p_vaddr + ph->p_memsz;
         uint32_t end_page   = (end_addr + PAGE_SIZE - 1) & ~0xFFFu;
 
+        if (end_page > max_load_end) max_load_end = end_page;
+
         for (uint32_t page_vaddr = start_page; page_vaddr < end_page;
              page_vaddr += PAGE_SIZE) {
             /* Allocate a physical frame for this page */
             uint32_t frame = alloc_frame();
-            if (frame == 0) {
+            if (frame == FRAME_ALLOC_FAIL) {
                 printf("[elf] alloc_frame failed\n");
                 goto fail;
             }
@@ -172,7 +176,7 @@ struct process *elf_load_and_exec(uint32_t file_phys, uint32_t file_size) {
     /* ---- 5. Allocate and map user stack ---- */
     {
         uint32_t stack_frame = alloc_frame();
-        if (stack_frame == 0) {
+        if (stack_frame == FRAME_ALLOC_FAIL) {
             printf("[elf] alloc_frame failed for stack\n");
             goto fail;
         }
@@ -201,6 +205,7 @@ struct process *elf_load_and_exec(uint32_t file_phys, uint32_t file_size) {
         return NULL;
     }
 
+    p->brk = max_load_end;
     return p;
 
 fail:
@@ -258,6 +263,8 @@ struct process *elf_load_from_vfs(const char *path) {
     if (pd_phys == 0) return NULL;
 
     /* ---- 4. Map each PT_LOAD segment ---- */
+    uint32_t max_load_end = 0;  /* track highest PT_LOAD end for brk */
+
     for (uint16_t i = 0; i < ph_num; i++) {
         Elf32_Phdr *ph = &phdrs[i];
         if (ph->p_type != PT_LOAD || ph->p_memsz == 0) continue;
@@ -268,9 +275,11 @@ struct process *elf_load_from_vfs(const char *path) {
         uint32_t end_addr   = ph->p_vaddr + ph->p_memsz;
         uint32_t end_page   = (end_addr + PAGE_SIZE - 1) & ~0xFFFu;
 
+        if (end_page > max_load_end) max_load_end = end_page;
+
         for (uint32_t pv = start_page; pv < end_page; pv += PAGE_SIZE) {
             uint32_t frame = alloc_frame();
-            if (frame == 0) goto fail;
+            if (frame == FRAME_ALLOC_FAIL) goto fail;
 
             if (pgdir_map_user_page(pd_phys, pv, frame,
                                     PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER) != 0) {
@@ -305,7 +314,7 @@ struct process *elf_load_from_vfs(const char *path) {
     /* ---- 5. Allocate and map user stack ---- */
     {
         uint32_t stack_frame = alloc_frame();
-        if (stack_frame == 0) goto fail;
+        if (stack_frame == FRAME_ALLOC_FAIL) goto fail;
 
         if (pgdir_map_user_page(pd_phys, USER_STACK_VADDR, stack_frame,
                                 PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER) != 0) {
@@ -326,6 +335,7 @@ struct process *elf_load_from_vfs(const char *path) {
             pgdir_destroy(pd_phys);
             return NULL;
         }
+        p->brk = max_load_end;
         return p;
     }
 

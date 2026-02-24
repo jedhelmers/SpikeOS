@@ -29,6 +29,10 @@ static uint32_t bg_color;     /* packed background pixel color */
 /* Bound window — position/size read from here */
 static window_t *bound_window = NULL;
 
+/* Forward declarations for cursor helpers */
+static void draw_cursor(void);
+static void erase_cursor(void);
+
 /* Character buffer for content redraw after window moves */
 typedef struct {
     uint8_t ch;
@@ -40,6 +44,22 @@ typedef struct {
 #define MAX_ROWS  48   /* 768/16 */
 
 static fb_cell_t char_buf[MAX_ROWS][MAX_COLS];
+
+/* ------------------------------------------------------------------ */
+/*  Scrollback ring buffer                                             */
+/* ------------------------------------------------------------------ */
+
+#define SB_LINES 200
+
+static fb_cell_t sb_ring[SB_LINES][MAX_COLS];
+static uint32_t sb_head  = 0;   /* next write slot in ring */
+static uint32_t sb_count = 0;   /* lines stored (capped at SB_LINES) */
+static int      sb_offset = 0;  /* view offset: 0 = live, >0 = scrolled back */
+
+/* Saved screen snapshot when entering scrollback mode */
+static fb_cell_t saved_screen[MAX_ROWS][MAX_COLS];
+static uint32_t saved_cx, saved_cy;
+static int sb_saved = 0;
 
 /* VGA 16-color palette → RGB (standard CGA/VGA colors) */
 static const uint8_t vga_palette[16][3] = {
@@ -105,14 +125,35 @@ void fb_render_char_px(uint32_t px, uint32_t py, uint8_t ch,
     }
 }
 
+/* Restore saved screen and exit scrollback mode */
+static void fb_snap_to_bottom(void) {
+    if (sb_offset > 0 && sb_saved) {
+        memcpy(char_buf, saved_screen, sizeof(char_buf));
+        cx = saved_cx;
+        cy = saved_cy;
+        sb_offset = 0;
+        sb_saved = 0;
+        fb_console_repaint();
+        draw_cursor();
+    }
+}
+
 /* Scroll the window up by one character row (FONT_H pixels) */
 static void fb_scroll(void) {
     if (!fb_active || !bound_window) return;
+
+    /* If scrolled back, snap to live view first */
+    fb_snap_to_bottom();
 
     uint32_t win_px = bound_window->content_x;
     uint32_t win_py = bound_window->content_y;
     uint32_t win_pw = bound_window->content_w;
     uint32_t win_ph = bound_window->content_h;
+
+    /* Save the top row into scrollback ring before it's lost */
+    memcpy(sb_ring[sb_head], char_buf[0], MAX_COLS * sizeof(fb_cell_t));
+    sb_head = (sb_head + 1) % SB_LINES;
+    if (sb_count < SB_LINES) sb_count++;
 
     /* Scroll character buffer */
     memmove(&char_buf[0], &char_buf[1],
@@ -181,6 +222,9 @@ void fb_console_putchar(char c) {
 void fb_console_write(const char *data, size_t size) {
     if (!fb_active || !bound_window) return;
 
+    fb_snap_to_bottom();
+    erase_cursor();
+
     for (size_t i = 0; i < size; i++) {
         switch (data[i]) {
         case '\n':
@@ -216,6 +260,8 @@ void fb_console_write(const char *data, size_t size) {
             break;
         }
     }
+
+    draw_cursor();
 }
 
 void fb_console_repaint(void) {
@@ -255,6 +301,12 @@ void fb_console_clear(void) {
     cx = 0;
     cy = 0;
     memset(char_buf, 0, sizeof(char_buf));
+
+    /* Reset scrollback */
+    sb_head = 0;
+    sb_count = 0;
+    sb_offset = 0;
+    sb_saved = 0;
 }
 
 void fb_console_setcolor(uint8_t fg, uint8_t bg) {
@@ -263,9 +315,134 @@ void fb_console_setcolor(uint8_t fg, uint8_t bg) {
     update_colors();
 }
 
+/* ------------------------------------------------------------------ */
+/*  Visible cursor                                                     */
+/* ------------------------------------------------------------------ */
+
+static int cursor_visible = 0;
+
+/* Draw an underline cursor at the current (cx, cy) position */
+static void draw_cursor(void) {
+    if (!fb_active || !bound_window) return;
+    uint32_t px = bound_window->content_x + cx * FONT_W;
+    uint32_t py = bound_window->content_y + cy * FONT_H + (FONT_H - 2);
+    fb_fill_rect(px, py, FONT_W, 2, fg_color);
+    cursor_visible = 1;
+}
+
+/* Erase the cursor by restoring the character at (cx, cy) */
+static void erase_cursor(void) {
+    if (!cursor_visible || !fb_active || !bound_window) return;
+    fb_cell_t cell = char_buf[cy][cx];
+    uint32_t cell_fg = (cell.ch != 0) ? fb_vga_color(cell.fg) : fg_color;
+    uint32_t cell_bg = (cell.ch != 0) ? fb_vga_color(cell.bg) : bg_color;
+    uint8_t ch = (cell.ch != 0) ? cell.ch : ' ';
+    fb_render_char_px(bound_window->content_x + cx * FONT_W,
+                      bound_window->content_y + cy * FONT_H,
+                      ch, cell_fg, cell_bg);
+    cursor_visible = 0;
+}
+
 void fb_console_setcursor(size_t x, size_t y) {
+    erase_cursor();
     cx = (uint32_t)x;
     cy = (uint32_t)y;
+    draw_cursor();
+}
+
+void fb_console_update_cursor(void) {
+    if (!fb_active) return;
+    draw_cursor();
+}
+
+/* ------------------------------------------------------------------ */
+/*  Scrollback navigation                                              */
+/* ------------------------------------------------------------------ */
+
+/* Redraw screen from scrollback + saved screen snapshot */
+static void fb_redraw_scrollback(void) {
+    if (!fb_active || !bound_window) return;
+
+    uint32_t win_px = bound_window->content_x;
+    uint32_t win_py = bound_window->content_y;
+    uint32_t win_pw = bound_window->content_w;
+    uint32_t win_ph = bound_window->content_h;
+
+    /* Clear content area */
+    fb_fill_rect(win_px, win_py, win_pw, win_ph, bg_color);
+
+    for (int y = 0; y < (int)rows; y++) {
+        /* Virtual line index: 0 = oldest scrollback line */
+        int vline = (int)sb_count - sb_offset + y;
+
+        fb_cell_t *src_row = NULL;
+
+        if (vline < 0) {
+            /* Past beginning of history — blank */
+            continue;
+        } else if (vline < (int)sb_count) {
+            /* From scrollback ring */
+            int idx = ((int)sb_head - (int)sb_count + vline
+                       + (int)SB_LINES) % (int)SB_LINES;
+            src_row = sb_ring[idx];
+        } else {
+            /* From saved screen */
+            int sy = vline - (int)sb_count;
+            if (sy < (int)rows)
+                src_row = saved_screen[sy];
+        }
+
+        if (!src_row) continue;
+
+        for (uint32_t c = 0; c < cols; c++) {
+            if (src_row[c].ch == 0) continue;
+            uint32_t cell_fg = fb_vga_color(src_row[c].fg);
+            uint32_t cell_bg = fb_vga_color(src_row[c].bg);
+            fb_render_char_px(win_px + c * FONT_W, win_py + (uint32_t)y * FONT_H,
+                              src_row[c].ch, cell_fg, cell_bg);
+        }
+    }
+}
+
+void fb_console_page_up(void) {
+    if (!fb_active || !bound_window) return;
+    if (sb_count == 0) return;
+
+    /* Save current screen on first scroll-back */
+    if (sb_offset == 0) {
+        memcpy(saved_screen, char_buf, sizeof(saved_screen));
+        saved_cx = cx;
+        saved_cy = cy;
+        sb_saved = 1;
+        erase_cursor();
+    }
+
+    sb_offset += (int)rows;
+    if (sb_offset > (int)sb_count) sb_offset = (int)sb_count;
+
+    fb_redraw_scrollback();
+}
+
+void fb_console_page_down(void) {
+    if (!fb_active || !bound_window) return;
+    if (sb_offset == 0) return;
+
+    sb_offset -= (int)rows;
+    if (sb_offset <= 0) {
+        /* Snap back to live view */
+        sb_offset = 0;
+        if (sb_saved) {
+            memcpy(char_buf, saved_screen, sizeof(char_buf));
+            cx = saved_cx;
+            cy = saved_cy;
+            sb_saved = 0;
+        }
+        fb_console_repaint();
+        draw_cursor();
+        return;
+    }
+
+    fb_redraw_scrollback();
 }
 
 int fb_console_active(void) {

@@ -80,6 +80,12 @@ void *temp_map(uint32_t phys_frame);
 void  temp_unmap(void);
 
 /*
+    Sentinel value for alloc_frame() failure (out of memory).
+    Distinct from physical address 0x0 (which is a valid reserved frame).
+*/
+#define FRAME_ALLOC_FAIL ((uint32_t)-1)
+
+/*
     Page Frame Allocation
 */
 void frame_init();
@@ -96,7 +102,7 @@ uint32_t alloc_frame();
 
 void free_frame(uint32_t phys);
 
-void map_page(uint32_t virt, uint32_t phys, uint32_t flags);
+int map_page(uint32_t virt, uint32_t phys, uint32_t flags);
 
 /*
     Per-process page directory management

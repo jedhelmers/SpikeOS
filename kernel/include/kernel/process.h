@@ -45,6 +45,7 @@ struct process {
 
     uint32_t cwd;               /* inode of current working directory */
     uint32_t pending_signals;   /* bitmask of pending signals */
+    uint32_t brk;               /* program break (end of user heap) */
 };
 
 extern struct process *current_process;

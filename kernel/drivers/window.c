@@ -13,8 +13,13 @@
 static uint32_t desktop_color;
 static window_t *shell_win = NULL;
 
+/* Window list — doubly linked, bottom to top z-order.
+   win_bottom = first painted (back), win_top = last painted (front). */
+static window_t *win_bottom = NULL;
+static window_t *win_top    = NULL;
+
 /* Desktop icon constants */
-#define DESKTOP_PATH "/Users/jedhelmers/Desktop"
+#define DESKTOP_PATH "/Desktop"
 #define ICON_W       30
 #define ICON_H       50
 #define ICON_PAD_X   10
@@ -46,10 +51,6 @@ void wm_update_content_rect(window_t *win) {
 /* ------------------------------------------------------------------ */
 
 static void desktop_ensure_path(void) {
-    if (vfs_resolve("/Users", NULL, NULL) < 0)
-        vfs_mkdir("/Users");
-    if (vfs_resolve("/Users/jedhelmers", NULL, NULL) < 0)
-        vfs_mkdir("/Users/jedhelmers");
     if (vfs_resolve(DESKTOP_PATH, NULL, NULL) < 0)
         vfs_mkdir(DESKTOP_PATH);
 
@@ -199,8 +200,19 @@ window_t *wm_create_window(int32_t x, int32_t y, uint32_t w, uint32_t h,
     win->border_color   = fb_pack_color(100, 102, 110);
 
     win->flags = WIN_FLAG_VISIBLE | WIN_FLAG_FOCUSED | WIN_FLAG_DRAGGABLE;
+    win->next = NULL;
+    win->prev = NULL;
 
     wm_update_content_rect(win);
+
+    /* Insert at top of z-order */
+    if (!win_bottom) {
+        win_bottom = win_top = win;
+    } else {
+        win->prev = win_top;
+        win_top->next = win;
+        win_top = win;
+    }
 
     if (!shell_win) shell_win = win;
 
@@ -221,6 +233,7 @@ void wm_init(void) {
 /* ------------------------------------------------------------------ */
 
 window_t *wm_get_shell_window(void) { return shell_win; }
+window_t *wm_get_top_window(void)   { return win_top; }
 
 /* ------------------------------------------------------------------ */
 /*  Redraw                                                             */
@@ -229,21 +242,23 @@ window_t *wm_get_shell_window(void) { return shell_win; }
 void wm_redraw_all(void) {
     mouse_hide_cursor();
     wm_draw_desktop();
-    if (shell_win && (shell_win->flags & WIN_FLAG_VISIBLE)) {
-        wm_draw_chrome(shell_win);
-        fb_console_repaint();
+
+    /* Paint all visible windows bottom-to-top */
+    for (window_t *w = win_bottom; w; w = w->next) {
+        if (w->flags & WIN_FLAG_VISIBLE) {
+            wm_draw_chrome(w);
+            /* Repaint content for the shell window (others would need their
+               own repaint callbacks — for now, only shell has one) */
+            if (w == shell_win)
+                fb_console_repaint();
+        }
     }
+
     mouse_show_cursor();
 }
 
 void wm_refresh_desktop(void) {
-    mouse_hide_cursor();
-    wm_draw_desktop();
-    if (shell_win && (shell_win->flags & WIN_FLAG_VISIBLE)) {
-        wm_draw_chrome(shell_win);
-        fb_console_repaint();
-    }
-    mouse_show_cursor();
+    wm_redraw_all();
 }
 
 /* ------------------------------------------------------------------ */
@@ -253,6 +268,43 @@ void wm_refresh_desktop(void) {
 static int hit_titlebar(window_t *win, int32_t mx, int32_t my) {
     return mx >= win->x && mx < win->x + (int32_t)win->w &&
            my >= win->y && my < win->y + (int32_t)(WIN_TITLEBAR_H + WIN_BORDER_W);
+}
+
+static int hit_window(window_t *win, int32_t mx, int32_t my) {
+    return mx >= win->x && mx < win->x + (int32_t)win->w &&
+           my >= win->y && my < win->y + (int32_t)win->h;
+}
+
+/* Find the topmost window at (mx, my), searching top-to-bottom */
+window_t *wm_window_at(int32_t mx, int32_t my) {
+    for (window_t *w = win_top; w; w = w->prev) {
+        if ((w->flags & WIN_FLAG_VISIBLE) && hit_window(w, mx, my))
+            return w;
+    }
+    return NULL;
+}
+
+/* Bring a window to the front of the z-order */
+void wm_focus_window(window_t *win) {
+    if (!win || win == win_top) return;
+
+    /* Remove from current position */
+    if (win->prev) win->prev->next = win->next;
+    else           win_bottom = win->next;
+    if (win->next) win->next->prev = win->prev;
+    else           win_top = win->prev;
+
+    /* Insert at top */
+    win->prev = win_top;
+    win->next = NULL;
+    if (win_top) win_top->next = win;
+    win_top = win;
+    if (!win_bottom) win_bottom = win;
+
+    /* Update focus flags */
+    for (window_t *w = win_bottom; w; w = w->next)
+        w->flags &= ~WIN_FLAG_FOCUSED;
+    win->flags |= WIN_FLAG_FOCUSED;
 }
 
 /* ------------------------------------------------------------------ */
@@ -280,8 +332,28 @@ static void drag_move(window_t *win, int32_t mx, int32_t my) {
 
     mouse_hide_cursor();
 
-    /* Redraw full desktop (background + icons) to erase old window area */
-    wm_draw_desktop();
+    /* Erase old window area with desktop color (dirty-rect) instead of
+       repainting the entire screen.  Clamp to visible screen bounds. */
+    {
+        int32_t ox = win->x;
+        int32_t oy = win->y;
+        int32_t ow = (int32_t)win->w;
+        int32_t oh = (int32_t)win->h;
+
+        /* Clamp to screen */
+        if (ox < 0) { ow += ox; ox = 0; }
+        if (oy < 0) { oh += oy; oy = 0; }
+        if (ox + ow > (int32_t)fb_info.width)  ow = (int32_t)fb_info.width - ox;
+        if (oy + oh > (int32_t)fb_info.height) oh = (int32_t)fb_info.height - oy;
+
+        if (ow > 0 && oh > 0) {
+            fb_fill_rect((uint32_t)ox, (uint32_t)oy,
+                         (uint32_t)ow, (uint32_t)oh, desktop_color);
+        }
+    }
+
+    /* Redraw desktop icons (lightweight — only icons, not the full background) */
+    wm_draw_desktop_icons();
 
     /* Update position */
     win->x = new_x;
@@ -305,16 +377,31 @@ static void drag_end(window_t *win) {
 /*  Event processing                                                   */
 /* ------------------------------------------------------------------ */
 
+/* Track which window is currently being dragged */
+static window_t *dragging_win = NULL;
+
 int wm_process_events(void) {
     event_t e = event_poll();
     if (e.type == EVENT_NONE) return 0;
 
-    /* Left-click: check title bar hit for drag start */
+    /* Left-click: find the topmost window under the mouse */
     if (e.type == EVENT_MOUSE_BUTTON && e.mouse_button.pressed &&
         (e.mouse_button.button & MOUSE_BTN_LEFT)) {
-        if (shell_win && (shell_win->flags & WIN_FLAG_DRAGGABLE) &&
-            hit_titlebar(shell_win, e.mouse_button.x, e.mouse_button.y)) {
-            drag_begin(shell_win, e.mouse_button.x, e.mouse_button.y);
+
+        window_t *hit = wm_window_at(e.mouse_button.x, e.mouse_button.y);
+        if (hit) {
+            /* Click-to-focus: bring to front if not already on top */
+            if (hit != win_top) {
+                wm_focus_window(hit);
+                wm_redraw_all();
+            }
+
+            /* Start drag if clicked on title bar */
+            if ((hit->flags & WIN_FLAG_DRAGGABLE) &&
+                hit_titlebar(hit, e.mouse_button.x, e.mouse_button.y)) {
+                drag_begin(hit, e.mouse_button.x, e.mouse_button.y);
+                dragging_win = hit;
+            }
             return 1;
         }
     }
@@ -322,16 +409,17 @@ int wm_process_events(void) {
     /* Left-release: end drag */
     if (e.type == EVENT_MOUSE_BUTTON && !e.mouse_button.pressed &&
         (e.mouse_button.button & MOUSE_BTN_LEFT)) {
-        if (shell_win && (shell_win->flags & WIN_FLAG_DRAGGING)) {
-            drag_end(shell_win);
+        if (dragging_win && (dragging_win->flags & WIN_FLAG_DRAGGING)) {
+            drag_end(dragging_win);
+            dragging_win = NULL;
             return 1;
         }
     }
 
     /* Mouse move during drag */
     if (e.type == EVENT_MOUSE_MOVE) {
-        if (shell_win && (shell_win->flags & WIN_FLAG_DRAGGING)) {
-            drag_move(shell_win, e.mouse_move.x, e.mouse_move.y);
+        if (dragging_win && (dragging_win->flags & WIN_FLAG_DRAGGING)) {
+            drag_move(dragging_win, e.mouse_move.x, e.mouse_move.y);
             return 1;
         }
     }

@@ -114,6 +114,10 @@ static void keyboard_irq(trapframe* r) {
             case 0x4D: e.type = KEY_RIGHT;     break;
             case 0x49: e.type = KEY_PAGE_UP;   break;
             case 0x51: e.type = KEY_PAGE_DOWN; break;
+            case 0x47: e.type = KEY_HOME;      break;
+            case 0x4F: e.type = KEY_END;       break;
+            case 0x52: e.type = KEY_INSERT;    break;
+            case 0x53: e.type = KEY_DELETE;    break;
         }
         extended = 0;
     } else if (ctrl_held && sc == 0x2E) {

@@ -24,6 +24,10 @@ typedef enum {
 
     KEY_PAGE_UP,
     KEY_PAGE_DOWN,
+
+    KEY_HOME,
+    KEY_END,
+    KEY_INSERT,
 } key_type_t;
 
 typedef struct {

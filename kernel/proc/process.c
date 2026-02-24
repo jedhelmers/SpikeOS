@@ -40,6 +40,7 @@ void process_init(void) {
         proc_table[i].wait_children.head = NULL;
         proc_table[i].cwd = 0;
         proc_table[i].pending_signals = 0;
+        proc_table[i].brk = 0;
         for (int j = 0; j < MAX_FDS; j++)
             proc_table[i].fds[j] = -1;
     }
@@ -111,6 +112,47 @@ void proc_kill(uint32_t pid) {
     printf("[proc] PID %d not found\n", pid);
 }
 
+/*
+ * Try to reclaim zombie process slots whose parent is also dead
+ * (or whose parent is PID 0 / idle).  This prevents process table
+ * exhaustion from accumulated zombies that nobody will waitpid() for.
+ */
+static void reap_orphan_zombies(void) {
+    for (int i = 1; i < MAX_PROCS; i++) {
+        if (proc_table[i].state != PROC_ZOMBIE) continue;
+
+        uint32_t ppid = proc_table[i].parent_pid;
+
+        /* Parent is idle/kernel (PID 0) — always reapable */
+        if (ppid == 0) goto reap;
+
+        /* Check if parent is also dead */
+        int parent_alive = 0;
+        for (int j = 0; j < MAX_PROCS; j++) {
+            if (proc_table[j].pid == ppid &&
+                proc_table[j].state != PROC_ZOMBIE) {
+                parent_alive = 1;
+                break;
+            }
+        }
+        if (parent_alive) continue;
+
+    reap:
+        /* Reset slot so it can be reused */
+        proc_table[i].pid = 0;
+        proc_table[i].tf = NULL;
+        proc_table[i].cr3 = 0;
+        proc_table[i].parent_pid = 0;
+        proc_table[i].exit_status = 0;
+        proc_table[i].pending_signals = 0;
+        proc_table[i].cwd = 0;
+        proc_table[i].brk = 0;
+        proc_table[i].wait_children.head = NULL;
+        for (int j = 0; j < MAX_FDS; j++)
+            proc_table[i].fds[j] = -1;
+    }
+}
+
 struct process *proc_create_kernel_thread(void (*entry)(void)) {
     for (int i = 1; i < MAX_PROCS; i++) {
         if (proc_table[i].state == PROC_ZOMBIE) {
@@ -163,6 +205,16 @@ struct process *proc_create_kernel_thread(void (*entry)(void)) {
         }
     }
 
+    /* Try reaping orphan zombies and retry once */
+    reap_orphan_zombies();
+    for (int i = 1; i < MAX_PROCS; i++) {
+        if (proc_table[i].state == PROC_ZOMBIE) {
+            /* Recurse with the freshly reaped slot available */
+            return proc_create_kernel_thread(entry);
+        }
+    }
+
+    printf("[proc] process table full (max %d)\n", MAX_PROCS);
     return NULL;
 }
 
@@ -221,6 +273,16 @@ struct process *proc_create_user_process(uint32_t pd_phys,
             return p;
         }
     }
+
+    /* Try reaping orphan zombies and retry once */
+    reap_orphan_zombies();
+    for (int i = 1; i < MAX_PROCS; i++) {
+        if (proc_table[i].state == PROC_ZOMBIE) {
+            return proc_create_user_process(pd_phys, user_eip, user_esp);
+        }
+    }
+
+    printf("[proc] process table full (max %d)\n", MAX_PROCS);
     return NULL;
 }
 
