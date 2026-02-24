@@ -135,10 +135,17 @@ void free_frame(uint32_t phys) {
  * Temp mapping: map any physical frame at TEMP_MAP_VADDR (0xC03FF000).
  * Uses PTE[1023] of first_page_table. Since first_page_table is in
  * kernel BSS (physical < 4MB, identity-mapped), we can write to it directly.
+ *
+ * Interrupts are disabled for the duration of a temp mapping to prevent
+ * re-entrancy (only one temp slot exists). temp_unmap restores the
+ * previous interrupt state.
  */
 #define TEMP_MAP_PTE_INDEX 1023
 
+static uint32_t temp_map_irq_flags;
+
 void *temp_map(uint32_t phys_frame) {
+    temp_map_irq_flags = hal_irq_save();
     first_page_table[TEMP_MAP_PTE_INDEX] = phys_frame | PAGE_PRESENT | PAGE_WRITABLE;
     hal_tlb_invalidate(TEMP_MAP_VADDR);
     return (void *)TEMP_MAP_VADDR;
@@ -147,6 +154,7 @@ void *temp_map(uint32_t phys_frame) {
 void temp_unmap(void) {
     first_page_table[TEMP_MAP_PTE_INDEX] = 0;
     hal_tlb_invalidate(TEMP_MAP_VADDR);
+    hal_irq_restore(temp_map_irq_flags);
 }
 
 /*

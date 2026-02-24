@@ -87,6 +87,15 @@ void fb_enable(void) {
 
     outw(0x01CE, 0x04);                  /* VBE_DISPI_INDEX_ENABLE */
     outw(0x01CF, 0x0041);                /* VBE_DISPI_ENABLED | VBE_DISPI_LFB_ENABLED */
+
+    /*
+     * Bochs VBE always uses XRGB8888: pixel = 0x00RRGGBB.
+     * The GRUB-reported color positions came from EFI GOP, which may differ.
+     * Now that we've reprogrammed Bochs VBE, force the known layout.
+     */
+    fb_info.red_pos    = 16;  fb_info.red_mask   = 8;
+    fb_info.green_pos  =  8;  fb_info.green_mask = 8;
+    fb_info.blue_pos   =  0;  fb_info.blue_mask  = 8;
 }
 
 void fb_putpixel(uint32_t x, uint32_t y, uint32_t color) {
@@ -143,4 +152,103 @@ uint32_t fb_pack_color(uint8_t r, uint8_t g, uint8_t b) {
     color |= ((uint32_t)g & ((1u << fb_info.green_mask) - 1)) << fb_info.green_pos;
     color |= ((uint32_t)b & ((1u << fb_info.blue_mask) - 1))  << fb_info.blue_pos;
     return color;
+}
+
+void fb_draw_hline(uint32_t x, uint32_t y, uint32_t w, uint32_t color) {
+    if (!fb_info.available) return;
+    if (y >= fb_info.height || x >= fb_info.width) return;
+    if (x + w > fb_info.width) w = fb_info.width - x;
+
+    uint32_t bpp = fb_info.bpp / 8;
+    volatile uint8_t *row = (volatile uint8_t *)
+        (fb_info.virt_addr + y * fb_info.pitch + x * bpp);
+
+    if (fb_info.bpp == 32) {
+        volatile uint32_t *p = (volatile uint32_t *)row;
+        for (uint32_t i = 0; i < w; i++)
+            p[i] = color;
+    } else {
+        for (uint32_t i = 0; i < w; i++) {
+            row[i * 3]     = color & 0xFF;
+            row[i * 3 + 1] = (color >> 8) & 0xFF;
+            row[i * 3 + 2] = (color >> 16) & 0xFF;
+        }
+    }
+}
+
+void fb_draw_vline(uint32_t x, uint32_t y, uint32_t h, uint32_t color) {
+    if (!fb_info.available) return;
+    if (x >= fb_info.width || y >= fb_info.height) return;
+    if (y + h > fb_info.height) h = fb_info.height - y;
+
+    uint32_t bpp = fb_info.bpp / 8;
+
+    for (uint32_t row = 0; row < h; row++) {
+        volatile uint8_t *p = (volatile uint8_t *)
+            (fb_info.virt_addr + (y + row) * fb_info.pitch + x * bpp);
+        if (fb_info.bpp == 32) {
+            *(volatile uint32_t *)p = color;
+        } else {
+            p[0] = color & 0xFF;
+            p[1] = (color >> 8) & 0xFF;
+            p[2] = (color >> 16) & 0xFF;
+        }
+    }
+}
+
+void fb_draw_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t color) {
+    if (!fb_info.available || w == 0 || h == 0) return;
+    fb_draw_hline(x, y, w, color);             /* top */
+    fb_draw_hline(x, y + h - 1, w, color);     /* bottom */
+    fb_draw_vline(x, y, h, color);             /* left */
+    fb_draw_vline(x + w - 1, y, h, color);     /* right */
+}
+
+void fb_blit(uint32_t dst_x, uint32_t dst_y, const uint32_t *src,
+             uint32_t src_pitch, uint32_t w, uint32_t h) {
+    if (!fb_info.available) return;
+    if (dst_x >= fb_info.width || dst_y >= fb_info.height) return;
+    if (dst_x + w > fb_info.width) w = fb_info.width - dst_x;
+    if (dst_y + h > fb_info.height) h = fb_info.height - dst_y;
+
+    uint32_t bpp = fb_info.bpp / 8;
+
+    for (uint32_t row = 0; row < h; row++) {
+        volatile uint8_t *dst = (volatile uint8_t *)
+            (fb_info.virt_addr + (dst_y + row) * fb_info.pitch + dst_x * bpp);
+        const uint8_t *srow = (const uint8_t *)src + row * src_pitch;
+        memcpy((void *)dst, srow, w * bpp);
+    }
+}
+
+void fb_blit_masked(uint32_t dst_x, uint32_t dst_y, const uint32_t *src,
+                    const uint8_t *mask, uint32_t src_pitch, uint32_t w, uint32_t h) {
+    if (!fb_info.available) return;
+
+    uint32_t bpp = fb_info.bpp / 8;
+
+    for (uint32_t row = 0; row < h; row++) {
+        uint32_t sy = dst_y + row;
+        if (sy >= fb_info.height) break;
+
+        const uint32_t *srow = (const uint32_t *)((const uint8_t *)src + row * src_pitch);
+        const uint8_t *mrow = mask + row * w;
+
+        for (uint32_t col = 0; col < w; col++) {
+            uint32_t sx = dst_x + col;
+            if (sx >= fb_info.width) break;
+            if (!mrow[col]) continue;  /* transparent */
+
+            volatile uint8_t *p = (volatile uint8_t *)
+                (fb_info.virt_addr + sy * fb_info.pitch + sx * bpp);
+            if (fb_info.bpp == 32) {
+                *(volatile uint32_t *)p = srow[col];
+            } else {
+                uint32_t c = srow[col];
+                p[0] = c & 0xFF;
+                p[1] = (c >> 8) & 0xFF;
+                p[2] = (c >> 16) & 0xFF;
+            }
+        }
+    }
 }

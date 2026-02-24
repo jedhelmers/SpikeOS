@@ -14,6 +14,9 @@
 #include <kernel/mutex.h>
 #include <kernel/condvar.h>
 #include <kernel/rwlock.h>
+#include <kernel/event.h>
+#include <kernel/mouse.h>
+#include <kernel/window.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -78,6 +81,7 @@ void shell_readline(void) {
         key_event_t c = keyboard_get_event();
 
         if (c.type == KEY_NONE) {
+            wm_process_events();
             __asm__ volatile ("hlt");
             continue;
         }
@@ -427,9 +431,50 @@ static int test_rwlock(void) {
     return pass;
 }
 
+static int test_mouse(void) {
+    int pass = 1;
+
+    printf("  mouse_get_state()... ");
+    mouse_state_t ms = mouse_get_state();
+    printf("[PASS] x=%d y=%d buttons=0x%x\n", ms.x, ms.y, ms.buttons);
+
+    printf("  Move the mouse or click within 5 seconds...\n");
+
+    uint32_t timeout = timer_ticks() + 500;  /* 5 seconds at 100Hz */
+    int got_mouse = 0;
+
+    while (timer_ticks() < timeout) {
+        event_t e = event_poll();
+        if (e.type == EVENT_MOUSE_MOVE) {
+            printf("  [PASS] MOUSE_MOVE x=%d y=%d dx=%d dy=%d\n",
+                   e.mouse_move.x, e.mouse_move.y,
+                   e.mouse_move.dx, e.mouse_move.dy);
+            got_mouse = 1;
+            break;
+        } else if (e.type == EVENT_MOUSE_BUTTON) {
+            printf("  [PASS] MOUSE_BUTTON x=%d y=%d btn=0x%x %s\n",
+                   e.mouse_button.x, e.mouse_button.y,
+                   e.mouse_button.button,
+                   e.mouse_button.pressed ? "pressed" : "released");
+            got_mouse = 1;
+            break;
+        }
+        hal_irq_enable();
+        hal_halt();
+    }
+
+    if (!got_mouse) {
+        printf("  [FAIL] no mouse event within 5 seconds\n");
+        pass = 0;
+    }
+
+    return pass;
+}
+
 static void run_tests(int which) {
     /* which: 0=all, 1=fd, 2=pipe, 3=sleep, 4=stat, 5=waitpid, 6=stdin,
-             7=mutex, 8=sem, 9=signal, 10=cwd, 11=condvar, 12=rwlock */
+             7=mutex, 8=sem, 9=signal, 10=cwd, 11=condvar, 12=rwlock,
+             13=mouse */
     int total = 0, passed = 0;
 
     if (which == 0 || which == 1) {
@@ -501,6 +546,12 @@ static void run_tests(int which) {
     if (which == 0 || which == 12) {
         printf("[test rwlock]\n");
         int r = test_rwlock();
+        total++; if (r) passed++;
+        printf("  result: %s\n\n", r ? "PASS" : "FAIL");
+    }
+    if (which == 13) {
+        printf("[test mouse]\n");
+        int r = test_mouse();
         total++; if (r) passed++;
         printf("  result: %s\n\n", r ? "PASS" : "FAIL");
     }
@@ -870,8 +921,11 @@ void shell_execute(void) {
     else if (strcmp(line_buf, "test rwlock") == 0) {
         run_tests(12);
     }
+    else if (strcmp(line_buf, "test mouse") == 0) {
+        run_tests(13);
+    }
     else if (strcmp(line_buf, "test") == 0) {
-        printf("Usage: test <fd|pipe|sleep|stat|stdin|waitpid|mutex|sem|signal|cwd|condvar|rwlock|all>\n");
+        printf("Usage: test <fd|pipe|sleep|stat|stdin|waitpid|mutex|sem|signal|cwd|condvar|rwlock|mouse|all>\n");
     }
 
     /* ---- clear ---- */

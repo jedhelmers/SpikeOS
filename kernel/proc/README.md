@@ -4,8 +4,8 @@ Process management, scheduling, and synchronization for SpikeOS.
 
 ## What's Here
 
-- **process.c** — Process table (max 32 processes), kernel thread and user process creation, kill/signal
-- **scheduler.c** — Round-robin preemptive scheduler with CR3 switching
+- **process.c** — Process table (max 32 processes), kernel thread and user process creation, interrupt-safe kill (switches to kernel CR3 before destroying user PD), signal delivery with zombie guard
+- **scheduler.c** — Round-robin preemptive scheduler with CR3 switching, NULL guard for premature timer IRQ, idle fallback in `pick_next()`
 - **elf_loader.c** — ELF binary loader for user-mode processes (VFS first, initrd fallback)
 - **wait.c** — Wait queues for blocking/waking processes
 - **mutex.c** — Spinlock, blocking mutex, and counting semaphore

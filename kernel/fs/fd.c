@@ -4,6 +4,7 @@
 #include <kernel/pipe.h>
 #include <kernel/tty.h>
 #include <kernel/keyboard.h>
+#include <kernel/hal.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -18,18 +19,23 @@ void fd_init(void) {
 }
 
 int alloc_open_file(void) {
+    uint32_t flags = hal_irq_save();
     for (int i = 0; i < MAX_OPEN_FILES; i++) {
         if (open_file_table[i].type == FD_TYPE_NONE) {
             memset(&open_file_table[i], 0, sizeof(open_file_t));
             open_file_table[i].refcount = 1;
+            hal_irq_restore(flags);
             return i;
         }
     }
+    hal_irq_restore(flags);
     return -1;
 }
 
 void release_open_file(int idx) {
     if (idx < 0 || idx >= MAX_OPEN_FILES) return;
+
+    uint32_t flags = hal_irq_save();
     open_file_t *of = &open_file_table[idx];
 
     of->refcount--;
@@ -43,6 +49,7 @@ void release_open_file(int idx) {
         }
         memset(of, 0, sizeof(open_file_t));
     }
+    hal_irq_restore(flags);
 }
 
 int alloc_fd(int *fd_table) {

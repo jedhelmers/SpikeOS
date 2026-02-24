@@ -73,6 +73,8 @@ struct process *process_ge_table(void) {
 }
 
 void proc_kill(uint32_t pid) {
+    uint32_t irq_flags = hal_irq_save();
+
     for (int i = 1; i < MAX_PROCS; i++) {
         if (proc_table[i].pid == pid && proc_table[i].state != PROC_ZOMBIE) {
             proc_table[i].state = PROC_ZOMBIE;
@@ -82,6 +84,9 @@ void proc_kill(uint32_t pid) {
 
             /* Free per-process page directory if this process has one */
             if (proc_table[i].cr3 != 0) {
+                /* If killing ourselves, switch to kernel CR3 first */
+                if (&proc_table[i] == current_process)
+                    hal_set_cr3(get_kernel_cr3());
                 pgdir_destroy(proc_table[i].cr3);
                 proc_table[i].cr3 = 0;
             }
@@ -96,10 +101,13 @@ void proc_kill(uint32_t pid) {
                 }
             }
 
+            hal_irq_restore(irq_flags);
             printf("[proc] killed PID %d\n", pid);
             return;
         }
     }
+
+    hal_irq_restore(irq_flags);
     printf("[proc] PID %d not found\n", pid);
 }
 
@@ -223,6 +231,8 @@ struct process *proc_create_user_process(uint32_t pd_phys,
 int proc_signal(uint32_t pid, int sig) {
     if (sig < 1 || sig >= NSIG) return -1;
 
+    uint32_t irq_flags = hal_irq_save();
+
     for (int i = 0; i < MAX_PROCS; i++) {
         if (proc_table[i].pid == pid &&
             proc_table[i].state != PROC_ZOMBIE) {
@@ -232,14 +242,18 @@ int proc_signal(uint32_t pid, int sig) {
             if (proc_table[i].state == PROC_BLOCKED) {
                 proc_table[i].state = PROC_READY;
             }
+            hal_irq_restore(irq_flags);
             return 0;
         }
     }
+
+    hal_irq_restore(irq_flags);
     return -1;
 }
 
 void signal_check_pending(void) {
     if (!current_process) return;
+    if (current_process->state == PROC_ZOMBIE) return;
     if (current_process->pending_signals == 0) return;
 
     /* Find the first pending signal */
@@ -254,5 +268,10 @@ void signal_check_pending(void) {
     printf("[signal] PID %d killed by signal %d\n",
            current_process->pid, sig);
 
+    current_process->exit_status = 128 + sig;
     proc_kill(current_process->pid);
+
+    /* Process is now zombie — yield to scheduler */
+    hal_irq_enable();
+    for (;;) hal_halt();
 }

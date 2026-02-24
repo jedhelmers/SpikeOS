@@ -18,7 +18,7 @@ Headers are included as `#include <kernel/header.h>`. They define the public API
 
 **Process:** `process.h`, `scheduler.h`, `elf.h`, `wait.h`, `mutex.h`, `condvar.h`, `rwlock.h`
 
-**Drivers:** `keyboard.h`, `timer.h`, `uart.h`, `ata.h`, `pic.h`, `vga13.h`, `debug_log.h`
+**Drivers:** `keyboard.h`, `timer.h`, `uart.h`, `ata.h`, `pic.h`, `vga13.h`, `framebuffer.h`, `fb_console.h`, `mouse.h`, `event.h`, `window.h`, `debug_log.h`
 
 **Shell:** `shell.h`, `boot_splash.h`, `tetris.h`
 

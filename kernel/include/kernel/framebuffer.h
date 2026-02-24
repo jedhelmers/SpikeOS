@@ -37,4 +37,17 @@ void fb_clear(uint32_t color);
 /* Pack R/G/B into native pixel format */
 uint32_t fb_pack_color(uint8_t r, uint8_t g, uint8_t b);
 
+/* Drawing primitives */
+void fb_draw_hline(uint32_t x, uint32_t y, uint32_t w, uint32_t color);
+void fb_draw_vline(uint32_t x, uint32_t y, uint32_t h, uint32_t color);
+void fb_draw_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t color);
+
+/* Blit rectangular pixel buffer to framebuffer (32bpp source, src_pitch in bytes) */
+void fb_blit(uint32_t dst_x, uint32_t dst_y, const uint32_t *src,
+             uint32_t src_pitch, uint32_t w, uint32_t h);
+
+/* Blit with transparency mask (mask: 1=opaque, 0=transparent, one byte per pixel) */
+void fb_blit_masked(uint32_t dst_x, uint32_t dst_y, const uint32_t *src,
+                    const uint8_t *mask, uint32_t src_pitch, uint32_t w, uint32_t h);
+
 #endif

@@ -2,6 +2,7 @@
 #include <kernel/fd.h>
 #include <kernel/process.h>
 #include <kernel/signal.h>
+#include <kernel/hal.h>
 #include <string.h>
 
 /* ------------------------------------------------------------------ */
@@ -15,13 +16,16 @@ void pipe_init(void) {
 }
 
 static pipe_t *alloc_pipe(void) {
+    uint32_t flags = hal_irq_save();
     for (int i = 0; i < MAX_PIPES; i++) {
         if (!pipe_pool[i].active) {
             memset(&pipe_pool[i], 0, sizeof(pipe_t));
             pipe_pool[i].active = 1;
+            hal_irq_restore(flags);
             return &pipe_pool[i];
         }
     }
+    hal_irq_restore(flags);
     return (pipe_t *)0;
 }
 
@@ -94,11 +98,15 @@ int32_t pipe_read(pipe_t *p, void *buf, uint32_t count) {
             break;
         }
 
-        /* Copy available bytes */
-        while (total < count && p->count > 0) {
-            out[total++] = p->buf[p->read_pos];
-            p->read_pos = (p->read_pos + 1) % PIPE_BUF_SIZE;
-            p->count--;
+        /* Copy available bytes (interrupts off to protect buffer state) */
+        {
+            uint32_t irq = hal_irq_save();
+            while (total < count && p->count > 0) {
+                out[total++] = p->buf[p->read_pos];
+                p->read_pos = (p->read_pos + 1) % PIPE_BUF_SIZE;
+                p->count--;
+            }
+            hal_irq_restore(irq);
         }
 
         /* Wake any blocked writers */
@@ -135,11 +143,15 @@ int32_t pipe_write(pipe_t *p, const void *buf, uint32_t count) {
             return total > 0 ? (int32_t)total : -1;
         }
 
-        /* Copy bytes into buffer */
-        while (total < count && p->count < PIPE_BUF_SIZE) {
-            p->buf[p->write_pos] = in[total++];
-            p->write_pos = (p->write_pos + 1) % PIPE_BUF_SIZE;
-            p->count++;
+        /* Copy bytes into buffer (interrupts off to protect buffer state) */
+        {
+            uint32_t irq = hal_irq_save();
+            while (total < count && p->count < PIPE_BUF_SIZE) {
+                p->buf[p->write_pos] = in[total++];
+                p->write_pos = (p->write_pos + 1) % PIPE_BUF_SIZE;
+                p->count++;
+            }
+            hal_irq_restore(irq);
         }
 
         /* Wake any blocked readers */
@@ -154,23 +166,29 @@ int32_t pipe_write(pipe_t *p, const void *buf, uint32_t count) {
 /* ------------------------------------------------------------------ */
 
 void pipe_close_reader(pipe_t *p) {
+    uint32_t flags = hal_irq_save();
     p->readers--;
-    if (p->readers <= 0) {
+    int no_readers = (p->readers <= 0);
+    int deactivate = (p->readers <= 0 && p->writers <= 0);
+    if (deactivate) p->active = 0;
+    hal_irq_restore(flags);
+
+    if (no_readers) {
         /* Wake blocked writers so they get -1 */
         wake_up_all(&p->write_wq);
-    }
-    if (p->readers <= 0 && p->writers <= 0) {
-        p->active = 0;
     }
 }
 
 void pipe_close_writer(pipe_t *p) {
+    uint32_t flags = hal_irq_save();
     p->writers--;
-    if (p->writers <= 0) {
+    int no_writers = (p->writers <= 0);
+    int deactivate = (p->readers <= 0 && p->writers <= 0);
+    if (deactivate) p->active = 0;
+    hal_irq_restore(flags);
+
+    if (no_writers) {
         /* Wake blocked readers so they get EOF */
         wake_up_all(&p->read_wq);
-    }
-    if (p->readers <= 0 && p->writers <= 0) {
-        p->active = 0;
     }
 }

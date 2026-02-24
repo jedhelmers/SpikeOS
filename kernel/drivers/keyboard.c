@@ -1,5 +1,6 @@
 #include <kernel/keyboard.h>
 #include <kernel/wait.h>
+#include <kernel/event.h>
 
 #define KBD_BUF_SIZE 128
 
@@ -10,14 +11,23 @@ static volatile uint8_t kbd_tail = 0;
 
 static wait_queue_t keyboard_wq = WAIT_QUEUE_INIT;
 
-static int ctrl_held = 0;
-static int extended  = 0;  /* set when 0xE0 prefix received */
+static int ctrl_held  = 0;
+static int shift_held = 0;
+static int extended   = 0;  /* set when 0xE0 prefix received */
 
 static const char scancode_to_ascii[128] = {
     0,  27, '1','2','3','4','5','6','7','8','9','0','-','=', '\b',
     '\t','q','w','e','r','t','y','u','i','o','p','[',']','\n',
     0,   'a','s','d','f','g','h','j','k','l',';','\'','`',
     0,  '\\','z','x','c','v','b','n','m',',','.','/',
+    0,   '*', 0,  ' '
+};
+
+static const char scancode_to_ascii_shift[128] = {
+    0,  27, '!','@','#','$','%','^','&','*','(',')','_','+', '\b',
+    '\t','Q','W','E','R','T','Y','U','I','O','P','{','}','\n',
+    0,   'A','S','D','F','G','H','J','K','L',':','"','~',
+    0,   '|','Z','X','C','V','B','N','M','<','>','?',
     0,   '*', 0,  ' '
 };
 
@@ -66,15 +76,13 @@ static void keyboard_irq(trapframe* r) {
         return;
     }
 
-    /* Ctrl release: 0x9D (left) or extended+0x1D (right) */
-    if (sc == 0x9D) {
-        ctrl_held = 0;
-        extended  = 0;
-        return;
-    }
-
-    /* All other key releases — clear extended flag and ignore */
+    /* Handle key releases (bit 7 set) */
     if (sc & 0x80) {
+        uint8_t release = sc & 0x7F;
+        if (release == 0x2A || release == 0x36)  /* left/right shift */
+            shift_held = 0;
+        else if (release == 0x1D)                 /* ctrl */
+            ctrl_held = 0;
         extended = 0;
         return;
     }
@@ -83,6 +91,13 @@ static void keyboard_irq(trapframe* r) {
     if (sc == 0x1D) {
         ctrl_held = 1;
         extended  = 0;
+        return;
+    }
+
+    /* Shift press (left = 0x2A, right = 0x36) */
+    if (sc == 0x2A || sc == 0x36) {
+        shift_held = 1;
+        extended   = 0;
         return;
     }
 
@@ -110,7 +125,8 @@ static void keyboard_irq(trapframe* r) {
     } else if (sc == 0x1C) {
         e.type = KEY_ENTER;
     } else if (sc < 128) {
-        char c = scancode_to_ascii[sc];
+        char c = shift_held ? scancode_to_ascii_shift[sc]
+                            : scancode_to_ascii[sc];
         if (c) {
             e.type = KEY_CHAR;
             e.ch   = c;
@@ -120,6 +136,7 @@ static void keyboard_irq(trapframe* r) {
     if (e.type != KEY_NONE) {
         kbd_push(e);
         wake_up_one(&keyboard_wq);
+        event_push_key(EVENT_KEY_PRESS, e.type, e.ch);
     }
 }
 

@@ -23,8 +23,11 @@
 #include <kernel/boot_splash.h>
 #include <kernel/fd.h>
 #include <kernel/pipe.h>
+#include <kernel/window.h>
 #include <kernel/framebuffer.h>
 #include <kernel/fb_console.h>
+#include <kernel/event.h>
+#include <kernel/mouse.h>
 
 extern void kprint_howdy(void);
 extern void paging_enable(uint32_t);
@@ -271,63 +274,92 @@ void kernel_main(void) {
 #endif
     spikefs_init();
 
-#ifdef VERBOSE_BOOT
-    printf("INIT IRQ0 (Timer)\n");
-#endif
-    timer_init(100);
-    pic_clear_mask(0);
-#ifdef VERBOSE_BOOT
-    printf("PIC: UNMASK Timer (enable hardware interrupt)\n");
-#endif
-
     fd_init();
     pipe_init();
+    event_init();
 #ifdef VERBOSE_BOOT
-    printf("INIT File Descriptor & Pipe Tables\n");
+    printf("INIT File Descriptors / Pipes / Events\n");
 #endif
 
-#ifdef VERBOSE_BOOT
-    printf("INIT Process\n");
-#endif
     process_init();
+#ifdef VERBOSE_BOOT
+    printf("INIT Process Table\n");
+#endif
 
+    scheduler_init();
 #ifdef VERBOSE_BOOT
     printf("INIT Scheduler\n");
 #endif
-    scheduler_init();
 
+    /* Timer and IRQ unmask AFTER process/scheduler are ready,
+       because IRQ0 triggers scheduler_tick() which needs
+       current_process and kernel_cr3 to be initialized. */
+    timer_init(100);
+    pic_clear_mask(0);
 #ifdef VERBOSE_BOOT
-    printf("INIT IRQ1 (Keyboard)\n");
+    printf("INIT Timer (100 Hz) + IRQ0 unmasked\n");
 #endif
+
     keyboard_init();
     pic_clear_mask(1);
 #ifdef VERBOSE_BOOT
-    printf("PIC: UNMASK Keyboard (enable hardware interrupt)\n");
+    printf("INIT Keyboard + IRQ1 unmasked\n");
 #endif
 
+    mouse_init();
 #ifdef VERBOSE_BOOT
-    printf("INIT UART (COM1)\n");
+    printf("INIT Mouse\n");
 #endif
+
     uart_init();
     irq_install_handler(4, uart_irq_handler);
     pic_clear_mask(4);
 #ifdef VERBOSE_BOOT
-    printf("PIC: UNMASK UART (IRQ4)\n");
-    printf("Kernel end: %x\n", (uint32_t)&endkernel);
+    printf("INIT UART + IRQ4 unmasked\n");
 #endif
 
-    /* Enable framebuffer before boot splash so the splash renders on it */
     fb_enable();
+#ifdef VERBOSE_BOOT
+    printf("INIT Framebuffer enable\n");
+#endif
 
     /* Show boot splash (only in non-verbose mode) */
 #ifndef VERBOSE_BOOT
     boot_splash();
 #endif
 
-    /* Init framebuffer console for shell use */
+    /* Init window manager and framebuffer console */
+    wm_init();
     fb_console_init();
+
+    /* Create shell window — content area matches old margins (32px sides, 48px top) */
+    if (fb_info.available) {
+        uint32_t content_w = (fb_info.width - 2 * 32);
+        uint32_t content_h = (fb_info.height - 48 - 16);
+        content_w = (content_w / 8) * 8;
+        content_h = (content_h / 16) * 16;
+
+        int32_t  outer_x = 32 - WIN_BORDER_W;
+        int32_t  outer_y = 48 - WIN_TITLEBAR_H - WIN_BORDER_W;
+        uint32_t outer_w = content_w + 2 * WIN_BORDER_W;
+        uint32_t outer_h = content_h + WIN_TITLEBAR_H + 2 * WIN_BORDER_W;
+
+        window_t *win = wm_create_window(outer_x, outer_y,
+                                         outer_w, outer_h, "SpikeOS Shell");
+        fb_console_bind_window(win);
+    }
+
+    fb_console_setcolor(14, 0);  /* yellow text on black background */
     terminal_switch_to_fb();
+
+    /* Draw desktop + window chrome, then clear content area */
+    if (fb_info.available) {
+        wm_draw_desktop();
+        wm_draw_chrome(wm_get_shell_window());
+    }
     terminal_clear();
+
+    mouse_show_cursor();
 
     // ring3_test_perprocess();
     proc_create_kernel_thread(shell_run);

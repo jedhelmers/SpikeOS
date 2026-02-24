@@ -16,6 +16,7 @@
 
 #include <kernel/heap.h>
 #include <kernel/paging.h>
+#include <kernel/hal.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -73,6 +74,11 @@ static int heap_grow(uint32_t pages) {
     for (uint32_t i = 0; i < pages; i++) {
         uint32_t phys = alloc_frame();
         if (phys == 0) {
+            /* Rollback: free frames from pages we already mapped */
+            for (uint32_t j = 0; j < i; j++) {
+                uint32_t mapped_phys = virt_to_phys(grow_virt + j * PAGE_SIZE);
+                if (mapped_phys) free_frame(mapped_phys);
+            }
             printf("[heap] ERROR: alloc_frame() failed\n");
             return -1;
         }
@@ -121,7 +127,7 @@ void heap_init(void) {
 
     if (heap_grow(HEAP_GROW_PAGES) != 0) {
         printf("[heap] FATAL: initial heap_grow failed\n");
-        for (;;) asm volatile("cli; hlt");
+        hal_halt_forever();
     }
 
     heap_start = (heap_block_t *)HEAP_START;
@@ -135,7 +141,7 @@ void *kmalloc(size_t size) {
     uint32_t req = align_up((uint32_t)size);
     if (req < HEAP_ALIGN) req = HEAP_ALIGN;
 
-    asm volatile("cli");
+    uint32_t irqflags = hal_irq_save();
 
     /* First-fit search: walk the free list for a large enough block. */
     heap_block_t *blk = free_list;
@@ -151,7 +157,7 @@ void *kmalloc(size_t size) {
 
         if (heap_grow(pages_needed) != 0) {
             printf("[heap] kmalloc(%u): out of memory\n", (unsigned)size);
-            asm volatile("sti");
+            hal_irq_restore(irqflags);
             return NULL;
         }
     }
@@ -164,7 +170,7 @@ void *kmalloc(size_t size) {
     }
 
     printf("[heap] kmalloc(%u): internal error after grow\n", (unsigned)size);
-    asm volatile("sti");
+    hal_irq_restore(irqflags);
     return NULL;
 
 found:
@@ -186,7 +192,7 @@ found:
     }
 
     free_list_remove(blk);
-    asm volatile("sti");
+    hal_irq_restore(irqflags);
     return (void *)(blk + 1);
 }
 
@@ -207,7 +213,7 @@ void kfree(void *ptr) {
         return;
     }
 
-    asm volatile("cli");
+    uint32_t irqflags = hal_irq_save();
 
     free_list_insert(blk);
 
@@ -241,7 +247,7 @@ void kfree(void *ptr) {
         }
     }
 
-    asm volatile("sti");
+    hal_irq_restore(irqflags);
 }
 
 void *kcalloc(size_t nmemb, size_t size) {
@@ -277,18 +283,20 @@ void *krealloc(void *ptr, size_t new_size) {
     }
 
     /* Growing: try in-place coalesce with next free block. */
-    asm volatile("cli");
-    heap_block_t *next_phys = (heap_block_t *)((char *)(blk + 1) + blk->size);
-    if ((uint32_t)next_phys < heap_end && (next_phys->flags & HEAP_FLAG_FREE)) {
-        uint32_t combined = blk->size + sizeof(heap_block_t) + next_phys->size;
-        if (combined >= req) {
-            free_list_remove(next_phys);
-            blk->size = combined;
-            asm volatile("sti");
-            return ptr;
+    {
+        uint32_t irqflags = hal_irq_save();
+        heap_block_t *next_phys = (heap_block_t *)((char *)(blk + 1) + blk->size);
+        if ((uint32_t)next_phys < heap_end && (next_phys->flags & HEAP_FLAG_FREE)) {
+            uint32_t combined = blk->size + sizeof(heap_block_t) + next_phys->size;
+            if (combined >= req) {
+                free_list_remove(next_phys);
+                blk->size = combined;
+                hal_irq_restore(irqflags);
+                return ptr;
+            }
         }
+        hal_irq_restore(irqflags);
     }
-    asm volatile("sti");
 
     /* Fallback: allocate new block, copy data, free old block. */
     void *new_ptr = kmalloc(new_size);
