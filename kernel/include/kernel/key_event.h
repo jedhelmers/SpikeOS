@@ -21,6 +21,9 @@ typedef enum {
     KEY_SHIFT_UP,
 
     KEY_CTRL_C,
+    KEY_CTRL_S,
+    KEY_CTRL_X,
+    KEY_CTRL_K,
 
     KEY_PAGE_UP,
     KEY_PAGE_DOWN,

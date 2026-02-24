@@ -5,6 +5,7 @@
 #include <kernel/mouse.h>
 #include <kernel/heap.h>
 #include <kernel/vfs.h>
+#include <kernel/timer.h>
 #include <string.h>
 
 #define FONT_W 8
@@ -36,15 +37,30 @@ static int desktop_dir_valid = 0;
 static window_t *dragging_win = NULL;
 static window_t *resizing_win = NULL;
 
+/* Dropdown menu state */
+static window_t *dropdown_win = NULL;
+static int dropdown_menu_idx = -1;
+static int dropdown_from_deskbar = 0;  /* 1 = opened from deskbar, 0 = from window menubar */
+
+/* Double-click tracking for desktop icons */
+static uint32_t last_icon_click_tick = 0;
+static int last_icon_click_idx = -1;
+#define DBLCLICK_TICKS 50  /* 500ms at 100Hz */
+
+/* Forward declaration for gui_editor_open (weak — may not be linked yet) */
+extern void gui_editor_open(const char *filename) __attribute__((weak));
+
 /* ------------------------------------------------------------------ */
 /*  Content rect                                                       */
 /* ------------------------------------------------------------------ */
 
 void wm_update_content_rect(window_t *win) {
+    uint32_t menu_h = (win->menu_count > 0) ? WM_MENUBAR_H : 0;
+
     win->content_x = (uint32_t)win->x + WIN_BORDER_W;
-    win->content_y = (uint32_t)win->y + WIN_TITLEBAR_H + WIN_BORDER_W;
+    win->content_y = (uint32_t)win->y + WIN_TITLEBAR_H + WIN_BORDER_W + menu_h;
     win->content_w = win->w - 2 * WIN_BORDER_W;
-    win->content_h = win->h - WIN_TITLEBAR_H - 2 * WIN_BORDER_W;
+    win->content_h = win->h - WIN_TITLEBAR_H - 2 * WIN_BORDER_W - menu_h;
 
     /* Snap content to character grid */
     win->content_w = (win->content_w / FONT_W) * FONT_W;
@@ -86,7 +102,8 @@ static void wm_draw_desktop_icons(void) {
 
     uint32_t cell_w = ICON_W + ICON_PAD_X;
     uint32_t cell_h = ICON_H + ICON_PAD_Y;
-    uint32_t max_rows = (fb_info.height - ICON_PAD_Y) / cell_h;
+    uint32_t icons_top = WM_DESKBAR_H + ICON_PAD_Y;  /* below desktop bar */
+    uint32_t max_rows = (fb_info.height - icons_top) / cell_h;
     if (max_rows == 0) max_rows = 1;
 
     uint32_t icon_idx = 0;
@@ -106,7 +123,7 @@ static void wm_draw_desktop_icons(void) {
         uint32_t row = icon_idx % max_rows;
 
         uint32_t cx = ICON_PAD_X + col * cell_w;
-        uint32_t cy = ICON_PAD_Y + row * cell_h;
+        uint32_t cy = icons_top + row * cell_h;
 
         /* Determine type */
         vfs_inode_t *child = vfs_get_inode(entries[i].inode);
@@ -148,11 +165,122 @@ static void wm_draw_desktop_icons(void) {
 }
 
 /* ------------------------------------------------------------------ */
+/*  Icon hit-testing                                                   */
+/* ------------------------------------------------------------------ */
+
+/* Returns the icon index (skipping . and ..) at screen coords, or -1 */
+static int icon_at(int32_t mx, int32_t my) {
+    if (!desktop_dir_valid) return -1;
+
+    vfs_inode_t *dir = vfs_get_inode(desktop_dir_ino);
+    if (!dir || dir->type != VFS_TYPE_DIR) return -1;
+
+    vfs_dirent_t *entries = (vfs_dirent_t *)dir->data;
+    uint32_t count = dir->size;
+
+    uint32_t cell_w = ICON_W + ICON_PAD_X;
+    uint32_t cell_h = ICON_H + ICON_PAD_Y;
+    uint32_t icons_top = WM_DESKBAR_H + ICON_PAD_Y;
+    uint32_t max_rows = (fb_info.height - icons_top) / cell_h;
+    if (max_rows == 0) max_rows = 1;
+
+    int icon_idx = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        if (entries[i].name[0] == '.' &&
+            (entries[i].name[1] == '\0' ||
+             (entries[i].name[1] == '.' && entries[i].name[2] == '\0')))
+            continue;
+
+        uint32_t col = (uint32_t)icon_idx / max_rows;
+        uint32_t row = (uint32_t)icon_idx % max_rows;
+
+        uint32_t cx = ICON_PAD_X + col * cell_w;
+        uint32_t cy = icons_top + row * cell_h;
+
+        if (mx >= (int32_t)cx && mx < (int32_t)(cx + ICON_W) &&
+            my >= (int32_t)cy && my < (int32_t)(cy + ICON_H))
+            return icon_idx;
+
+        icon_idx++;
+    }
+    return -1;
+}
+
+/* Get the dirent for icon_idx (skipping . and ..) */
+static vfs_dirent_t *icon_dirent(int idx) {
+    if (!desktop_dir_valid || idx < 0) return NULL;
+
+    vfs_inode_t *dir = vfs_get_inode(desktop_dir_ino);
+    if (!dir || dir->type != VFS_TYPE_DIR) return NULL;
+
+    vfs_dirent_t *entries = (vfs_dirent_t *)dir->data;
+    uint32_t count = dir->size;
+
+    int icon_idx = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        if (entries[i].name[0] == '.' &&
+            (entries[i].name[1] == '\0' ||
+             (entries[i].name[1] == '.' && entries[i].name[2] == '\0')))
+            continue;
+
+        if (icon_idx == idx) return &entries[i];
+        icon_idx++;
+    }
+    return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Desktop bar (macOS-style global menu bar at screen top)            */
+/* ------------------------------------------------------------------ */
+
+void wm_draw_deskbar(void) {
+    uint32_t bar_bg  = fb_pack_color(40, 40, 48);
+    uint32_t bar_fg  = fb_pack_color(200, 200, 200);
+    uint32_t bar_sep = fb_pack_color(60, 60, 68);
+    uint32_t bold_fg = fb_pack_color(255, 255, 255);
+
+    fb_fill_rect(0, 0, fb_info.width, WM_DESKBAR_H, bar_bg);
+    fb_draw_hline(0, WM_DESKBAR_H - 1, fb_info.width, bar_sep);
+
+    uint32_t tx = 10;
+    uint32_t ty = (WM_DESKBAR_H - FONT_H) / 2;
+
+    /* Find focused window */
+    window_t *focused = NULL;
+    for (window_t *w = win_top; w; w = w->prev) {
+        if (w->flags & WIN_FLAG_FOCUSED) { focused = w; break; }
+    }
+
+    /* Draw app name (bold: render shifted by 1px) */
+    const char *app = focused ? focused->title : "SpikeOS";
+    for (int i = 0; app[i]; i++) {
+        fb_render_char_px(tx, ty, (uint8_t)app[i], bold_fg, bar_bg);
+        fb_render_char_px(tx + 1, ty, (uint8_t)app[i], bold_fg, bar_bg);
+        tx += FONT_W;
+    }
+
+    tx += FONT_W * 2;  /* gap after app name */
+
+    /* Draw menu labels from focused window */
+    if (focused && focused->menu_count > 0) {
+        for (int m = 0; m < focused->menu_count; m++) {
+            const char *label = focused->menus[m].label;
+            for (int c = 0; label[c]; c++) {
+                fb_render_char_px(tx, ty, (uint8_t)label[c], bar_fg, bar_bg);
+                tx += FONT_W;
+            }
+            tx += FONT_W * 2;  /* gap between menus */
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /*  Desktop                                                            */
 /* ------------------------------------------------------------------ */
 
 void wm_draw_desktop(void) {
     fb_fill_rect(0, 0, fb_info.width, fb_info.height, desktop_color);
+    wm_draw_deskbar();
     wm_draw_desktop_icons();
 }
 
@@ -228,6 +356,39 @@ static void draw_aa_corner(uint32_t ox, uint32_t oy, uint32_t r,
 }
 
 /* ------------------------------------------------------------------ */
+/*  Per-window menu bar                                                */
+/* ------------------------------------------------------------------ */
+
+static void wm_draw_window_menubar(window_t *win) {
+    if (win->menu_count <= 0) return;
+
+    uint32_t mb_x = (uint32_t)win->x + WIN_BORDER_W;
+    uint32_t mb_y = (uint32_t)win->y + WIN_TITLEBAR_H + WIN_BORDER_W;
+    uint32_t mb_w = win->w - 2 * WIN_BORDER_W;
+    uint32_t mb_h = WM_MENUBAR_H;
+
+    uint32_t mb_bg  = fb_pack_color(50, 50, 65);
+    uint32_t mb_fg  = fb_pack_color(200, 200, 200);
+    uint32_t mb_sep = fb_pack_color(70, 70, 80);
+
+    fb_fill_rect(mb_x, mb_y, mb_w, mb_h, mb_bg);
+    fb_draw_hline(mb_x, mb_y + mb_h - 1, mb_w, mb_sep);
+
+    uint32_t tx = mb_x + 8;
+    uint32_t ty = mb_y + (mb_h - FONT_H) / 2;
+
+    for (int m = 0; m < win->menu_count; m++) {
+        const char *label = win->menus[m].label;
+        for (int c = 0; label[c]; c++) {
+            if (tx + FONT_W > mb_x + mb_w) break;
+            fb_render_char_px(tx, ty, (uint8_t)label[c], mb_fg, mb_bg);
+            tx += FONT_W;
+        }
+        tx += FONT_W * 2;  /* gap between menus */
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /*  Window chrome                                                      */
 /* ------------------------------------------------------------------ */
 
@@ -288,6 +449,9 @@ void wm_draw_chrome(window_t *win) {
                           win->title_fg_color, win->title_bg_color);
         text_px += FONT_W;
     }
+
+    /* --- Per-window menu bar --- */
+    wm_draw_window_menubar(win);
 }
 
 /* ------------------------------------------------------------------ */
@@ -316,7 +480,13 @@ window_t *wm_create_window(int32_t x, int32_t y, uint32_t w, uint32_t h,
     win->body_bg_color  = fb_pack_color(0, 0, 0);
     win->border_color   = fb_pack_color(100, 102, 110);
 
+    /* Defocus all existing windows before focusing the new one */
+    for (window_t *w = win_bottom; w; w = w->next)
+        w->flags &= ~WIN_FLAG_FOCUSED;
+
     win->flags = WIN_FLAG_VISIBLE | WIN_FLAG_FOCUSED | WIN_FLAG_DRAGGABLE | WIN_FLAG_RESIZABLE;
+    win->menu_count = 0;
+    win->repaint = NULL;
     win->next = NULL;
     win->prev = NULL;
 
@@ -356,6 +526,12 @@ void wm_destroy_window(window_t *win) {
     if (win == dragging_win)  dragging_win = NULL;
     if (win == resizing_win)  resizing_win = NULL;
 
+    /* Clear dropdown if it referenced this window */
+    if (win == dropdown_win) {
+        dropdown_win = NULL;
+        dropdown_menu_idx = -1;
+    }
+
     kfree(win);
 
     /* Focus the new top window */
@@ -385,6 +561,211 @@ window_t *wm_get_shell_window(void) { return shell_win; }
 window_t *wm_get_top_window(void)   { return win_top; }
 
 /* ------------------------------------------------------------------ */
+/*  Menu helpers                                                       */
+/* ------------------------------------------------------------------ */
+
+wm_menu_t *wm_window_add_menu(window_t *win, const char *label) {
+    if (!win || win->menu_count >= WM_MENU_MAX_MENUS) return NULL;
+
+    wm_menu_t *m = &win->menus[win->menu_count++];
+    int i;
+    for (i = 0; i < WM_MENU_LABEL_MAX - 1 && label[i]; i++)
+        m->label[i] = label[i];
+    m->label[i] = '\0';
+    m->item_count = 0;
+
+    /* Recalculate content rect since menu bar presence may have changed */
+    wm_update_content_rect(win);
+
+    return m;
+}
+
+void wm_menu_add_item(wm_menu_t *menu, const char *label,
+                       wm_menu_action_t action, void *ctx) {
+    if (!menu || menu->item_count >= WM_MENU_MAX_ITEMS) return;
+
+    wm_menu_item_t *item = &menu->items[menu->item_count++];
+    int i;
+    for (i = 0; i < WM_MENU_LABEL_MAX - 1 && label[i]; i++)
+        item->label[i] = label[i];
+    item->label[i] = '\0';
+    item->action = action;
+    item->ctx = ctx;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Dropdown rendering                                                 */
+/* ------------------------------------------------------------------ */
+
+/* Compute the X position of each menu label in the deskbar (for click hit-testing).
+   Returns the X position of the label at index menu_idx.
+   If menu_idx < 0, returns 0. */
+static uint32_t deskbar_menu_x(window_t *focused, int menu_idx) {
+    uint32_t tx = 10;
+
+    /* Skip past app name */
+    const char *app = focused ? focused->title : "SpikeOS";
+    for (int i = 0; app[i]; i++) tx += FONT_W;
+    tx += FONT_W * 2;  /* gap after app name */
+
+    for (int m = 0; m < menu_idx && focused && m < focused->menu_count; m++) {
+        const char *label = focused->menus[m].label;
+        for (int c = 0; label[c]; c++) tx += FONT_W;
+        tx += FONT_W * 2;  /* gap */
+    }
+    return tx;
+}
+
+/* Compute the X position of each menu label in the per-window menu bar. */
+static uint32_t winmenu_label_x(window_t *win, int menu_idx) {
+    uint32_t tx = (uint32_t)win->x + WIN_BORDER_W + 8;
+    for (int m = 0; m < menu_idx && m < win->menu_count; m++) {
+        const char *label = win->menus[m].label;
+        for (int c = 0; label[c]; c++) tx += FONT_W;
+        tx += FONT_W * 2;
+    }
+    return tx;
+}
+
+static uint32_t menu_label_width(const char *label) {
+    uint32_t w = 0;
+    while (*label) { w += FONT_W; label++; }
+    return w;
+}
+
+static void wm_draw_dropdown(void) {
+    if (!dropdown_win || dropdown_menu_idx < 0 ||
+        dropdown_menu_idx >= dropdown_win->menu_count)
+        return;
+
+    wm_menu_t *menu = &dropdown_win->menus[dropdown_menu_idx];
+    if (menu->item_count == 0) return;
+
+    /* Compute dropdown position */
+    uint32_t dd_x, dd_y;
+
+    if (dropdown_from_deskbar) {
+        dd_x = deskbar_menu_x(dropdown_win, dropdown_menu_idx);
+        dd_y = WM_DESKBAR_H;
+    } else {
+        dd_x = winmenu_label_x(dropdown_win, dropdown_menu_idx);
+        dd_y = (uint32_t)dropdown_win->y + WIN_TITLEBAR_H + WIN_BORDER_W + WM_MENUBAR_H;
+    }
+
+    /* Compute dropdown dimensions */
+    uint32_t item_h = FONT_H + 4;
+    uint32_t dd_w = 0;
+    for (int i = 0; i < menu->item_count; i++) {
+        uint32_t lw = menu_label_width(menu->items[i].label);
+        if (lw + 16 > dd_w) dd_w = lw + 16;  /* 8px padding each side */
+    }
+    if (dd_w < 80) dd_w = 80;
+    uint32_t dd_h = (uint32_t)menu->item_count * item_h + 4;  /* 2px top/bottom padding */
+
+    /* Clamp to screen */
+    if (dd_x + dd_w > fb_info.width) dd_x = fb_info.width - dd_w;
+
+    /* Draw dropdown background and border */
+    uint32_t dd_bg     = fb_pack_color(50, 50, 58);
+    uint32_t dd_border = fb_pack_color(80, 80, 90);
+    uint32_t dd_fg     = fb_pack_color(220, 220, 220);
+
+    fb_fill_rect(dd_x, dd_y, dd_w, dd_h, dd_bg);
+    fb_draw_rect(dd_x, dd_y, dd_w, dd_h, dd_border);
+
+    /* Draw items */
+    for (int i = 0; i < menu->item_count; i++) {
+        uint32_t iy = dd_y + 2 + (uint32_t)i * item_h;
+        uint32_t ix = dd_x + 8;
+        const char *label = menu->items[i].label;
+        for (int c = 0; label[c]; c++) {
+            fb_render_char_px(ix, iy + 2, (uint8_t)label[c], dd_fg, dd_bg);
+            ix += FONT_W;
+        }
+    }
+}
+
+static void dropdown_close(void) {
+    dropdown_win = NULL;
+    dropdown_menu_idx = -1;
+    dropdown_from_deskbar = 0;
+    wm_redraw_all();
+}
+
+/* Test if (mx, my) hits a dropdown item. Returns item index or -1. */
+static int dropdown_hit_item(int32_t mx, int32_t my) {
+    if (!dropdown_win || dropdown_menu_idx < 0 ||
+        dropdown_menu_idx >= dropdown_win->menu_count)
+        return -1;
+
+    wm_menu_t *menu = &dropdown_win->menus[dropdown_menu_idx];
+    if (menu->item_count == 0) return -1;
+
+    uint32_t dd_x, dd_y;
+    if (dropdown_from_deskbar) {
+        dd_x = deskbar_menu_x(dropdown_win, dropdown_menu_idx);
+        dd_y = WM_DESKBAR_H;
+    } else {
+        dd_x = winmenu_label_x(dropdown_win, dropdown_menu_idx);
+        dd_y = (uint32_t)dropdown_win->y + WIN_TITLEBAR_H + WIN_BORDER_W + WM_MENUBAR_H;
+    }
+
+    uint32_t item_h = FONT_H + 4;
+    uint32_t dd_w = 0;
+    for (int i = 0; i < menu->item_count; i++) {
+        uint32_t lw = menu_label_width(menu->items[i].label);
+        if (lw + 16 > dd_w) dd_w = lw + 16;
+    }
+    if (dd_w < 80) dd_w = 80;
+    uint32_t dd_h = (uint32_t)menu->item_count * item_h + 4;
+
+    if (dd_x + dd_w > fb_info.width) dd_x = fb_info.width - dd_w;
+
+    if (mx < (int32_t)dd_x || mx >= (int32_t)(dd_x + dd_w) ||
+        my < (int32_t)dd_y || my >= (int32_t)(dd_y + dd_h))
+        return -1;
+
+    int idx = ((int32_t)my - (int32_t)dd_y - 2) / (int32_t)item_h;
+    if (idx < 0 || idx >= menu->item_count) return -1;
+    return idx;
+}
+
+/* Test if (mx, my) hits a deskbar menu label. Returns menu index or -1. */
+static int deskbar_hit_menu(int32_t mx, int32_t my) {
+    if (my < 0 || my >= (int32_t)WM_DESKBAR_H) return -1;
+
+    window_t *focused = NULL;
+    for (window_t *w = win_top; w; w = w->prev) {
+        if (w->flags & WIN_FLAG_FOCUSED) { focused = w; break; }
+    }
+    if (!focused || focused->menu_count == 0) return -1;
+
+    for (int m = 0; m < focused->menu_count; m++) {
+        uint32_t lx = deskbar_menu_x(focused, m);
+        uint32_t lw = menu_label_width(focused->menus[m].label);
+        if (mx >= (int32_t)lx && mx < (int32_t)(lx + lw))
+            return m;
+    }
+    return -1;
+}
+
+/* Test if (mx, my) hits a per-window menu bar label. Returns menu index or -1. */
+static int winmenu_hit_menu(window_t *win, int32_t mx, int32_t my) {
+    if (!win || win->menu_count == 0) return -1;
+
+    uint32_t mb_y = (uint32_t)win->y + WIN_TITLEBAR_H + WIN_BORDER_W;
+    if (my < (int32_t)mb_y || my >= (int32_t)(mb_y + WM_MENUBAR_H)) return -1;
+
+    for (int m = 0; m < win->menu_count; m++) {
+        uint32_t lx = winmenu_label_x(win, m);
+        uint32_t lw = menu_label_width(win->menus[m].label);
+        if (mx >= (int32_t)lx && mx < (int32_t)(lx + lw))
+            return m;
+    }
+    return -1;
+}
+
+/* ------------------------------------------------------------------ */
 /*  Redraw                                                             */
 /* ------------------------------------------------------------------ */
 
@@ -396,12 +777,17 @@ void wm_redraw_all(void) {
     for (window_t *w = win_bottom; w; w = w->next) {
         if (w->flags & WIN_FLAG_VISIBLE) {
             wm_draw_chrome(w);
-            /* Repaint content for the shell window (others would need their
-               own repaint callbacks — for now, only shell has one) */
-            if (w == shell_win)
+            /* Call per-window repaint callback */
+            if (w->repaint)
+                w->repaint(w);
+            else if (w == shell_win)
                 fb_console_repaint();
         }
     }
+
+    /* Draw dropdown on top of everything */
+    if (dropdown_win && dropdown_menu_idx >= 0)
+        wm_draw_dropdown();
 
     mouse_show_cursor();
 }
@@ -424,20 +810,25 @@ static int hit_window(window_t *win, int32_t mx, int32_t my) {
            my >= win->y && my < win->y + (int32_t)win->h;
 }
 
-/* Detect which resize edges the mouse is near. Returns 0 if not on any edge. */
+/* Detect which resize edges the mouse is near.
+   CORNER-ONLY: returns non-zero only when BOTH a horizontal and vertical
+   edge are within the grip zone (i.e., only corners). */
 static uint32_t hit_resize_edges(window_t *win, int32_t mx, int32_t my) {
     if (!(win->flags & WIN_FLAG_RESIZABLE)) return 0;
     if (!hit_window(win, mx, my)) return 0;
 
-    uint32_t edges = 0;
+    uint32_t h_edge = 0, v_edge = 0;
     int32_t grip = WIN_RESIZE_GRIP;
 
-    if (mx < win->x + grip)                          edges |= RESIZE_LEFT;
-    if (mx >= win->x + (int32_t)win->w - grip)       edges |= RESIZE_RIGHT;
-    if (my < win->y + grip)                           edges |= RESIZE_TOP;
-    if (my >= win->y + (int32_t)win->h - grip)        edges |= RESIZE_BOTTOM;
+    if (mx < win->x + grip)                          h_edge = RESIZE_LEFT;
+    if (mx >= win->x + (int32_t)win->w - grip)       h_edge = RESIZE_RIGHT;
+    if (my < win->y + grip)                           v_edge = RESIZE_TOP;
+    if (my >= win->y + (int32_t)win->h - grip)        v_edge = RESIZE_BOTTOM;
 
-    return edges;
+    /* Both axes must be in grip zone (corner only) */
+    if (h_edge && v_edge)
+        return h_edge | v_edge;
+    return 0;
 }
 
 /* Find the topmost window at (mx, my), searching top-to-bottom */
@@ -489,7 +880,7 @@ static void drag_move(window_t *win, int32_t mx, int32_t my) {
     /* Clamp so title bar stays partially on screen */
     if (new_x < -(int32_t)(win->w - 40)) new_x = -(int32_t)(win->w - 40);
     if (new_x > (int32_t)fb_info.width - 40) new_x = (int32_t)fb_info.width - 40;
-    if (new_y < 0) new_y = 0;
+    if (new_y < (int32_t)WM_DESKBAR_H) new_y = (int32_t)WM_DESKBAR_H;
     if (new_y > (int32_t)fb_info.height - (int32_t)WIN_TITLEBAR_H)
         new_y = (int32_t)fb_info.height - (int32_t)WIN_TITLEBAR_H;
 
@@ -518,6 +909,7 @@ static void drag_move(window_t *win, int32_t mx, int32_t my) {
     }
 
     /* Redraw desktop icons (lightweight — only icons, not the full background) */
+    wm_draw_deskbar();
     wm_draw_desktop_icons();
 
     /* Update position */
@@ -528,8 +920,11 @@ static void drag_move(window_t *win, int32_t mx, int32_t my) {
     /* Draw chrome at new position */
     wm_draw_chrome(win);
 
-    /* Repaint content from character buffer */
-    fb_console_repaint();
+    /* Repaint content via callback */
+    if (win->repaint)
+        win->repaint(win);
+    else if (win == shell_win)
+        fb_console_repaint();
 
     mouse_show_cursor();
 }
@@ -604,6 +999,7 @@ static void resize_move(window_t *win, int32_t mx, int32_t my) {
                          (uint32_t)ow, (uint32_t)oh, desktop_color);
     }
 
+    wm_draw_deskbar();
     wm_draw_desktop_icons();
 
     /* Apply new geometry */
@@ -618,7 +1014,12 @@ static void resize_move(window_t *win, int32_t mx, int32_t my) {
         fb_console_bind_window(win);
 
     wm_draw_chrome(win);
-    fb_console_repaint();
+
+    /* Repaint content via callback */
+    if (win->repaint)
+        win->repaint(win);
+    else if (win == shell_win)
+        fb_console_repaint();
 
     mouse_show_cursor();
 }
@@ -636,11 +1037,49 @@ int wm_process_events(void) {
     event_t e = event_poll();
     if (e.type == EVENT_NONE) return 0;
 
-    /* Left-click: find the topmost window under the mouse */
+    /* --- Left-click --- */
     if (e.type == EVENT_MOUSE_BUTTON && e.mouse_button.pressed &&
         (e.mouse_button.button & MOUSE_BTN_LEFT)) {
 
-        window_t *hit = wm_window_at(e.mouse_button.x, e.mouse_button.y);
+        int32_t mx = e.mouse_button.x;
+        int32_t my = e.mouse_button.y;
+
+        /* If a dropdown is open, check for item click first */
+        if (dropdown_win && dropdown_menu_idx >= 0) {
+            int item = dropdown_hit_item(mx, my);
+            if (item >= 0) {
+                wm_menu_t *menu = &dropdown_win->menus[dropdown_menu_idx];
+                wm_menu_action_t action = menu->items[item].action;
+                void *ctx = menu->items[item].ctx;
+                dropdown_close();
+                if (action) action(ctx);
+                return 1;
+            }
+            /* Click outside dropdown — close it */
+            dropdown_close();
+            /* Fall through to handle the click normally */
+        }
+
+        /* Check deskbar click (menu labels) */
+        if (my < (int32_t)WM_DESKBAR_H) {
+            int menu_hit = deskbar_hit_menu(mx, my);
+            if (menu_hit >= 0) {
+                window_t *focused = NULL;
+                for (window_t *w = win_top; w; w = w->prev) {
+                    if (w->flags & WIN_FLAG_FOCUSED) { focused = w; break; }
+                }
+                if (focused) {
+                    dropdown_win = focused;
+                    dropdown_menu_idx = menu_hit;
+                    dropdown_from_deskbar = 1;
+                    wm_redraw_all();
+                }
+            }
+            return 1;
+        }
+
+        /* Find topmost window under mouse */
+        window_t *hit = wm_window_at(mx, my);
         if (hit) {
             /* Click-to-focus: bring to front if not already on top */
             if (hit != win_top) {
@@ -648,19 +1087,30 @@ int wm_process_events(void) {
                 wm_redraw_all();
             }
 
-            /* Check for resize grip first (edges/corners) */
-            uint32_t edges = hit_resize_edges(hit,
-                                e.mouse_button.x, e.mouse_button.y);
+            /* Check per-window menu bar click */
+            if (hit->menu_count > 0) {
+                int wmenu = winmenu_hit_menu(hit, mx, my);
+                if (wmenu >= 0) {
+                    dropdown_win = hit;
+                    dropdown_menu_idx = wmenu;
+                    dropdown_from_deskbar = 0;
+                    wm_redraw_all();
+                    return 1;
+                }
+            }
+
+            /* Check for resize grip first (corners only) */
+            uint32_t edges = hit_resize_edges(hit, mx, my);
             if (edges) {
-                resize_begin(hit, e.mouse_button.x, e.mouse_button.y, edges);
+                resize_begin(hit, mx, my, edges);
                 resizing_win = hit;
                 return 1;
             }
 
             /* Check traffic light dots before starting drag */
-            if (hit_titlebar(hit, e.mouse_button.x, e.mouse_button.y)) {
-                int32_t rel_x = e.mouse_button.x - hit->x;
-                int32_t rel_y = e.mouse_button.y - hit->y;
+            if (hit_titlebar(hit, mx, my)) {
+                int32_t rel_x = mx - hit->x;
+                int32_t rel_y = my - hit->y;
 
                 /* Close dot — set flag; owner checks and cleans up */
                 if ((rel_x - WIN_DOT_CLOSE_X) * (rel_x - WIN_DOT_CLOSE_X) +
@@ -696,9 +1146,9 @@ int wm_process_events(void) {
                         hit->saved_w = hit->w;
                         hit->saved_h = hit->h;
                         hit->x = 0;
-                        hit->y = 0;
+                        hit->y = (int32_t)WM_DESKBAR_H;
                         hit->w = fb_info.width;
-                        hit->h = fb_info.height;
+                        hit->h = fb_info.height - WM_DESKBAR_H;
                         hit->flags |= WIN_FLAG_MAXIMIZED;
                     }
                     wm_update_content_rect(hit);
@@ -710,10 +1160,44 @@ int wm_process_events(void) {
 
                 /* No dot hit — start drag */
                 if (hit->flags & WIN_FLAG_DRAGGABLE) {
-                    drag_begin(hit, e.mouse_button.x, e.mouse_button.y);
+                    drag_begin(hit, mx, my);
                     dragging_win = hit;
                 }
             }
+            return 1;
+        }
+
+        /* No window hit — check desktop icon click */
+        int icon = icon_at(mx, my);
+        if (icon >= 0) {
+            uint32_t now = timer_ticks();
+            if (icon == last_icon_click_idx &&
+                (now - last_icon_click_tick) < DBLCLICK_TICKS) {
+                /* Double-click on icon */
+                last_icon_click_idx = -1;
+
+                vfs_dirent_t *de = icon_dirent(icon);
+                if (de) {
+                    vfs_inode_t *node = vfs_get_inode(de->inode);
+                    if (node && node->type == VFS_TYPE_FILE) {
+                        /* Build full path */
+                        char path[128];
+                        int plen = 0;
+                        const char *dp = DESKTOP_PATH;
+                        while (*dp && plen < 126) path[plen++] = *dp++;
+                        path[plen++] = '/';
+                        const char *nm = de->name;
+                        while (*nm && plen < 126) path[plen++] = *nm++;
+                        path[plen] = '\0';
+
+                        if (gui_editor_open)
+                            gui_editor_open(path);
+                    }
+                }
+                return 1;
+            }
+            last_icon_click_idx = icon;
+            last_icon_click_tick = now;
             return 1;
         }
     }

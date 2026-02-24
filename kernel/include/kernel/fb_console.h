@@ -41,6 +41,10 @@ void fb_console_page_down(void);
 /* Returns 1 if framebuffer console is active */
 int fb_console_active(void);
 
+/* Get console grid dimensions (character columns and rows) */
+uint32_t fb_console_get_cols(void);
+uint32_t fb_console_get_rows(void);
+
 /* Direct character rendering at grid position (no cursor/console state needed).
    Used by boot splash before fb_console_init(). */
 void fb_render_char(uint32_t gx, uint32_t gy, uint8_t ch,
