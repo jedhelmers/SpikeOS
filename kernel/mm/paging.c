@@ -8,6 +8,7 @@
 uint32_t page_directory[PAGE_ENTRIES] __attribute__((aligned(PAGE_SIZE)));
 uint32_t first_page_table[PAGE_ENTRIES] __attribute__((aligned(PAGE_SIZE)));
 uint32_t second_page_table[PAGE_ENTRIES] __attribute__((aligned(PAGE_SIZE)));
+uint32_t third_page_table[PAGE_ENTRIES] __attribute__((aligned(PAGE_SIZE)));
 
 static uint32_t frame_bitmap[MAX_FRAMES / 32];
 
@@ -59,14 +60,15 @@ void paging_init() {
     page_directory[KERNEL_PDE_INDEX] = fpt_phys | PAGE_PRESENT | PAGE_WRITABLE;
 
     // Pre-allocate PDE[769] for the kernel heap region (0xC0400000–0xC07FFFFF).
-    // Using the statically-allocated second_page_table avoids the map_page()
-    // new-table-allocation path, which has issues with physical vs virtual addresses.
+    // Using a statically-allocated page table avoids alloc_frame() before heap is ready.
     memset(second_page_table, 0, sizeof(second_page_table));
     uint32_t spt_phys = (uint32_t)second_page_table - KERNEL_VMA_OFFSET;
     page_directory[769] = spt_phys | PAGE_PRESENT | PAGE_WRITABLE;
 
-    // Optional: map page dir itself recursively (helps later for dynamic mapping)
-    // page_directory[1023] = (uint32_t)page_directory | PAGE_PRESENT | PAGE_WRITABLE;
+    // Pre-allocate PDE[770] for the framebuffer region (0xC0800000–0xC0BFFFFF).
+    memset(third_page_table, 0, sizeof(third_page_table));
+    uint32_t tpt_phys = (uint32_t)third_page_table - KERNEL_VMA_OFFSET;
+    page_directory[770] = tpt_phys | PAGE_PRESENT | PAGE_WRITABLE;
 }
 uint32_t virt_to_phys(uint32_t virt) {
     uint32_t pd_index = virt >> 22;
@@ -80,9 +82,11 @@ uint32_t virt_to_phys(uint32_t virt) {
         return 0;
     }
 
-    uint32_t* pt = (uint32_t*)(pde & 0xFFFFF000);
-
+    /* Use temp_map to access the page table by its physical address. */
+    uint32_t pt_phys = pde & 0xFFFFF000;
+    uint32_t *pt = (uint32_t *)temp_map(pt_phys);
     uint32_t pte = pt[pt_index];
+    temp_unmap();
 
     if (!(pte & PAGE_PRESENT)) {
         printf("PTE not present!\n");
@@ -115,7 +119,7 @@ uint32_t alloc_frame() {
         }
     }
 
-    return 0;
+    return FRAME_ALLOC_FAIL;
 }
 
 void free_frame(uint32_t phys) {
@@ -127,10 +131,17 @@ void free_frame(uint32_t phys) {
  * Temp mapping: map any physical frame at TEMP_MAP_VADDR (0xC03FF000).
  * Uses PTE[1023] of first_page_table. Since first_page_table is in
  * kernel BSS (physical < 4MB, identity-mapped), we can write to it directly.
+ *
+ * Interrupts are disabled for the duration of a temp mapping to prevent
+ * re-entrancy (only one temp slot exists). temp_unmap restores the
+ * previous interrupt state.
  */
 #define TEMP_MAP_PTE_INDEX 1023
 
+static uint32_t temp_map_irq_flags;
+
 void *temp_map(uint32_t phys_frame) {
+    temp_map_irq_flags = hal_irq_save();
     first_page_table[TEMP_MAP_PTE_INDEX] = phys_frame | PAGE_PRESENT | PAGE_WRITABLE;
     hal_tlb_invalidate(TEMP_MAP_VADDR);
     return (void *)TEMP_MAP_VADDR;
@@ -139,6 +150,7 @@ void *temp_map(uint32_t phys_frame) {
 void temp_unmap(void) {
     first_page_table[TEMP_MAP_PTE_INDEX] = 0;
     hal_tlb_invalidate(TEMP_MAP_VADDR);
+    hal_irq_restore(temp_map_irq_flags);
 }
 
 /*
@@ -147,7 +159,7 @@ void temp_unmap(void) {
  */
 uint32_t pgdir_create(void) {
     uint32_t pd_phys = alloc_frame();
-    if (pd_phys == 0) return 0;
+    if (pd_phys == FRAME_ALLOC_FAIL) return 0;
 
     uint32_t *pd = (uint32_t *)temp_map(pd_phys);
     memcpy(pd, page_directory, PAGE_SIZE);
@@ -166,6 +178,7 @@ void pgdir_destroy(uint32_t pd_phys) {
 
     uint32_t fpt_phys = (uint32_t)first_page_table - KERNEL_VMA_OFFSET;
     uint32_t spt_phys = (uint32_t)second_page_table - KERNEL_VMA_OFFSET;
+    uint32_t tpt_phys = (uint32_t)third_page_table - KERNEL_VMA_OFFSET;
 
     for (int i = 1; i < 768; i++) {
         /* Temp-map PD, read one PDE, temp-unmap */
@@ -178,7 +191,7 @@ void pgdir_destroy(uint32_t pd_phys) {
         uint32_t pt_phys = pde & 0xFFFFF000;
 
         /* Skip shared kernel page tables */
-        if (pt_phys == fpt_phys || pt_phys == spt_phys) continue;
+        if (pt_phys == fpt_phys || pt_phys == spt_phys || pt_phys == tpt_phys) continue;
 
         /* Free all frames referenced by this page table */
         for (int j = 0; j < PAGE_ENTRIES; j++) {
@@ -206,7 +219,7 @@ void pgdir_destroy(uint32_t pd_phys) {
         uint32_t pt_phys = pde & 0xFFFFF000;
 
         /* Only free if it's NOT a shared kernel page table */
-        if (pt_phys != fpt_phys && pt_phys != spt_phys) {
+        if (pt_phys != fpt_phys && pt_phys != spt_phys && pt_phys != tpt_phys) {
             /* This is a cloned kernel PT — free the clone but NOT the frames
                (they're kernel frames, still in use by the kernel's PD) */
             free_frame(pt_phys);
@@ -229,6 +242,7 @@ int pgdir_map_user_page(uint32_t pd_phys, uint32_t virt, uint32_t phys,
 
     uint32_t fpt_phys = (uint32_t)first_page_table - KERNEL_VMA_OFFSET;
     uint32_t spt_phys = (uint32_t)second_page_table - KERNEL_VMA_OFFSET;
+    uint32_t tpt_phys = (uint32_t)third_page_table - KERNEL_VMA_OFFSET;
 
     /* Read the PDE */
     uint32_t *pd = (uint32_t *)temp_map(pd_phys);
@@ -237,7 +251,7 @@ int pgdir_map_user_page(uint32_t pd_phys, uint32_t virt, uint32_t phys,
     if (!(pde & PAGE_PRESENT)) {
         /* Allocate a new page table */
         uint32_t pt_phys = alloc_frame();
-        if (pt_phys == 0) { temp_unmap(); return -1; }
+        if (pt_phys == FRAME_ALLOC_FAIL) { temp_unmap(); return -1; }
 
         pd[pd_index] = pt_phys | PAGE_PRESENT | PAGE_WRITABLE | (flags & PAGE_USER);
         temp_unmap();
@@ -254,9 +268,9 @@ int pgdir_map_user_page(uint32_t pd_phys, uint32_t virt, uint32_t phys,
 
     /* If PDE points to a shared kernel PT and we need PAGE_USER, clone it */
     if ((flags & PAGE_USER) &&
-        (pt_phys == fpt_phys || pt_phys == spt_phys)) {
+        (pt_phys == fpt_phys || pt_phys == spt_phys || pt_phys == tpt_phys)) {
         uint32_t new_pt_phys = alloc_frame();
-        if (new_pt_phys == 0) { temp_unmap(); return -1; }
+        if (new_pt_phys == FRAME_ALLOC_FAIL) { temp_unmap(); return -1; }
 
         /* Update the PDE to point to the clone */
         pd[pd_index] = new_pt_phys | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
@@ -264,7 +278,8 @@ int pgdir_map_user_page(uint32_t pd_phys, uint32_t virt, uint32_t phys,
 
         /* Copy from the original kernel PT (accessible via identity map) */
         uint32_t *orig_pt = (pt_phys == fpt_phys) ? first_page_table
-                                                   : second_page_table;
+                          : (pt_phys == spt_phys)  ? second_page_table
+                                                   : third_page_table;
 
         uint32_t *new_pt = (uint32_t *)temp_map(new_pt_phys);
         memcpy(new_pt, orig_pt, PAGE_SIZE);
@@ -282,21 +297,30 @@ int pgdir_map_user_page(uint32_t pd_phys, uint32_t virt, uint32_t phys,
     return 0;
 }
 
-void map_page(uint32_t virt, uint32_t phys, uint32_t flags) {
+int map_page(uint32_t virt, uint32_t phys, uint32_t flags) {
     uint32_t pd_index = virt >> 22;
     uint32_t pt_index = (virt >> 12) & 0x3FF;
 
     if (!(page_directory[pd_index] & PAGE_PRESENT)) {
         uint32_t new_table = alloc_frame();
+        if (new_table == FRAME_ALLOC_FAIL) return -1;
         page_directory[pd_index] = new_table | PAGE_PRESENT | PAGE_WRITABLE;
 
-        memset((void*)new_table, 0, PAGE_SIZE);
+        /* Use temp_map to zero the new page table — the physical address
+           may be above 4MB and not identity-mapped. */
+        uint32_t *pt = (uint32_t *)temp_map(new_table);
+        memset(pt, 0, PAGE_SIZE);
+        temp_unmap();
     }
 
-    uint32_t* table = (uint32_t*)(page_directory[pd_index] & 0xFFFFF000);
+    /* Use temp_map to access the page table by its physical address. */
+    uint32_t pt_phys = page_directory[pd_index] & 0xFFFFF000;
+    uint32_t *table = (uint32_t *)temp_map(pt_phys);
     table[pt_index] = phys | flags;
+    temp_unmap();
 
     hal_tlb_invalidate(virt);
+    return 0;
 }
 
 /*

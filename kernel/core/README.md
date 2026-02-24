@@ -13,6 +13,8 @@ CPU core management and kernel entry point.
 
 ## How It Fits Together
 
-`kernel_main()` initializes all subsystems in order: GDT, TSS, IDT, PIC, paging, heap, initrd, ATA, VFS, SpikeFS, timer, processes, keyboard, UART, then starts the shell as a kernel thread.
+`kernel_main()` initializes all subsystems in order: GDT, TSS, IDT, PIC, paging, heap, framebuffer, initrd, ATA, VFS, SpikeFS, fd/pipe/event, process/scheduler, then timer + device IRQs, boot splash, window manager, and finally the shell as a kernel thread.
+
+**Critical ordering**: `process_init()` and `scheduler_init()` must complete before `timer_init()` + `pic_clear_mask(0)`, because the timer IRQ triggers `scheduler_tick()` which requires `current_process` and `kernel_cr3` to be initialized. All syscalls validate user pointers (reject addresses >= `KERNEL_VMA_OFFSET`).
 
 All interrupts flow through `isr_common_handler()` in `isr.c`, which dispatches to exception handlers, the syscall table, or registered IRQ handlers. The scheduler integrates via the timer IRQ returning a new stack pointer for context switching.

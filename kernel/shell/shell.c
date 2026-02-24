@@ -14,6 +14,9 @@
 #include <kernel/mutex.h>
 #include <kernel/condvar.h>
 #include <kernel/rwlock.h>
+#include <kernel/event.h>
+#include <kernel/mouse.h>
+#include <kernel/window.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -78,6 +81,7 @@ void shell_readline(void) {
         key_event_t c = keyboard_get_event();
 
         if (c.type == KEY_NONE) {
+            wm_process_events();
             __asm__ volatile ("hlt");
             continue;
         }
@@ -427,9 +431,50 @@ static int test_rwlock(void) {
     return pass;
 }
 
+static int test_mouse(void) {
+    int pass = 1;
+
+    printf("  mouse_get_state()... ");
+    mouse_state_t ms = mouse_get_state();
+    printf("[PASS] x=%d y=%d buttons=0x%x\n", ms.x, ms.y, ms.buttons);
+
+    printf("  Move the mouse or click within 5 seconds...\n");
+
+    uint32_t timeout = timer_ticks() + 500;  /* 5 seconds at 100Hz */
+    int got_mouse = 0;
+
+    while (timer_ticks() < timeout) {
+        event_t e = event_poll();
+        if (e.type == EVENT_MOUSE_MOVE) {
+            printf("  [PASS] MOUSE_MOVE x=%d y=%d dx=%d dy=%d\n",
+                   e.mouse_move.x, e.mouse_move.y,
+                   e.mouse_move.dx, e.mouse_move.dy);
+            got_mouse = 1;
+            break;
+        } else if (e.type == EVENT_MOUSE_BUTTON) {
+            printf("  [PASS] MOUSE_BUTTON x=%d y=%d btn=0x%x %s\n",
+                   e.mouse_button.x, e.mouse_button.y,
+                   e.mouse_button.button,
+                   e.mouse_button.pressed ? "pressed" : "released");
+            got_mouse = 1;
+            break;
+        }
+        hal_irq_enable();
+        hal_halt();
+    }
+
+    if (!got_mouse) {
+        printf("  [FAIL] no mouse event within 5 seconds\n");
+        pass = 0;
+    }
+
+    return pass;
+}
+
 static void run_tests(int which) {
     /* which: 0=all, 1=fd, 2=pipe, 3=sleep, 4=stat, 5=waitpid, 6=stdin,
-             7=mutex, 8=sem, 9=signal, 10=cwd, 11=condvar, 12=rwlock */
+             7=mutex, 8=sem, 9=signal, 10=cwd, 11=condvar, 12=rwlock,
+             13=mouse */
     int total = 0, passed = 0;
 
     if (which == 0 || which == 1) {
@@ -504,6 +549,12 @@ static void run_tests(int which) {
         total++; if (r) passed++;
         printf("  result: %s\n\n", r ? "PASS" : "FAIL");
     }
+    if (which == 13) {
+        printf("[test mouse]\n");
+        int r = test_mouse();
+        total++; if (r) passed++;
+        printf("  result: %s\n\n", r ? "PASS" : "FAIL");
+    }
 
     if (which == 0) {
         printf("=== %d/%d tests passed ===\n", passed, total);
@@ -550,6 +601,8 @@ void shell_execute(void) {
         printf("  mkdir <name>   - create directory\n");
         printf("  touch <name>   - create empty file\n");
         printf("  rm <name>      - remove file or empty directory\n");
+        printf("  rm -r <name>   - remove directory recursively\n");
+        printf("  rename <o> <n> - rename file or directory\n");
         printf("  cat <name>     - display file contents\n");
         printf("  write <n> <t>  - write text to file\n");
         printf("  mv <src> <dst> - move/rename\n");
@@ -624,13 +677,20 @@ void shell_execute(void) {
         }
     }
 
-    /* ---- rm ---- */
+    /* ---- rm [-r] ---- */
     else if (strncmp(line_buf, "rm ", 3) == 0) {
-        const char *name = shell_arg(line_buf, 2);
-        if (!name) {
-            printf("Usage: rm <name>\n");
-        } else if (vfs_remove(name) != 0) {
-            printf("rm: failed to remove '%s'\n", name);
+        const char *args = shell_arg(line_buf, 2);
+        if (!args) {
+            printf("Usage: rm [-r] <name>\n");
+        } else if (strncmp(args, "-r ", 3) == 0) {
+            const char *name = shell_arg(args, 2);
+            if (!name) {
+                printf("Usage: rm -r <name>\n");
+            } else if (vfs_remove_recursive(name) != 0) {
+                printf("rm: failed to remove '%s'\n", name);
+            }
+        } else if (vfs_remove(args) != 0) {
+            printf("rm: failed to remove '%s'\n", args);
         }
     }
 
@@ -717,6 +777,22 @@ void shell_execute(void) {
                 printf("Usage: mv <src> <dst>\n");
             } else if (vfs_rename(src, dst) != 0) {
                 printf("mv: failed\n");
+            }
+        }
+    }
+
+    /* ---- rename <old> <new> ---- */
+    else if (strncmp(line_buf, "rename ", 7) == 0) {
+        const char *args = shell_arg(line_buf, 6);
+        if (!args) {
+            printf("Usage: rename <old> <new>\n");
+        } else {
+            const char *old_name, *new_name;
+            shell_split_args(args, &old_name, &new_name);
+            if (!new_name) {
+                printf("Usage: rename <old> <new>\n");
+            } else if (vfs_rename(old_name, new_name) != 0) {
+                printf("rename: failed\n");
             }
         }
     }
@@ -870,8 +946,11 @@ void shell_execute(void) {
     else if (strcmp(line_buf, "test rwlock") == 0) {
         run_tests(12);
     }
+    else if (strcmp(line_buf, "test mouse") == 0) {
+        run_tests(13);
+    }
     else if (strcmp(line_buf, "test") == 0) {
-        printf("Usage: test <fd|pipe|sleep|stat|stdin|waitpid|mutex|sem|signal|cwd|condvar|rwlock|all>\n");
+        printf("Usage: test <fd|pipe|sleep|stat|stdin|waitpid|mutex|sem|signal|cwd|condvar|rwlock|mouse|all>\n");
     }
 
     /* ---- clear ---- */

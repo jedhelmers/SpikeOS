@@ -13,6 +13,29 @@
 #include <string.h>
 #include <stdio.h>
 
+#define USER_STACK_VADDR 0xBFFFF000u
+
+/* ------------------------------------------------------------------ */
+/*  User pointer validation                                           */
+/* ------------------------------------------------------------------ */
+
+/* Reject pointers into kernel space. User processes (via int 0x80)
+   must only pass addresses below KERNEL_VMA_OFFSET. */
+static int bad_user_ptr(const void *ptr, uint32_t len) {
+    if (!ptr) return 1;
+    uint32_t addr = (uint32_t)ptr;
+    if (addr >= KERNEL_VMA_OFFSET) return 1;
+    if (len > 0 && addr + len > KERNEL_VMA_OFFSET) return 1;
+    if (len > 0 && addr + len < addr) return 1;  /* overflow */
+    return 0;
+}
+
+static int bad_user_string(const char *str) {
+    if (!str) return 1;
+    if ((uint32_t)str >= KERNEL_VMA_OFFSET) return 1;
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /*  SYS_EXIT (0) — terminate calling process                          */
 /* ------------------------------------------------------------------ */
@@ -22,26 +45,7 @@ static int32_t sys_exit(trapframe *tf) {
     int32_t status = (int32_t)tf->ebx;
 
     current_process->exit_status = status;
-    current_process->state = PROC_ZOMBIE;
-
-    /* Close all file descriptors */
-    fd_close_all(current_process->fds);
-
-    /* Free per-process page directory */
-    if (current_process->cr3 != 0) {
-        hal_set_cr3(get_kernel_cr3());
-        pgdir_destroy(current_process->cr3);
-        current_process->cr3 = 0;
-    }
-
-    /* Wake parent if it's waiting on waitpid */
-    for (int i = 0; i < MAX_PROCS; i++) {
-        if (proc_table[i].pid == current_process->parent_pid &&
-            proc_table[i].state != PROC_ZOMBIE) {
-            wake_up_all(&proc_table[i].wait_children);
-            break;
-        }
-    }
+    proc_kill(current_process->pid);
 
     hal_irq_enable();
     for (;;) hal_halt();
@@ -56,6 +60,7 @@ static int32_t sys_write(trapframe *tf) {
     const void *buf   = (const void *)tf->ecx;
     uint32_t len      = tf->edx;
 
+    if (bad_user_ptr(buf, len)) return -1;
     return fd_write(fd, buf, len);
 }
 
@@ -68,6 +73,7 @@ static int32_t sys_read(trapframe *tf) {
     void *buf    = (void *)tf->ecx;
     uint32_t len = tf->edx;
 
+    if (bad_user_ptr(buf, len)) return -1;
     return fd_read(fd, buf, len);
 }
 
@@ -80,6 +86,7 @@ static int32_t sys_open(trapframe *tf) {
     const char *path = (const char *)tf->ebx;
     uint32_t flags   = tf->ecx;
 
+    if (bad_user_string(path)) return -1;
     return (int32_t)fd_open(path, flags);
 }
 
@@ -114,6 +121,9 @@ static int32_t sys_seek(trapframe *tf) {
 static int32_t sys_stat(trapframe *tf) {
     const char *path       = (const char *)tf->ebx;
     struct spike_stat *buf = (struct spike_stat *)tf->ecx;
+
+    if (bad_user_string(path)) return -1;
+    if (bad_user_ptr(buf, sizeof(struct spike_stat))) return -1;
 
     int32_t ino = vfs_resolve(path, NULL, NULL);
     if (ino < 0) return -1;
@@ -158,14 +168,50 @@ static int32_t sys_sleep(trapframe *tf) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  SYS_BRK (9) — adjust process break (stub for now)                */
+/*  SYS_BRK (9) — adjust process break                               */
 /*  EBX = new break address (0 = query current break)                 */
+/*  Returns current/new break on success, old break on failure.       */
 /* ------------------------------------------------------------------ */
 
 static int32_t sys_brk(trapframe *tf) {
-    (void)tf;
-    /* Stub: user-mode heap not implemented yet */
-    return -1;
+    uint32_t new_brk = tf->ebx;
+    uint32_t cur_brk = current_process->brk;
+
+    /* Kernel threads have no user address space */
+    if (current_process->cr3 == 0) return -1;
+
+    /* Query: return current break */
+    if (new_brk == 0) return (int32_t)cur_brk;
+
+    /* Reject: can't shrink below initial program image */
+    if (new_brk < cur_brk) return (int32_t)cur_brk;
+
+    /* Reject: can't grow into kernel space or stack region */
+    if (new_brk >= USER_STACK_VADDR) return (int32_t)cur_brk;
+
+    /* Page-align the new break upward */
+    uint32_t new_brk_page = (new_brk + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    uint32_t cur_brk_page = (cur_brk + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+
+    /* Map any new pages needed between old and new break */
+    for (uint32_t pv = cur_brk_page; pv < new_brk_page; pv += PAGE_SIZE) {
+        uint32_t frame = alloc_frame();
+        if (frame == FRAME_ALLOC_FAIL) return (int32_t)cur_brk;
+
+        if (pgdir_map_user_page(current_process->cr3, pv, frame,
+                                PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER) != 0) {
+            free_frame(frame);
+            return (int32_t)cur_brk;
+        }
+
+        /* Zero the new page */
+        uint8_t *p = (uint8_t *)temp_map(frame);
+        memset(p, 0, PAGE_SIZE);
+        temp_unmap();
+    }
+
+    current_process->brk = new_brk;
+    return (int32_t)new_brk;
 }
 
 /* ------------------------------------------------------------------ */
@@ -179,6 +225,8 @@ struct process *elf_spawn(const char *name);
 
 static int32_t sys_spawn(trapframe *tf) {
     const char *path = (const char *)tf->ebx;
+
+    if (bad_user_string(path)) return -1;
 
     struct process *child = elf_spawn(path);
     if (!child) return -1;
@@ -197,6 +245,9 @@ static int32_t sys_spawn(trapframe *tf) {
 static int32_t sys_waitpid(trapframe *tf) {
     int32_t target_pid   = (int32_t)tf->ebx;
     int32_t *status_ptr  = (int32_t *)tf->ecx;
+
+    /* status_ptr is nullable, but if non-NULL it must be in user space */
+    if (status_ptr && bad_user_ptr(status_ptr, sizeof(int32_t))) return -1;
 
     while (1) {
         /* Search for a zombie child matching the target */
@@ -242,6 +293,7 @@ static int32_t sys_waitpid(trapframe *tf) {
 
 static int32_t sys_mkdir(trapframe *tf) {
     const char *path = (const char *)tf->ebx;
+    if (bad_user_string(path)) return -1;
     return vfs_mkdir(path);
 }
 
@@ -252,6 +304,7 @@ static int32_t sys_mkdir(trapframe *tf) {
 
 static int32_t sys_unlink(trapframe *tf) {
     const char *path = (const char *)tf->ebx;
+    if (bad_user_string(path)) return -1;
     return (int32_t)vfs_remove(path);
 }
 
@@ -262,6 +315,7 @@ static int32_t sys_unlink(trapframe *tf) {
 
 static int32_t sys_chdir(trapframe *tf) {
     const char *path = (const char *)tf->ebx;
+    if (bad_user_string(path)) return -1;
     return (int32_t)vfs_chdir(path);
 }
 
@@ -274,6 +328,8 @@ static int32_t sys_chdir(trapframe *tf) {
 static int32_t sys_getcwd(trapframe *tf) {
     char *buf        = (char *)tf->ebx;
     uint32_t bufsize = tf->ecx;
+
+    if (bad_user_ptr(buf, bufsize)) return -1;
 
     const char *cwd = vfs_get_cwd_path();
     uint32_t len = (uint32_t)strlen(cwd) + 1;
@@ -290,7 +346,7 @@ static int32_t sys_getcwd(trapframe *tf) {
 
 static int32_t sys_pipe(trapframe *tf) {
     int *fds = (int *)tf->ebx;
-    if (!fds) return -1;
+    if (bad_user_ptr(fds, 2 * sizeof(int))) return -1;
 
     int read_fd, write_fd;
     if (pipe_create(&read_fd, &write_fd) != 0)

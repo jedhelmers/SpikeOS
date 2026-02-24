@@ -6,8 +6,12 @@
 #include <kernel/tty.h>
 #include <kernel/vga13.h>
 #include <kernel/io.h>
+#include <kernel/fb_console.h>
 
 #include "vga.h"
+
+/* Console backend: 0 = VGA text mode (default), 1 = framebuffer */
+static int use_fb = 0;
 
 static const size_t VGA_WIDTH  =  80;
 static const size_t VGA_HEIGHT =  25;
@@ -166,6 +170,10 @@ void terminal_initialize(void) {
 }
 
 void terminal_clear(void) {
+    if (use_fb) {
+        fb_console_clear();
+        return;
+    }
     sb_head = 0;
     sb_count = 0;
     sb_offset = 0;
@@ -258,6 +266,11 @@ void terminal_putchar(char c) {
 }
 
 void terminal_write(const char* data, size_t size) {
+    if (use_fb) {
+        fb_console_write(data, size);
+        return;
+    }
+
     // Iterate through each char in the data
     for (size_t i = 0; i < size; i++) {
         // Handle special chars
@@ -327,6 +340,11 @@ static void terminal_redraw_scrollback(void) {
 }
 
 void terminal_page_up(void) {
+    if (use_fb) {
+        fb_console_page_up();
+        return;
+    }
+
     if (sb_count == 0) return;
 
     /* Save current screen on first scroll-back */
@@ -343,6 +361,11 @@ void terminal_page_up(void) {
 }
 
 void terminal_page_down(void) {
+    if (use_fb) {
+        fb_console_page_down();
+        return;
+    }
+
     if (sb_offset == 0) return;
 
     sb_offset -= (int)VGA_HEIGHT;
@@ -359,4 +382,9 @@ void terminal_page_down(void) {
     }
 
     terminal_redraw_scrollback();
+}
+
+void terminal_switch_to_fb(void) {
+    if (fb_console_active())
+        use_fb = 1;
 }

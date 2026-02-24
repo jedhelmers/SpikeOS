@@ -23,6 +23,11 @@
 #include <kernel/boot_splash.h>
 #include <kernel/fd.h>
 #include <kernel/pipe.h>
+#include <kernel/window.h>
+#include <kernel/framebuffer.h>
+#include <kernel/fb_console.h>
+#include <kernel/event.h>
+#include <kernel/mouse.h>
 
 extern void kprint_howdy(void);
 extern void paging_enable(uint32_t);
@@ -210,15 +215,31 @@ void kernel_main(void) {
     printf("CR0 = %x\n", cr0);
 #endif
 
+    /* Save framebuffer info from multiboot before heap (just stores values) */
+    {
+        uint32_t mb_phys = multiboot_info_ptr;
+        if (mb_phys != 0)
+            fb_save_info((struct multiboot_info *)mb_phys);
+    }
+
     heap_init();
 #ifdef VERBOSE_BOOT
     printf("INIT Kernel Heap\n");
+#endif
+
+    /* Map framebuffer into kernel VA (needs paging + heap) */
+    fb_init();
+#ifdef VERBOSE_BOOT
+    if (fb_info.available)
+        printf("INIT Framebuffer (%dx%dx%d at 0x%x)\n",
+               fb_info.width, fb_info.height, fb_info.bpp, fb_info.phys_addr);
 #endif
 
     /* Parse Multiboot info to find initrd module */
     uint32_t mb_info_phys = multiboot_info_ptr;
     if (mb_info_phys != 0) {
         struct multiboot_info *mb = (struct multiboot_info *)mb_info_phys;
+
         if ((mb->flags & MB_FLAG_MODS) && mb->mods_count > 0) {
             struct multiboot_mod_entry *mods =
                 (struct multiboot_mod_entry *)mb->mods_addr;
@@ -253,56 +274,92 @@ void kernel_main(void) {
 #endif
     spikefs_init();
 
-#ifdef VERBOSE_BOOT
-    printf("INIT IRQ0 (Timer)\n");
-#endif
-    timer_init(100);
-    pic_clear_mask(0);
-#ifdef VERBOSE_BOOT
-    printf("PIC: UNMASK Timer (enable hardware interrupt)\n");
-#endif
-
     fd_init();
     pipe_init();
+    event_init();
 #ifdef VERBOSE_BOOT
-    printf("INIT File Descriptor & Pipe Tables\n");
+    printf("INIT File Descriptors / Pipes / Events\n");
 #endif
 
-#ifdef VERBOSE_BOOT
-    printf("INIT Process\n");
-#endif
     process_init();
+#ifdef VERBOSE_BOOT
+    printf("INIT Process Table\n");
+#endif
 
+    scheduler_init();
 #ifdef VERBOSE_BOOT
     printf("INIT Scheduler\n");
 #endif
-    scheduler_init();
 
+    /* Timer and IRQ unmask AFTER process/scheduler are ready,
+       because IRQ0 triggers scheduler_tick() which needs
+       current_process and kernel_cr3 to be initialized. */
+    timer_init(100);
+    pic_clear_mask(0);
 #ifdef VERBOSE_BOOT
-    printf("INIT IRQ1 (Keyboard)\n");
+    printf("INIT Timer (100 Hz) + IRQ0 unmasked\n");
 #endif
+
     keyboard_init();
     pic_clear_mask(1);
 #ifdef VERBOSE_BOOT
-    printf("PIC: UNMASK Keyboard (enable hardware interrupt)\n");
+    printf("INIT Keyboard + IRQ1 unmasked\n");
 #endif
 
+    mouse_init();
 #ifdef VERBOSE_BOOT
-    printf("INIT UART (COM1)\n");
+    printf("INIT Mouse\n");
 #endif
+
     uart_init();
     irq_install_handler(4, uart_irq_handler);
     pic_clear_mask(4);
 #ifdef VERBOSE_BOOT
-    printf("PIC: UNMASK UART (IRQ4)\n");
-    printf("Kernel end: %x\n", (uint32_t)&endkernel);
+    printf("INIT UART + IRQ4 unmasked\n");
+#endif
+
+    fb_enable();
+#ifdef VERBOSE_BOOT
+    printf("INIT Framebuffer enable\n");
 #endif
 
     /* Show boot splash (only in non-verbose mode) */
 #ifndef VERBOSE_BOOT
     boot_splash();
-    terminal_clear();
 #endif
+
+    /* Init window manager and framebuffer console */
+    wm_init();
+    fb_console_init();
+
+    /* Create shell window — 80% width, 50% height, centered horizontally */
+    if (fb_info.available) {
+        uint32_t content_w = (fb_info.width * 4 / 5);
+        uint32_t content_h = (fb_info.height / 2);
+        content_w = (content_w / 8) * 8;
+        content_h = (content_h / 16) * 16;
+
+        uint32_t outer_w = content_w + 2 * WIN_BORDER_W;
+        uint32_t outer_h = content_h + WIN_TITLEBAR_H + 2 * WIN_BORDER_W;
+        int32_t  outer_x = ((int32_t)fb_info.width - (int32_t)outer_w) / 2;
+        int32_t  outer_y = (int32_t)fb_info.height - (int32_t)outer_h - 16;
+
+        window_t *win = wm_create_window(outer_x, outer_y,
+                                         outer_w, outer_h, "SpikeOS Shell");
+        fb_console_bind_window(win);
+    }
+
+    fb_console_setcolor(14, 0);  /* yellow text on black background */
+    terminal_switch_to_fb();
+
+    /* Draw desktop + window chrome, then clear content area */
+    if (fb_info.available) {
+        wm_draw_desktop();
+        wm_draw_chrome(wm_get_shell_window());
+    }
+    terminal_clear();
+
+    mouse_show_cursor();
 
     // ring3_test_perprocess();
     proc_create_kernel_thread(shell_run);

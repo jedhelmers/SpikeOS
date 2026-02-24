@@ -59,6 +59,7 @@ cat .debug.log    # Inspect UART debug output during or after a run
 - Physical frame allocator: bitmap over `MAX_FRAMES = 16384` frames (64 MB addressable)
 - `endkernel` linker symbol marks end of kernel image (used to reserve physical frames)
 - Kernel heap at `0xC0400000` (PDE[769]), up to 4 MB, first-fit free-list allocator
+- Framebuffer at `0xC0800000` (PDE[770]), up to 4 MB, mapped when GRUB provides GOP/VBE framebuffer
 
 ### GDT Layout
 
@@ -75,26 +76,36 @@ cat .debug.log    # Inspect UART debug output during or after a run
 
 All init `printf` calls are wrapped in `#ifdef VERBOSE_BOOT`. Without the flag, init is silent and a retro boot splash is shown instead.
 
+**Critical ordering**: process/scheduler init must complete before timer IRQ is unmasked, because IRQ0 triggers `scheduler_tick()` which requires `current_process` and `kernel_cr3`.
+
 1. `terminal_initialize()` — VGA 80x25 text mode (includes `vga_set_mode3()` for UEFI compatibility)
 2. `gdt_init()` — 6-entry GDT (null, kernel code/data, user code/data, TSS placeholder)
 3. `tss_init()` — TSS with `ss0=0x10`, `esp0` set to current kernel stack
 4. `idt_init()` — 256-vector IDT, including syscall gate at vector 0x80 (DPL=3)
-5. `pic_remap(0x20, 0x28)` — remap PIC IRQs away from CPU exceptions
+5. `pic_remap(0x20, 0x28)` — remap PIC IRQs away from CPU exceptions, all masked
 6. `paging_init()` + `paging_enable()` — enable CR0.PG, switch to higher-half
 7. `heap_init()` — kernel heap allocator (kmalloc/kfree)
-8. `initrd_init()` — parse GRUB module into file entry table
+7a. `fb_save_info()` + `fb_init()` — save framebuffer info, map into kernel VA
+8. `initrd_init()` — parse GRUB module
 9. `ata_init()` — ATA PIO disk driver (primary master, 28-bit LBA)
 10. `vfs_init(64)` — in-memory inode filesystem (starts with 64 slots, grows on demand up to 8192)
 11. `vfs_import_initrd()` — copy initrd files into VFS root
 12. `spikefs_init()` — load filesystem from disk (or format if blank/incompatible)
-13. `timer_init(100)` — 100 Hz preemptive timer on IRQ0
-14. `fd_init()` / `pipe_init()` — zero the system-wide open file table and pipe pool
-15. `process_init()` / `scheduler_init()` — process table (max 32) + round-robin scheduler
-16. `keyboard_init()` — keyboard on IRQ1
-17. `uart_init()` — COM1 serial on IRQ4
-18. `boot_splash()` — 1980s-style animated boot screen (only without `VERBOSE_BOOT`), waits for key press
-19. `proc_create_kernel_thread(shell_run)` — start the kernel shell
-20. `sti` — enable interrupts
+13. `fd_init()` / `pipe_init()` / `event_init()` — zero open file table, pipe pool, event queue
+14. `process_init()` — process table (max 32), sets `kernel_cr3` and `current_process`
+15. `scheduler_init()` — round-robin scheduler state
+16. `timer_init(100)` + `pic_clear_mask(0)` — 100 Hz timer on IRQ0 (**safe: process/scheduler ready**)
+17. `keyboard_init()` + `pic_clear_mask(1)` — keyboard on IRQ1
+18. `mouse_init()` — PS/2 mouse on IRQ12 (no-op if no framebuffer)
+19. `uart_init()` + `pic_clear_mask(4)` — COM1 serial on IRQ4
+20. `fb_enable()` — switch framebuffer to XRGB8888 mode
+21. `boot_splash()` — 1980s-style animated boot screen (only without `VERBOSE_BOOT`)
+22. `wm_init()` + `fb_console_init()` — window manager and framebuffer text console
+23. `terminal_switch_to_fb()` — switch to framebuffer console (no-op if FB unavailable)
+24. `terminal_clear()` — clear screen
+25. `mouse_show_cursor()` — display mouse cursor
+26. `proc_create_kernel_thread(shell_run)` — start the kernel shell
+27. `sti` — enable interrupts
 
 ### Directory Structure
 
@@ -104,7 +115,7 @@ All init `printf` calls are wrapped in `#ifdef VERBOSE_BOOT`. Without the flag, 
 | `kernel/core/` | Kernel entry, GDT, IDT, ISR, TSS, syscall dispatch |
 | `kernel/mm/` | Paging (page directory/tables, frame allocator, page fault handler) and heap allocator |
 | `kernel/fs/` | VFS, SpikeFS on-disk filesystem, initrd, file descriptors, pipes |
-| `kernel/drivers/` | ATA disk, keyboard, UART, PIC, timer, VGA mode 13h, debug log |
+| `kernel/drivers/` | ATA disk, keyboard, UART, PIC, timer, VGA mode 13h, framebuffer, FB console, mouse, event queue, window manager, debug log |
 | `kernel/proc/` | Process table, scheduler, ELF loader, wait queues, mutex/semaphore |
 | `kernel/shell/` | Kernel shell, Tetris, boot splash |
 | `kernel/include/kernel/` | All kernel headers (flat) |
@@ -128,10 +139,10 @@ All init `printf` calls are wrapped in `#ifdef VERBOSE_BOOT`. Without the flag, 
 
 - Two-level page tables: `page_directory[1024]` -> `page_table[1024]`
 - `paging_init()` sets up identity map (PDE[0]) + higher-half map (PDE[768]) + heap table (PDE[769])
-- `map_page(virt, phys, flags)` — dynamic mapping with `invlpg` TLB invalidation
-- `alloc_frame()` / `free_frame()` — bitmap physical frame allocator
-- `virt_to_phys(vaddr)` — walk page tables to resolve physical address
-- `temp_map(phys)` / `temp_unmap()` — temporary mapping window at `0xC03FF000` for accessing physical frames that aren't identity-mapped
+- `map_page(virt, phys, flags)` — dynamic mapping with `invlpg` TLB invalidation; uses `temp_map()` for safe page table access; returns 0 on success, -1 on failure
+- `alloc_frame()` / `free_frame()` — bitmap physical frame allocator; returns `FRAME_ALLOC_FAIL` (0xFFFFFFFF) on OOM
+- `virt_to_phys(vaddr)` — walk page tables via `temp_map()` for safe access
+- `temp_map(phys)` / `temp_unmap()` — interrupt-safe temporary mapping window at `0xC03FF000` for accessing physical frames that aren't identity-mapped
 
 ### Per-Process Page Directories
 
@@ -145,7 +156,8 @@ All init `printf` calls are wrapped in `#ifdef VERBOSE_BOOT`. Without the flag, 
 
 - First-fit free-list with block splitting and forward/backward coalescing
 - `kmalloc(size)` / `kfree(ptr)` / `kcalloc(n, size)` / `krealloc(ptr, size)`
-- 16-byte aligned, interrupt-safe (cli/sti around critical sections)
+- 16-byte aligned, interrupt-safe (`hal_irq_save/restore` — preserves caller's interrupt state)
+- `heap_grow()` has partial-failure rollback if frame allocation fails mid-grow
 - `heap_dump()` — debug output, used by `meminfo` shell command
 
 ### TSS (Task State Segment)
@@ -171,7 +183,7 @@ All init `printf` calls are wrapped in `#ifdef VERBOSE_BOOT`. Without the flag, 
 | 6 | `SYS_STAT` | EBX=path, ECX=&stat | Get file info (type, size, inode, nlink) |
 | 7 | `SYS_GETPID` | — | Return current PID |
 | 8 | `SYS_SLEEP` | EBX=ticks | Sleep for N ticks (10ms each) |
-| 9 | `SYS_BRK` | EBX=addr | Adjust process break (stub) |
+| 9 | `SYS_BRK` | EBX=addr | Adjust user heap break (maps new pages; `brk(0)` queries current break) |
 | 10 | `SYS_SPAWN` | EBX=name | Spawn ELF (VFS first, then initrd) |
 | 11 | `SYS_WAITPID` | EBX=pid, ECX=&status | Wait for child to exit |
 | 12 | `SYS_MKDIR` | EBX=path | Create directory |
@@ -185,14 +197,18 @@ All init `printf` calls are wrapped in `#ifdef VERBOSE_BOOT`. Without the flag, 
 ### Process & Scheduling
 
 - Process states: `NEW -> READY -> RUNNING -> BLOCKED -> ZOMBIE`
-- Each process has its own kernel stack (4 KB), saved CPU context (ESP/EBP), page directory (CR3), file descriptor table (16 fds), cwd inode, and pending signal bitmask
+- Each process has its own kernel stack (4 KB), saved CPU context (ESP/EBP), page directory (CR3), file descriptor table (16 fds), cwd inode, pending signal bitmask, and `brk` (program break for user heap)
 - Process hierarchy: parent_pid, exit_status, wait queue for waitpid blocking
+- Zombie reaping: process creation reaps orphan zombies when the table is full before failing
 - Round-robin scheduler, timer-driven (fires on each IRQ0 tick at 100 Hz)
 - `proc_create_kernel_thread(fn)` — create a kernel-mode thread, initializes stdin/stdout/stderr
 - `proc_create_user_process(pd_phys, eip, esp)` — create a ring-3 process with its own page directory
-- `elf_spawn(name)` — spawn user process (VFS first, then initrd fallback), sets parent_pid
-- `proc_signal(pid, sig)` — send signal to process (all signals currently fatal)
+- `elf_spawn(name)` — spawn user process (VFS first, then initrd fallback), sets parent_pid; ELF loader initializes `p->brk` to end of highest PT_LOAD segment
+- `proc_kill(pid)` — interrupt-safe, switches to kernel CR3 before destroying user PD, closes all fds
+- `proc_signal(pid, sig)` — send signal to process (all signals currently fatal); zombie guard prevents double-kill
+- `scheduler_tick()` — NULL guard returns 0 if `current_process` uninitialized; `pick_next()` falls back to idle (PID 0)
 - Context switch: saves trapframe + ESP, picks next READY process, updates TSS esp0, switches CR3 via HAL
+- All syscalls validate user pointers (reject addresses >= `KERNEL_VMA_OFFSET`)
 
 ### Virtual File System (VFS)
 
@@ -204,7 +220,7 @@ In-memory inode-based filesystem (like Linux's page cache). All data lives in km
 - **Directories**: `data` points to a dynamic array of dirents (name + inode number), grows via krealloc
 - **Directory entries**: 64 bytes each (60-byte name + 4-byte inode number)
 - **Root directory**: always inode 0, contains `.` and `..` entries pointing to itself
-- **Path resolution**: iterative walk, starts from root (absolute) or per-process cwd (relative), handles `.` and `..`
+- **Path resolution**: iterative walk, starts from root (absolute) or per-process cwd (relative), handles `.` and `..`; rejects path components exceeding 59 chars
 - **Per-process CWD**: each process has its own `cwd` inode (inherited from parent); falls back to global during early boot
 - **Dirty tracking**: global dirty flag set on any mutation; supports write-back to disk
 - **Link counting**: inodes freed when link count reaches 0
@@ -214,7 +230,7 @@ In-memory inode-based filesystem (like Linux's page cache). All data lives in km
 Polling-based PIO driver for the primary IDE master drive (port 0x1F0).
 
 - `ata_init()` — IDENTIFY command, detects drive presence and sector count
-- `ata_read_sectors()` / `ata_write_sectors()` — 28-bit LBA, 1-255 sectors
+- `ata_read_sectors()` / `ata_write_sectors()` — 28-bit LBA, 1-255 sectors, interrupt-safe (`hal_irq_save/restore`)
 - `ata_flush()` — flush write cache
 - QEMU disk: 64 MiB raw image (`disk.img`, 131072 sectors), attached as IDE primary master
 
@@ -243,15 +259,15 @@ Arch-independent interface (`kernel/include/kernel/hal.h`) with i386 implementat
 
 ### File Descriptors
 
-Per-process fd table (16 fds) backed by a system-wide open file pool (64 entries). Supports VFS files, console (terminal), and pipe endpoints. Each process starts with stdin (0), stdout (1), stderr (2) pointing to the console. Operations: open, close, read, write, seek, dup.
+Per-process fd table (16 fds) backed by a system-wide open file pool (64 entries). Supports VFS files, console (terminal), and pipe endpoints. Each process starts with stdin (0), stdout (1), stderr (2) pointing to the console. Operations: open, close, read, write, seek, dup. Allocation and release are interrupt-safe via `hal_irq_save/restore`.
 
 ### Pipes
 
-Kernel IPC via 512-byte circular buffer. Blocking: read sleeps when empty (via wait queue), write sleeps when full. EOF on read when no writers remain; writing to closed reader sends `SIGPIPE` and returns -1. Created via `pipe_create()` which returns a read/write fd pair.
+Kernel IPC via 512-byte circular buffer. Blocking: read sleeps when empty (via wait queue), write sleeps when full. EOF on read when no writers remain; writing to closed reader sends `SIGPIPE` and returns -1. Created via `pipe_create()` which returns a read/write fd pair. All buffer operations and state changes are interrupt-safe via `hal_irq_save/restore`.
 
 ### Wait Queues
 
-Blocking mechanism for processes. `sleep_on(wq)` sets process to BLOCKED and spins until woken. `wake_up_one(wq)` / `wake_up_all(wq)` set blocked processes back to READY. Used by pipes, waitpid, keyboard blocking, and mutex/semaphore blocking.
+Blocking mechanism for processes. `sleep_on(wq)` sets process to BLOCKED and spins until woken (uses `hal_irq_save/restore` for queue manipulation). `wake_up_one(wq)` / `wake_up_all(wq)` set blocked processes back to READY. Used by pipes, waitpid, keyboard blocking, and mutex/semaphore blocking.
 
 ### Synchronization Primitives
 
@@ -280,6 +296,18 @@ Basic signal delivery (`kernel/include/kernel/signal.h`, `kernel/proc/process.c`
 ### Page Fault Handler
 
 ISR 14 handler reads CR2 (faulting address). User-mode faults send `SIGSEGV` (kills the process) and yield to the scheduler. Kernel-mode faults print a register dump and halt (unrecoverable).
+
+### Framebuffer Console
+
+GOP/VBE linear framebuffer console that activates after the boot splash. The boot splash runs in VGA text mode; after it completes, the kernel switches to pixel-rendered text on the framebuffer (if GRUB provided one).
+
+- Framebuffer driver maps physical FB at `0xC0800000` (PDE[770]) with cache-disable
+- Renders 8x16 CP437 glyphs from embedded font onto pixel framebuffer
+- Visible cursor (solid block) rendered at current position
+- Character grid: `width/8` cols × `height/16` rows (e.g., 128×48 at 1024×768)
+- 16 VGA colors mapped to 32-bit RGB
+- 200-line scrollback ring buffer with Page Up/Down navigation; snaps back to live view on new output
+- BIOS fallback: stays in VGA text mode when framebuffer info is unavailable
 
 ### Terminal & Scrollback
 
@@ -317,7 +345,8 @@ The ISO is a hybrid BIOS+UEFI image. GRUB handles both boot paths — the kernel
 - **BIOS path**: GRUB uses i386-pc modules, loads kernel via Multiboot, VGA already in text mode
 - **UEFI path**: GRUB uses x86_64-efi modules, transitions CPU from long mode to 32-bit protected mode before loading the Multiboot kernel
 - `vga_set_mode3()` handles the UEFI display: disables Bochs VBE, reprograms VGA registers for mode 3 (80x25 text), and loads the embedded 8x16 font into VGA plane 2
-- Known limitation: `vga_set_mode3()` relies on Bochs VBE I/O ports, which only exist on QEMU/Bochs. Real UEFI hardware would need a framebuffer console.
+- After the boot splash, the kernel switches to the GOP framebuffer console for higher-resolution text output
+- Known limitation: `vga_set_mode3()` relies on Bochs VBE I/O ports, which only exist on QEMU/Bochs. The framebuffer console path will work on real UEFI hardware.
 
 ## Shell Commands
 
@@ -363,7 +392,12 @@ Shell prompt shows current working directory: `jedhelmers:/path> `
 | `kernel/fs/fd.c` | File descriptor subsystem: per-process fd table, open/close/read/write/seek |
 | `kernel/fs/pipe.c` | Pipe IPC: circular buffer, blocking read/write |
 | `kernel/fs/initrd.c` | Initial ramdisk: parse GRUB module, file lookup, VFS import |
-| `kernel/drivers/ata.c` | ATA PIO disk driver (primary master, 28-bit LBA) |
+| `kernel/drivers/framebuffer.c` | GOP/VBE framebuffer driver: map to kernel VA, pixel operations, XRGB8888 color |
+| `kernel/drivers/fb_console.c` | Framebuffer text console: glyph rendering, visible cursor, 200-line scrollback |
+| `kernel/drivers/ata.c` | ATA PIO disk driver (primary master, 28-bit LBA), interrupt-safe via HAL |
+| `kernel/drivers/mouse.c` | PS/2 mouse driver on IRQ12, software cursor |
+| `kernel/drivers/event.c` | Unified event queue (keyboard + mouse), interrupt-safe, blocking wait |
+| `kernel/drivers/window.c` | Window manager: linked window list, z-order, click-to-focus, dirty-rect drag |
 | `kernel/proc/process.c` | Process table, kernel thread + user process creation, fd init, process kill |
 | `kernel/proc/scheduler.c` | Round-robin scheduler with CR3 switching (via HAL) |
 | `kernel/proc/wait.c` | Wait queue implementation: sleep_on, wake_up_one, wake_up_all |

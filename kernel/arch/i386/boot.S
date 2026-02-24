@@ -1,19 +1,27 @@
 /* Multiboot header constants */
 .set ALIGN,    1<<0
 .set MEMINFO,  1<<1
-.set FLAGS,    ALIGN | MEMINFO
+.set VIDMODE,  1<<2           /* Request video mode info from GRUB */
+.set FLAGS,    ALIGN | MEMINFO | VIDMODE
 .set MAGIC,    0x1BADB002
 .set CHECKSUM, -(MAGIC + FLAGS)
 
 /*
     Multiboot header – must be in the first 8 KiB of the file.
     Placed in its own section so the linker script can force it first.
+    When VIDMODE is set, GRUB reads the optional video mode fields
+    and tries to provide a linear framebuffer (via VBE or GOP).
 */
 .section .multiboot,"a",@progbits
 .align 4
 .long MAGIC
 .long FLAGS
 .long CHECKSUM
+/* Video mode request fields (required when bit 2 is set): */
+.long 0          /* mode_type: 0 = linear graphics mode */
+.long 1024       /* preferred width */
+.long 768        /* preferred height */
+.long 32         /* preferred depth (bits per pixel) */
 
 /*
     Bootstrap data: boot-time page directory, page table, and stack.

@@ -40,6 +40,7 @@ void process_init(void) {
         proc_table[i].wait_children.head = NULL;
         proc_table[i].cwd = 0;
         proc_table[i].pending_signals = 0;
+        proc_table[i].brk = 0;
         for (int j = 0; j < MAX_FDS; j++)
             proc_table[i].fds[j] = -1;
     }
@@ -73,6 +74,8 @@ struct process *process_ge_table(void) {
 }
 
 void proc_kill(uint32_t pid) {
+    uint32_t irq_flags = hal_irq_save();
+
     for (int i = 1; i < MAX_PROCS; i++) {
         if (proc_table[i].pid == pid && proc_table[i].state != PROC_ZOMBIE) {
             proc_table[i].state = PROC_ZOMBIE;
@@ -82,6 +85,9 @@ void proc_kill(uint32_t pid) {
 
             /* Free per-process page directory if this process has one */
             if (proc_table[i].cr3 != 0) {
+                /* If killing ourselves, switch to kernel CR3 first */
+                if (&proc_table[i] == current_process)
+                    hal_set_cr3(get_kernel_cr3());
                 pgdir_destroy(proc_table[i].cr3);
                 proc_table[i].cr3 = 0;
             }
@@ -96,11 +102,55 @@ void proc_kill(uint32_t pid) {
                 }
             }
 
+            hal_irq_restore(irq_flags);
             printf("[proc] killed PID %d\n", pid);
             return;
         }
     }
+
+    hal_irq_restore(irq_flags);
     printf("[proc] PID %d not found\n", pid);
+}
+
+/*
+ * Try to reclaim zombie process slots whose parent is also dead
+ * (or whose parent is PID 0 / idle).  This prevents process table
+ * exhaustion from accumulated zombies that nobody will waitpid() for.
+ */
+static void reap_orphan_zombies(void) {
+    for (int i = 1; i < MAX_PROCS; i++) {
+        if (proc_table[i].state != PROC_ZOMBIE) continue;
+
+        uint32_t ppid = proc_table[i].parent_pid;
+
+        /* Parent is idle/kernel (PID 0) — always reapable */
+        if (ppid == 0) goto reap;
+
+        /* Check if parent is also dead */
+        int parent_alive = 0;
+        for (int j = 0; j < MAX_PROCS; j++) {
+            if (proc_table[j].pid == ppid &&
+                proc_table[j].state != PROC_ZOMBIE) {
+                parent_alive = 1;
+                break;
+            }
+        }
+        if (parent_alive) continue;
+
+    reap:
+        /* Reset slot so it can be reused */
+        proc_table[i].pid = 0;
+        proc_table[i].tf = NULL;
+        proc_table[i].cr3 = 0;
+        proc_table[i].parent_pid = 0;
+        proc_table[i].exit_status = 0;
+        proc_table[i].pending_signals = 0;
+        proc_table[i].cwd = 0;
+        proc_table[i].brk = 0;
+        proc_table[i].wait_children.head = NULL;
+        for (int j = 0; j < MAX_FDS; j++)
+            proc_table[i].fds[j] = -1;
+    }
 }
 
 struct process *proc_create_kernel_thread(void (*entry)(void)) {
@@ -155,6 +205,16 @@ struct process *proc_create_kernel_thread(void (*entry)(void)) {
         }
     }
 
+    /* Try reaping orphan zombies and retry once */
+    reap_orphan_zombies();
+    for (int i = 1; i < MAX_PROCS; i++) {
+        if (proc_table[i].state == PROC_ZOMBIE) {
+            /* Recurse with the freshly reaped slot available */
+            return proc_create_kernel_thread(entry);
+        }
+    }
+
+    printf("[proc] process table full (max %d)\n", MAX_PROCS);
     return NULL;
 }
 
@@ -213,6 +273,16 @@ struct process *proc_create_user_process(uint32_t pd_phys,
             return p;
         }
     }
+
+    /* Try reaping orphan zombies and retry once */
+    reap_orphan_zombies();
+    for (int i = 1; i < MAX_PROCS; i++) {
+        if (proc_table[i].state == PROC_ZOMBIE) {
+            return proc_create_user_process(pd_phys, user_eip, user_esp);
+        }
+    }
+
+    printf("[proc] process table full (max %d)\n", MAX_PROCS);
     return NULL;
 }
 
@@ -223,6 +293,8 @@ struct process *proc_create_user_process(uint32_t pd_phys,
 int proc_signal(uint32_t pid, int sig) {
     if (sig < 1 || sig >= NSIG) return -1;
 
+    uint32_t irq_flags = hal_irq_save();
+
     for (int i = 0; i < MAX_PROCS; i++) {
         if (proc_table[i].pid == pid &&
             proc_table[i].state != PROC_ZOMBIE) {
@@ -232,14 +304,18 @@ int proc_signal(uint32_t pid, int sig) {
             if (proc_table[i].state == PROC_BLOCKED) {
                 proc_table[i].state = PROC_READY;
             }
+            hal_irq_restore(irq_flags);
             return 0;
         }
     }
+
+    hal_irq_restore(irq_flags);
     return -1;
 }
 
 void signal_check_pending(void) {
     if (!current_process) return;
+    if (current_process->state == PROC_ZOMBIE) return;
     if (current_process->pending_signals == 0) return;
 
     /* Find the first pending signal */
@@ -254,5 +330,10 @@ void signal_check_pending(void) {
     printf("[signal] PID %d killed by signal %d\n",
            current_process->pid, sig);
 
+    current_process->exit_status = 128 + sig;
     proc_kill(current_process->pid);
+
+    /* Process is now zombie — yield to scheduler */
+    hal_irq_enable();
+    for (;;) hal_halt();
 }

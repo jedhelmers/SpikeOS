@@ -17,7 +17,9 @@ static struct process *pick_next(void) {
             return &proc_table[idx];
         }
     }
-    return current_process;
+    /* No READY process found — fall back to idle (PID 0).
+     * Returning current_process is wrong if it's BLOCKED or ZOMBIE. */
+    return &proc_table[0];
 }
 
 
@@ -28,6 +30,8 @@ void scheduler_init(void) {
 }
 
 uint32_t scheduler_tick(trapframe *tf) {
+    if (!current_process) return 0;  /* not initialized yet */
+
     struct process *prev = current_process;
 
     // Save where prev can resume: the current trapframe address

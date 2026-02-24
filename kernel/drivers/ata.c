@@ -1,5 +1,6 @@
 #include <kernel/ata.h>
 #include <kernel/io.h>
+#include <kernel/hal.h>
 #include <stdio.h>
 
 static int disk_present = 0;
@@ -113,12 +114,12 @@ int ata_read_sectors(uint32_t lba, uint8_t count, void *buf) {
     if (!disk_present) return -1;
     if (count == 0) return -1;
 
-    /* Disable interrupts during transfer */
-    __asm__ volatile ("cli");
+    /* Disable interrupts during transfer, restore caller's state on exit */
+    uint32_t irqflags = hal_irq_save();
 
     /* Wait for drive ready */
     if (ata_poll_bsy() != 0) {
-        __asm__ volatile ("sti");
+        hal_irq_restore(irqflags);
         return -1;
     }
 
@@ -139,14 +140,14 @@ int ata_read_sectors(uint32_t lba, uint8_t count, void *buf) {
     uint16_t *ptr = (uint16_t *)buf;
     for (uint8_t i = 0; i < count; i++) {
         if (ata_poll_drq() != 0) {
-            __asm__ volatile ("sti");
+            hal_irq_restore(irqflags);
             return -1;
         }
         insw(ATA_PRIMARY_IO + ATA_REG_DATA, ptr, 256);
         ptr += 256;
     }
 
-    __asm__ volatile ("sti");
+    hal_irq_restore(irqflags);
     return 0;
 }
 
@@ -154,12 +155,12 @@ int ata_write_sectors(uint32_t lba, uint8_t count, const void *buf) {
     if (!disk_present) return -1;
     if (count == 0) return -1;
 
-    /* Disable interrupts during transfer */
-    __asm__ volatile ("cli");
+    /* Disable interrupts during transfer, restore caller's state on exit */
+    uint32_t irqflags = hal_irq_save();
 
     /* Wait for drive ready */
     if (ata_poll_bsy() != 0) {
-        __asm__ volatile ("sti");
+        hal_irq_restore(irqflags);
         return -1;
     }
 
@@ -180,14 +181,14 @@ int ata_write_sectors(uint32_t lba, uint8_t count, const void *buf) {
     const uint16_t *ptr = (const uint16_t *)buf;
     for (uint8_t i = 0; i < count; i++) {
         if (ata_poll_drq() != 0) {
-            __asm__ volatile ("sti");
+            hal_irq_restore(irqflags);
             return -1;
         }
         outsw(ATA_PRIMARY_IO + ATA_REG_DATA, ptr, 256);
         ptr += 256;
     }
 
-    __asm__ volatile ("sti");
+    hal_irq_restore(irqflags);
 
     /* Flush write cache */
     return ata_flush();

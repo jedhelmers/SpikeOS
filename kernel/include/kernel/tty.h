@@ -23,5 +23,6 @@ void terminal_setcursor(size_t x, size_t y);
 
 void terminal_page_up(void);
 void terminal_page_down(void);
+void terminal_switch_to_fb(void);
 
 #endif
