@@ -33,9 +33,33 @@ struct trapframe;
 #define SYS_GETCWD  15
 #define SYS_PIPE    16
 #define SYS_DUP     17
-#define SYS_KILL    18
+#define SYS_KILL      18
+#define SYS_SOCKET    19
+#define SYS_BIND      20
+#define SYS_SENDTO    21
+#define SYS_RECVFROM  22
+#define SYS_CLOSESOCK 23
 
-#define NUM_SYSCALLS 19
+#define NUM_SYSCALLS  24
+
+/* Socket type for SYS_SOCKET */
+#define SOCK_UDP  1
+
+/* Argument structs passed by pointer for SYS_SENDTO / SYS_RECVFROM */
+struct sendto_args {
+    uint32_t    dst_ip;     /* network byte order */
+    uint16_t    dst_port;   /* host byte order */
+    const void *buf;
+    uint16_t    len;
+};
+
+struct recvfrom_args {
+    void     *buf;
+    uint16_t  max_len;
+    uint32_t  from_ip;     /* filled by kernel, network byte order */
+    uint16_t  from_port;   /* filled by kernel, host byte order */
+    uint16_t  received;    /* filled by kernel */
+};
 
 /*
  * Stat struct — returned by SYS_STAT.

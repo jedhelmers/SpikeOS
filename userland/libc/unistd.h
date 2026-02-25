@@ -101,4 +101,45 @@ static inline int stat(const char *path, struct spike_stat *buf) {
     return syscall2(SYS_STAT, (int)path, (int)buf);
 }
 
+/* ------------------------------------------------------------------ */
+/*  Socket API                                                        */
+/* ------------------------------------------------------------------ */
+
+#define SOCK_UDP  1
+
+struct sendto_args {
+    unsigned int    dst_ip;     /* network byte order */
+    unsigned short  dst_port;   /* host byte order */
+    const void     *buf;
+    unsigned short  len;
+};
+
+struct recvfrom_args {
+    void           *buf;
+    unsigned short  max_len;
+    unsigned int    from_ip;     /* filled by kernel */
+    unsigned short  from_port;   /* filled by kernel */
+    unsigned short  received;    /* filled by kernel */
+};
+
+static inline int spike_socket(int type) {
+    return syscall1(SYS_SOCKET, type);
+}
+
+static inline int spike_bind(int type, int port) {
+    return syscall2(SYS_BIND, type, port);
+}
+
+static inline int spike_sendto(int sock, struct sendto_args *args) {
+    return syscall2(SYS_SENDTO, sock, (int)args);
+}
+
+static inline int spike_recvfrom(int sock, struct recvfrom_args *args) {
+    return syscall2(SYS_RECVFROM, sock, (int)args);
+}
+
+static inline int spike_closesock(int sock) {
+    return syscall1(SYS_CLOSESOCK, sock);
+}
+
 #endif

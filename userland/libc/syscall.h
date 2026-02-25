@@ -20,7 +20,12 @@
 #define SYS_GETCWD  15
 #define SYS_PIPE    16
 #define SYS_DUP     17
-#define SYS_KILL    18
+#define SYS_KILL      18
+#define SYS_SOCKET    19
+#define SYS_BIND      20
+#define SYS_SENDTO    21
+#define SYS_RECVFROM  22
+#define SYS_CLOSESOCK 23
 
 static inline int syscall0(int num) {
     int ret;

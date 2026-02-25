@@ -1,5 +1,6 @@
 #include <stdio.h>
 
+#include <kernel/hal.h>
 #include <kernel/tty.h>
 #include <kernel/gdt.h>
 #include <kernel/paging.h>
@@ -28,6 +29,9 @@
 #include <kernel/fb_console.h>
 #include <kernel/event.h>
 #include <kernel/mouse.h>
+#include <kernel/pci.h>
+#include <kernel/e1000.h>
+#include <kernel/net.h>
 
 extern void kprint_howdy(void);
 extern void paging_enable(uint32_t);
@@ -317,6 +321,42 @@ void kernel_main(void) {
 #ifdef VERBOSE_BOOT
     printf("INIT UART + IRQ4 unmasked\n");
 #endif
+
+    pci_init();
+#ifdef VERBOSE_BOOT
+    {
+        int pci_count = 0;
+        pci_get_devices(&pci_count);
+        printf("INIT PCI (%d devices found)\n", pci_count);
+    }
+#endif
+
+    e1000_init();
+#ifdef VERBOSE_BOOT
+    if (nic)
+        printf("INIT e1000 NIC (MAC=%02x:%02x:%02x:%02x:%02x:%02x, link=%s)\n",
+               nic->mac[0], nic->mac[1], nic->mac[2],
+               nic->mac[3], nic->mac[4], nic->mac[5],
+               nic->link_up ? "UP" : "DOWN");
+#endif
+
+    net_init();
+#ifdef VERBOSE_BOOT
+    printf("INIT Network stack\n");
+#endif
+
+    /* DHCP: auto-configure IP (needs interrupts for e1000 RX) */
+    if (nic) {
+        dhcp_discover();
+        uint32_t dhcp_deadline = timer_ticks() + 500; /* 5 second timeout */
+        while (!net_cfg.configured && timer_ticks() < dhcp_deadline) {
+            hal_irq_enable();
+            hal_halt();
+        }
+        if (!net_cfg.configured) {
+            printf("[net] DHCP timeout, no IP assigned\n");
+        }
+    }
 
     fb_enable();
 #ifdef VERBOSE_BOOT

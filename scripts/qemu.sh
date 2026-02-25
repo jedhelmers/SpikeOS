@@ -30,5 +30,7 @@ qemu-system-$(scripts/target-triplet-to-arch.sh $HOST) \
     -cdrom myos.iso \
     -vga std \
     -serial file:.debug.log \
+    -netdev user,id=net0,hostfwd=udp::9999-:9999 \
+    -device e1000,netdev=net0 \
     -no-reboot -no-shutdown \
     -d int,cpu_reset # -D qemu_debug.log

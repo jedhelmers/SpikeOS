@@ -60,6 +60,7 @@ cat .debug.log    # Inspect UART debug output during or after a run
 - `endkernel` linker symbol marks end of kernel image (used to reserve physical frames)
 - Kernel heap at `0xC0400000` (PDE[769]), up to 4 MB, first-fit free-list allocator
 - Framebuffer at `0xC0800000` (PDE[770]), up to 4 MB, mapped when GRUB provides GOP/VBE framebuffer
+- e1000 NIC MMIO at `0xC0C00000` (PDE[771]), 128 KB (32 pages), mapped with cache-disable
 
 ### GDT Layout
 
@@ -98,14 +99,18 @@ All init `printf` calls are wrapped in `#ifdef VERBOSE_BOOT`. Without the flag, 
 17. `keyboard_init()` + `pic_clear_mask(1)` — keyboard on IRQ1
 18. `mouse_init()` — PS/2 mouse on IRQ12 (no-op if no framebuffer)
 19. `uart_init()` + `pic_clear_mask(4)` — COM1 serial on IRQ4
-20. `fb_enable()` — switch framebuffer to XRGB8888 mode
-21. `boot_splash()` — 1980s-style animated boot screen (only without `VERBOSE_BOOT`)
-22. `wm_init()` + `fb_console_init()` — window manager and framebuffer text console
-23. `terminal_switch_to_fb()` — switch to framebuffer console (no-op if FB unavailable)
-24. `terminal_clear()` — clear screen
-25. `mouse_show_cursor()` — display mouse cursor
-26. `proc_create_kernel_thread(shell_run)` — start the kernel shell
-27. `sti` — enable interrupts
+20. `pci_init()` — PCI bus 0 scan, enumerate devices
+21. `e1000_init()` — Intel e1000 NIC: MMIO mapping, TX/RX rings, IRQ handler, link up
+22. `net_init()` — zero network config, init ARP cache + UDP socket table
+23. `dhcp_discover()` + busy-wait (5s timeout) — auto-configure IP/subnet/gateway/DNS
+24. `fb_enable()` — switch framebuffer to XRGB8888 mode
+25. `boot_splash()` — 1980s-style animated boot screen (only without `VERBOSE_BOOT`)
+26. `wm_init()` + `fb_console_init()` — window manager and framebuffer text console
+27. `terminal_switch_to_fb()` — switch to framebuffer console (no-op if FB unavailable)
+28. `terminal_clear()` — clear screen
+29. `mouse_show_cursor()` — display mouse cursor
+30. `proc_create_kernel_thread(shell_run)` — start the kernel shell
+31. `sti` — enable interrupts
 
 ### Directory Structure
 
@@ -115,7 +120,8 @@ All init `printf` calls are wrapped in `#ifdef VERBOSE_BOOT`. Without the flag, 
 | `kernel/core/` | Kernel entry, GDT, IDT, ISR, TSS, syscall dispatch |
 | `kernel/mm/` | Paging (page directory/tables, frame allocator, page fault handler) and heap allocator |
 | `kernel/fs/` | VFS, SpikeFS on-disk filesystem, initrd, file descriptors, pipes |
-| `kernel/drivers/` | ATA disk, keyboard, UART, PIC, timer, VGA mode 13h, framebuffer, FB console, mouse, event queue, window manager, debug log |
+| `kernel/drivers/` | ATA disk, keyboard, UART, PIC, timer, VGA mode 13h, framebuffer, FB console, mouse, event queue, window manager, PCI, e1000 NIC, debug log |
+| `kernel/net/` | Networking stack: Ethernet, ARP, IPv4, ICMP, UDP, DHCP |
 | `kernel/proc/` | Process table, scheduler, ELF loader, wait queues, mutex/semaphore |
 | `kernel/shell/` | Kernel shell, text editors (shell + GUI), Tetris, boot splash |
 | `kernel/include/kernel/` | All kernel headers (flat) |
@@ -193,6 +199,11 @@ All init `printf` calls are wrapped in `#ifdef VERBOSE_BOOT`. Without the flag, 
 | 16 | `SYS_PIPE` | EBX=int[2] | Create pipe (read/write fd pair) |
 | 17 | `SYS_DUP` | EBX=fd | Duplicate file descriptor |
 | 18 | `SYS_KILL` | EBX=pid, ECX=sig | Send signal to process |
+| 19 | `SYS_SOCKET` | EBX=type | Create socket (placeholder) |
+| 20 | `SYS_BIND` | EBX=type, ECX=port | Bind UDP socket to local port |
+| 21 | `SYS_SENDTO` | EBX=sock, ECX=&args | Send UDP datagram |
+| 22 | `SYS_RECVFROM` | EBX=sock, ECX=&args | Receive UDP datagram (blocks) |
+| 23 | `SYS_CLOSESOCK` | EBX=sock | Close UDP socket |
 
 ### Process & Scheduling
 
@@ -233,6 +244,27 @@ Polling-based PIO driver for the primary IDE master drive (port 0x1F0).
 - `ata_read_sectors()` / `ata_write_sectors()` — 28-bit LBA, 1-255 sectors, interrupt-safe (`hal_irq_save/restore`)
 - `ata_flush()` — flush write cache
 - QEMU disk: 64 MiB raw image (`disk.img`, 131072 sectors), attached as IDE primary master
+
+### PCI Bus
+
+PCI config space access and bus 0 enumeration (`kernel/drivers/pci.c`). Discovers devices via I/O ports `0x0CF8`/`0x0CFC`, stores up to 32 devices. API: `pci_init()`, `pci_find_device()`, `pci_enable_bus_master()`.
+
+### Intel e1000 NIC Driver
+
+MMIO-based Intel e1000 Ethernet driver (`kernel/drivers/e1000.c`). BAR0 mapped at `0xC0C00000` (PDE[771], 32 pages with cache-disable). Supports device IDs 0x100E, 0x100F, 0x1004, 0x10D3. 16 TX descriptors with static 2 KB buffers, 32 RX descriptors with 2 KB buffers each. IRQ-driven receive via `net_rx_callback()`. NIC abstraction (`nic_t`) with function pointer allows future driver swaps.
+
+### Networking Stack
+
+Custom networking stack (no lwIP) in `kernel/net/`:
+
+- **Ethernet** (`net.c`): frame TX/RX, ethertype dispatch
+- **ARP** (`arp.c`): 16-entry cache, blocking resolve (up to 3s timeout)
+- **IPv4** (`ip.c`): RFC 1071 checksum, next-hop routing (direct or via gateway), broadcast acceptance for DHCP
+- **ICMP** (`icmp.c`): echo request/reply, `net_ping()` sends 4 pings with timing
+- **UDP** (`udp.c`): 8-slot socket table with per-socket 2 KB receive buffer and blocking recv via wait queues
+- **DHCP** (`dhcp.c`): DISCOVER/OFFER/REQUEST/ACK state machine, builds raw Ethernet+IP+UDP frames (since IP isn't configured during discovery)
+
+All IP addresses stored in network byte order using direct byte access. QEMU networking: `-netdev user,id=net0 -device e1000,netdev=net0` (user-mode NAT, DHCP assigns 10.0.2.15, gateway at 10.0.2.2).
 
 ### SpikeFS (On-Disk Filesystem — v3)
 
@@ -358,14 +390,14 @@ Two text editors: a nano-like shell editor and a GUI windowed editor.
 Freestanding C library for user-mode programs (`userland/libc/`). Built with `-nostdlib -ffreestanding`, linked statically at `0x08048000`.
 
 - `crt0.S` — C runtime startup (`_start` → `main()` → `_exit()`)
-- `syscall.h` — inline `int $0x80` wrappers for all 19 syscalls
-- `unistd.h` — POSIX-like function wrappers: `_exit`, `write`, `read`, `open`, `close`, `getpid`, `spawn`, `waitpid`, `kill`, `brk`, `sbrk`, `lseek`, `getcwd`, `stat`, `chdir`, `mkdir`, `unlink`, `spike_pipe`, `dup`, `spike_sleep`
+- `syscall.h` — inline `int $0x80` wrappers for all 24 syscalls
+- `unistd.h` — POSIX-like function wrappers: `_exit`, `write`, `read`, `open`, `close`, `getpid`, `spawn`, `waitpid`, `kill`, `brk`, `sbrk`, `lseek`, `getcwd`, `stat`, `chdir`, `mkdir`, `unlink`, `spike_pipe`, `dup`, `spike_sleep`, `spike_socket`, `spike_bind`, `spike_sendto`, `spike_recvfrom`, `spike_closesock`
 - `stat.h` — userland `struct spike_stat` (matches kernel), `O_*` flags, `SEEK_*` constants, `S_TYPE_*` macros
 - `stdio.h/c` — `printf` (`%d`, `%u`, `%x`, `%s`, `%c`, `%%`), `putchar`, `puts`
 - `string.h/c` — `strlen`, `memcpy`, `memset`, `strcmp`, `strcpy`, `strchr`, `strrchr`, `strncpy`, `strncmp`, `strcat`, `strncat`, `strstr`, `memcmp`, `memmove`
 - `stdlib.h/c` — `atoi`, `strtol`, `abs`, `rand`/`srand` (LCG), `exit`; declares `malloc`/`free`/`calloc`/`realloc`
 - `malloc.c` — userland heap allocator: first-fit free-list with block splitting and forward coalescing, grows via `sbrk()`, 8-byte aligned, 4 KB minimum sbrk increment
-- User programs: `hello.elf` (printf/getpid), `alloc_test.elf` (6-suite heap test), `files_test.elf` (6-suite filesystem test). Run via `exec <name>` in the shell.
+- User programs: `hello.elf` (printf/getpid), `alloc_test.elf` (6-suite heap test), `files_test.elf` (6-suite filesystem test), `udp_test.elf` (UDP socket test). Run via `exec <name>` in the shell.
 - Build: `make -C userland` (called automatically by `scripts/iso.sh`)
 
 ### UEFI Boot Support
@@ -404,6 +436,10 @@ Shell prompt shows current working directory: `jedhelmers:/path> `
 | `run tetris` | Play Tetris (WASD=move, Space=drop, Q=quit) |
 | `ps` | List processes |
 | `kill <pid>` | Send SIGKILL to process by PID |
+| `lspci` | List PCI devices |
+| `netinfo` | Show NIC MAC, link status, and IP config |
+| `ping <ip>` | Send 4 ICMP echo requests to target IP |
+| `udpsend <ip> <port> <msg>` | Send a UDP datagram |
 | `meminfo` | Show heap info |
 | `test <name>` | Run kernel tests: `fd`, `pipe`, `sleep`, `stat`, `stdin`, `waitpid`, `mutex`, `sem`, `signal`, `cwd`, `condvar`, `rwlock`, or `all` |
 | `clear` | Clear screen |
@@ -415,7 +451,7 @@ Shell prompt shows current working directory: `jedhelmers:/path> `
 | `kernel/core/kernel.c` | Kernel entry point, init sequence, test functions |
 | `kernel/core/gdt.c` | GDT with kernel + user segments + TSS |
 | `kernel/core/isr.c` | Interrupt/exception/syscall dispatcher |
-| `kernel/core/syscall.c` | Syscall dispatcher and 19 syscall implementations |
+| `kernel/core/syscall.c` | Syscall dispatcher and 24 syscall implementations (including 5 socket syscalls) |
 | `kernel/mm/paging.c` | Page directory/table management, frame allocator, temp mapping, per-process PDs, page fault handler |
 | `kernel/mm/heap.c` | Kernel heap allocator (kmalloc/kfree) |
 | `kernel/fs/vfs.c` | In-memory VFS: growable inode table, directories, path resolution, file I/O, dirty tracking |
@@ -426,6 +462,15 @@ Shell prompt shows current working directory: `jedhelmers:/path> `
 | `kernel/drivers/framebuffer.c` | GOP/VBE framebuffer driver: map to kernel VA, pixel operations, XRGB8888 color |
 | `kernel/drivers/fb_console.c` | Framebuffer text console: glyph rendering, visible cursor, 200-line scrollback |
 | `kernel/drivers/ata.c` | ATA PIO disk driver (primary master, 28-bit LBA), interrupt-safe via HAL |
+| `kernel/drivers/pci.c` | PCI bus 0 enumeration, config space read/write |
+| `kernel/drivers/e1000.c` | Intel e1000 NIC driver: MMIO, TX/RX rings, IRQ handler |
+| `kernel/include/kernel/net.h` | Unified networking header: all protocol structs and API declarations |
+| `kernel/net/net.c` | Ethernet TX/RX, IP parse/format, `net_init()` |
+| `kernel/net/arp.c` | ARP cache, request/reply, blocking resolve |
+| `kernel/net/ip.c` | IPv4 send/receive, checksum, next-hop routing |
+| `kernel/net/icmp.c` | ICMP echo request/reply, `net_ping()` |
+| `kernel/net/udp.c` | UDP send/receive, 8-slot socket table, blocking recv |
+| `kernel/net/dhcp.c` | DHCP client state machine |
 | `kernel/drivers/mouse.c` | PS/2 mouse driver on IRQ12, software cursor |
 | `kernel/drivers/event.c` | Unified event queue (keyboard + mouse), interrupt-safe, blocking wait |
 | `kernel/drivers/window.c` | Window manager: z-order list, click-to-focus, corner-only resize, desktop/per-window menu bars, dropdown menus, repaint callbacks, desktop icons, traffic light dots, AA rounded corners |
@@ -446,6 +491,7 @@ Shell prompt shows current working directory: `jedhelmers:/path> `
 | `userland/hello.c` | User-mode test program using libc |
 | `userland/alloc_test.c` | Heap allocator test (malloc/free/calloc/realloc/stress, 6 suites) |
 | `userland/files_test.c` | Filesystem syscall test (getcwd/file I/O/stat/lseek/mkdir/unlink, 6 suites) |
+| `userland/udp_test.c` | UDP socket test: bind, sendto, recvfrom |
 | `userland/Makefile` | Build rules for userland libc + user programs |
 | `userland/libc/syscall.h` | Inline `int $0x80` syscall wrappers |
 | `userland/libc/unistd.h` | POSIX-like syscall wrappers (brk, sbrk, lseek, getcwd, stat, etc.) |
