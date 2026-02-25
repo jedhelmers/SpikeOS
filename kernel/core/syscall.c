@@ -10,6 +10,7 @@
 #include <kernel/timer.h>
 #include <kernel/tty.h>
 #include <kernel/signal.h>
+#include <kernel/net.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -392,6 +393,86 @@ static int32_t sys_kill(trapframe *tf) {
 }
 
 /* ------------------------------------------------------------------ */
+/*  SYS_SOCKET (19) — create a UDP socket                            */
+/*  EBX = type (SOCK_UDP = 1)                                        */
+/* ------------------------------------------------------------------ */
+
+static int32_t sys_socket(trapframe *tf) {
+    uint32_t type = tf->ebx;
+    if (type != SOCK_UDP) return -1;
+
+    /* udp_bind(0) allocates a socket without binding a port yet.
+       We use a temporary high port so the slot is reserved. */
+    return -1;  /* placeholder — sockets are created at bind time */
+}
+
+/* ------------------------------------------------------------------ */
+/*  SYS_BIND (20) — bind a socket to a local port                   */
+/*  EBX = type (SOCK_UDP), ECX = port                                */
+/*  Returns socket index, or -1 on failure.                          */
+/* ------------------------------------------------------------------ */
+
+static int32_t sys_bind(trapframe *tf) {
+    uint32_t type = tf->ebx;
+    uint16_t port = (uint16_t)tf->ecx;
+
+    if (type != SOCK_UDP) return -1;
+    return (int32_t)udp_bind(port);
+}
+
+/* ------------------------------------------------------------------ */
+/*  SYS_SENDTO (21) — send a UDP datagram                           */
+/*  EBX = sock, ECX = pointer to struct sendto_args                  */
+/* ------------------------------------------------------------------ */
+
+static int32_t sys_sendto(trapframe *tf) {
+    int sock = (int)tf->ebx;
+    struct sendto_args *args = (struct sendto_args *)tf->ecx;
+
+    if (bad_user_ptr(args, sizeof(struct sendto_args))) return -1;
+    if (bad_user_ptr(args->buf, args->len)) return -1;
+
+    return (int32_t)udp_sendto(sock, args->dst_ip, args->dst_port,
+                                args->buf, args->len);
+}
+
+/* ------------------------------------------------------------------ */
+/*  SYS_RECVFROM (22) — receive a UDP datagram (blocks)              */
+/*  EBX = sock, ECX = pointer to struct recvfrom_args                */
+/* ------------------------------------------------------------------ */
+
+static int32_t sys_recvfrom(trapframe *tf) {
+    int sock = (int)tf->ebx;
+    struct recvfrom_args *args = (struct recvfrom_args *)tf->ecx;
+
+    if (bad_user_ptr(args, sizeof(struct recvfrom_args))) return -1;
+    if (bad_user_ptr(args->buf, args->max_len)) return -1;
+
+    uint32_t from_ip = 0;
+    uint16_t from_port = 0;
+    int ret = udp_recv(sock, args->buf, args->max_len, &from_ip, &from_port);
+
+    if (ret >= 0) {
+        args->from_ip   = from_ip;
+        args->from_port = from_port;
+        args->received  = (uint16_t)ret;
+    }
+
+    return (int32_t)ret;
+}
+
+/* ------------------------------------------------------------------ */
+/*  SYS_CLOSESOCK (23) — close a socket                              */
+/*  EBX = sock                                                       */
+/* ------------------------------------------------------------------ */
+
+static int32_t sys_closesock(trapframe *tf) {
+    int sock = (int)tf->ebx;
+    udp_unbind(sock);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /*  Dispatch table                                                    */
 /* ------------------------------------------------------------------ */
 
@@ -416,7 +497,12 @@ static syscall_fn syscall_table[NUM_SYSCALLS] = {
     [SYS_GETCWD]  = sys_getcwd,
     [SYS_PIPE]    = sys_pipe,
     [SYS_DUP]     = sys_dup,
-    [SYS_KILL]    = sys_kill,
+    [SYS_KILL]      = sys_kill,
+    [SYS_SOCKET]    = sys_socket,
+    [SYS_BIND]      = sys_bind,
+    [SYS_SENDTO]    = sys_sendto,
+    [SYS_RECVFROM]  = sys_recvfrom,
+    [SYS_CLOSESOCK] = sys_closesock,
 };
 
 void syscall_dispatch(trapframe *tf) {

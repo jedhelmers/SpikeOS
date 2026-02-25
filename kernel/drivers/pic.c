@@ -49,5 +49,13 @@ void pic_clear_mask(uint8_t irq) {
     uint8_t bit = (irq < 8) ? irq : (irq - 8);
     uint8_t val = inb(port) & ~(1u << bit);
     outb(port, val);
+
+    /* Slave PIC IRQs (8-15) require IRQ2 (cascade) unmasked on the
+       master PIC, otherwise the slave's interrupts never reach the CPU. */
+    if (irq >= 8) {
+        uint8_t master = inb(PIC1_DATA);
+        if (master & (1u << 2))
+            outb(PIC1_DATA, master & ~(1u << 2));
+    }
 }
 
