@@ -1,5 +1,6 @@
 #include <kernel/gui_editor.h>
 #include <kernel/window.h>
+#include <kernel/surface.h>
 #include <kernel/keyboard.h>
 #include <kernel/key_event.h>
 #include <kernel/framebuffer.h>
@@ -217,12 +218,12 @@ static void ge_compute_dims(gui_editor_t *ed) {
 
 static void ge_putchar_at(gui_editor_t *ed, int x, int y, char ch,
                            uint32_t fg, uint32_t bg) {
-    if (!ed->win) return;
+    if (!ed->win || !ed->win->surface) return;
     if (x < 0 || y < 0 || x >= ed->text_cols || y >= (int)(ed->win->content_h / FONT_H))
         return;
-    uint32_t px = ed->win->content_x + (uint32_t)x * FONT_W;
-    uint32_t py = ed->win->content_y + (uint32_t)y * FONT_H;
-    fb_render_char_px(px, py, (uint8_t)ch, fg, bg);
+    surface_render_char(ed->win->surface,
+                        (uint32_t)x * FONT_W, (uint32_t)y * FONT_H,
+                        (uint8_t)ch, fg, bg);
 }
 
 static void ge_fill_row(gui_editor_t *ed, int y, uint32_t fg, uint32_t bg) {
@@ -237,15 +238,14 @@ static void ge_draw_str(gui_editor_t *ed, int x, int y, const char *s,
 }
 
 static void gui_editor_draw(gui_editor_t *ed) {
-    if (!ed->win) return;
+    if (!ed->win || !ed->win->surface) return;
 
     ge_compute_dims(ed);
     uint32_t fg = GE_FG;
     uint32_t bg = GE_BG;
 
-    /* Clear content area */
-    fb_fill_rect(ed->win->content_x, ed->win->content_y,
-                 ed->win->content_w, ed->win->content_h, bg);
+    /* Clear surface */
+    surface_clear(ed->win->surface, bg);
 
     /* Draw text lines */
     for (int row = 0; row < ed->text_rows; row++) {
@@ -308,12 +308,13 @@ static void gui_editor_draw(gui_editor_t *ed) {
     if (pos_x > 0)
         ge_draw_str(ed, pos_x, status_y, pos, GE_BAR_FG, GE_BAR_BG);
 
-    /* Draw cursor (underline) */
+    /* Draw cursor (underline) — surface-relative coordinates */
     int cur_screen_y = ed->cy - ed->scroll;
     if (cur_screen_y >= 0 && cur_screen_y < ed->text_rows) {
-        uint32_t cpx = ed->win->content_x + (uint32_t)ed->cx * FONT_W;
-        uint32_t cpy = ed->win->content_y + (uint32_t)cur_screen_y * FONT_H + 14;
-        fb_fill_rect(cpx, cpy, FONT_W, 2, GE_CURSOR);
+        surface_fill_rect(ed->win->surface,
+                          (uint32_t)ed->cx * FONT_W,
+                          (uint32_t)cur_screen_y * FONT_H + 14,
+                          FONT_W, 2, GE_CURSOR);
     }
 }
 
