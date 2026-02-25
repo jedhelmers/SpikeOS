@@ -22,6 +22,9 @@
 #include <string.h>
 
 #include <kernel/tty.h>
+#include <kernel/pci.h>
+#include <kernel/e1000.h>
+#include <kernel/net.h>
 
 #define LINE_BUF_SIZE 128
 
@@ -626,6 +629,10 @@ void shell_execute(void) {
         printf("  ps             - list processes\n");
         printf("  kill <pid>     - kill process by PID\n");
         printf("  meminfo        - show heap info\n");
+        printf("  lspci          - list PCI devices\n");
+        printf("  netinfo        - show network interface info\n");
+        printf("  ping <ip>      - send ICMP echo requests\n");
+        printf("  udpsend <ip> <port> <msg> - send UDP datagram\n");
         printf("  test <name>    - run kernel tests (fd|pipe|sleep|stat|stdin|waitpid|\n");
         printf("                   mutex|sem|signal|cwd|condvar|rwlock|all)\n");
         printf("  clear          - clear screen\n");
@@ -913,6 +920,89 @@ void shell_execute(void) {
     /* ---- meminfo ---- */
     else if (strcmp(line_buf, "meminfo") == 0) {
         heap_dump();
+    }
+
+    /* ---- lspci ---- */
+    else if (strcmp(line_buf, "lspci") == 0) {
+        int count = 0;
+        pci_device_t *devs = pci_get_devices(&count);
+        if (count == 0) {
+            printf("No PCI devices found\n");
+        } else {
+            for (int i = 0; i < count; i++) {
+                printf("%02x:%02x.%x %04x:%04x class=%02x:%02x IRQ=%d BAR0=0x%x\n",
+                       devs[i].bus, devs[i].slot, devs[i].func,
+                       devs[i].vendor_id, devs[i].device_id,
+                       devs[i].class_code, devs[i].subclass,
+                       devs[i].irq_line, devs[i].bar[0]);
+            }
+        }
+    }
+
+    /* ---- netinfo ---- */
+    else if (strcmp(line_buf, "netinfo") == 0) {
+        if (!nic) {
+            printf("No network interface found\n");
+        } else {
+            printf("MAC:  %02x:%02x:%02x:%02x:%02x:%02x\n",
+                   nic->mac[0], nic->mac[1], nic->mac[2],
+                   nic->mac[3], nic->mac[4], nic->mac[5]);
+            printf("Link: %s\n", nic->link_up ? "UP" : "DOWN");
+            if (net_cfg.configured) {
+                printf("IP:   %s\n", ip_fmt(net_cfg.ip));
+                printf("Mask: %s\n", ip_fmt(net_cfg.subnet));
+                printf("GW:   %s\n", ip_fmt(net_cfg.gateway));
+                printf("DNS:  %s\n", ip_fmt(net_cfg.dns));
+            } else {
+                printf("IP:   (not configured)\n");
+            }
+        }
+    }
+
+    /* ---- ping ---- */
+    else if (strncmp(line_buf, "ping ", 5) == 0) {
+        const char *arg = shell_arg(line_buf, 4);
+        if (!arg) {
+            printf("Usage: ping <ip>\n");
+        } else {
+            uint32_t dst = ip_parse(arg);
+            net_ping(dst);
+        }
+    }
+
+    /* ---- udpsend <ip> <port> <msg> ---- */
+    else if (strncmp(line_buf, "udpsend ", 8) == 0) {
+        const char *args = shell_arg(line_buf, 7);
+        if (!args) {
+            printf("Usage: udpsend <ip> <port> <msg>\n");
+        } else {
+            /* Parse IP */
+            const char *p = args;
+            while (*p && *p != ' ') p++;
+            char ip_buf[16];
+            int ip_len = p - args;
+            if (ip_len > 15) ip_len = 15;
+            memcpy(ip_buf, args, ip_len);
+            ip_buf[ip_len] = '\0';
+
+            /* Parse port */
+            while (*p == ' ') p++;
+            uint16_t port = 0;
+            while (*p >= '0' && *p <= '9') port = port * 10 + (*p++ - '0');
+
+            /* Parse message */
+            while (*p == ' ') p++;
+            if (*p == '\0') {
+                printf("Usage: udpsend <ip> <port> <msg>\n");
+            } else {
+                uint32_t dst = ip_parse(ip_buf);
+                uint16_t len = (uint16_t)strlen(p);
+                if (udp_send(dst, 12345, port, p, len) == 0)
+                    printf("Sent %d bytes to %s:%d\n", len, ip_buf, port);
+                else
+                    printf("udpsend: failed\n");
+            }
+        }
     }
 
     /* ---- exec ---- */

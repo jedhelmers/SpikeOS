@@ -9,7 +9,7 @@ LIBC_OBJS := $(LIBC_SRCS:.c=.o)
 CRT0 := libc/crt0.o
 
 # User programs (add more here)
-PROGRAMS := hello.elf alloc_test.elf files_test.elf
+PROGRAMS := hello.elf alloc_test.elf files_test.elf udp_test.elf
 
 .PHONY: all clean
 
