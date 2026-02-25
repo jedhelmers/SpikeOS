@@ -2,6 +2,7 @@
 #define _WINDOW_H
 
 #include <stdint.h>
+#include <kernel/surface.h>
 
 #define WIN_MAX_TITLE    32
 #define WIN_TITLEBAR_H   20   /* title bar height in pixels */
@@ -97,6 +98,9 @@ typedef struct window {
     /* Menu bar (0 = no menu bar) */
     wm_menu_t menus[WM_MENU_MAX_MENUS];
     int menu_count;
+
+    /* Per-window back buffer (content area only, NULL if not allocated) */
+    surface_t *surface;
 
     /* Content repaint callback (called by wm_redraw_all for each visible window) */
     void (*repaint)(struct window *win);

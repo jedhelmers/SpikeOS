@@ -1,12 +1,13 @@
 #include <kernel/fb_console.h>
 #include <kernel/framebuffer.h>
+#include <kernel/surface.h>
 #include <kernel/window.h>
 #include <string.h>
 
 /*
- * Framebuffer text console — renders CP437 glyphs (8x16) onto a linear
- * framebuffer. Provides the same interface as VGA text mode: character grid,
- * cursor, 16-color palette, newline/backspace handling, and scrolling.
+ * Framebuffer text console — renders CP437 glyphs (8x16) onto a per-window
+ * surface (back buffer). The compositor blits the surface to the framebuffer
+ * in z-order, eliminating all rendering races between windows.
  *
  * The console binds to a window_t and reads position/size from it,
  * enabling drag-to-move via the window manager.
@@ -19,7 +20,7 @@
 #define FONT_H 16
 
 static int fb_active = 0;     /* 1 after fb_console_init succeeds */
-static int console_dirty = 0; /* set when char_buf changes while not frontmost */
+static int console_dirty = 0; /* set when content changes; compositor checks this */
 static uint32_t cols, rows;   /* character grid dimensions */
 static uint32_t cx, cy;       /* cursor position (character coords) */
 static uint8_t fg_idx = 7;    /* foreground VGA color index (light gray) */
@@ -33,13 +34,6 @@ static window_t *bound_window = NULL;
 /* Forward declarations for cursor helpers */
 static void draw_cursor(void);
 static void erase_cursor(void);
-
-/* Returns 1 if the bound window is the topmost (frontmost) window,
-   meaning direct pixel writes won't be painted over by another window.
-   When false, we still update char_buf but skip pixel operations. */
-static int fb_should_render(void) {
-    return bound_window && bound_window == wm_get_top_window();
-}
 
 /* Character buffer for content redraw after window moves */
 typedef struct {
@@ -102,7 +96,7 @@ static void update_colors(void) {
 }
 
 /* Render a single glyph at character grid position (gx, gy).
-   Used by boot splash with absolute grid coords. */
+   Used by boot splash with absolute grid coords — renders to framebuffer. */
 void fb_render_char(uint32_t gx, uint32_t gy, uint8_t ch,
                     uint32_t fg, uint32_t bg) {
     uint32_t px = gx * FONT_W;
@@ -119,7 +113,7 @@ void fb_render_char(uint32_t gx, uint32_t gy, uint8_t ch,
 }
 
 /* Render a single glyph at arbitrary pixel position (not grid-aligned).
-   Used by window manager for title bar text and by console rendering. */
+   Used by window manager for title bar text and deskbar — renders to framebuffer. */
 void fb_render_char_px(uint32_t px, uint32_t py, uint8_t ch,
                        uint32_t fg, uint32_t bg) {
     const uint8_t *glyph = &vga_font_8x16[ch * FONT_H];
@@ -133,6 +127,11 @@ void fb_render_char_px(uint32_t px, uint32_t py, uint8_t ch,
     }
 }
 
+/* Helper: get the bound window's surface, or NULL */
+static surface_t *get_surface(void) {
+    return bound_window ? bound_window->surface : NULL;
+}
+
 /* Restore saved screen and exit scrollback mode */
 static void fb_snap_to_bottom(void) {
     if (sb_offset > 0 && sb_saved) {
@@ -141,10 +140,8 @@ static void fb_snap_to_bottom(void) {
         cy = saved_cy;
         sb_offset = 0;
         sb_saved = 0;
-        if (fb_should_render()) {
-            fb_console_repaint();
-            draw_cursor();
-        }
+        fb_console_repaint();
+        draw_cursor();
     }
 }
 
@@ -160,33 +157,18 @@ static void fb_scroll(void) {
     sb_head = (sb_head + 1) % SB_LINES;
     if (sb_count < SB_LINES) sb_count++;
 
-    /* Scroll character buffer (always, regardless of visibility) */
+    /* Scroll character buffer */
     memmove(&char_buf[0], &char_buf[1],
             (rows - 1) * MAX_COLS * sizeof(fb_cell_t));
     memset(&char_buf[rows - 1], 0, MAX_COLS * sizeof(fb_cell_t));
 
-    /* Only move pixels if this window is frontmost */
-    if (fb_should_render()) {
-        uint32_t win_px = bound_window->content_x;
-        uint32_t win_py = bound_window->content_y;
-        uint32_t win_pw = bound_window->content_w;
-        uint32_t win_ph = bound_window->content_h;
-
-        uint32_t bpp = fb_info.bpp / 8;
-        uint32_t win_row_bytes = win_pw * bpp;
-
-        for (uint32_t py = win_py + FONT_H; py < win_py + win_ph; py++) {
-            volatile uint8_t *dst = (volatile uint8_t *)
-                (fb_info.virt_addr + (py - FONT_H) * fb_info.pitch + win_px * bpp);
-            volatile uint8_t *src = (volatile uint8_t *)
-                (fb_info.virt_addr + py * fb_info.pitch + win_px * bpp);
-            memmove((void *)dst, (const void *)src, win_row_bytes);
-        }
-
-        /* Clear the bottom character row of the window */
-        uint32_t clear_y = win_py + (rows - 1) * FONT_H;
-        fb_fill_rect(win_px, clear_y, win_pw, FONT_H, bg_color);
+    /* Scroll the surface */
+    surface_t *s = get_surface();
+    if (s) {
+        surface_scroll_up(s, FONT_H, bg_color);
     }
+
+    console_dirty = 1;
 }
 
 void fb_console_init(void) {
@@ -210,19 +192,19 @@ void fb_console_bind_window(window_t *win) {
 void fb_console_putchar(char c) {
     if (!fb_active || !bound_window) return;
 
-    /* Always record in character buffer */
+    /* Record in character buffer */
     char_buf[cy][cx].ch = (uint8_t)c;
     char_buf[cy][cx].fg = fg_idx;
     char_buf[cy][cx].bg = bg_idx;
 
-    /* Only render pixels if this window is frontmost */
-    if (fb_should_render()) {
-        fb_render_char_px(bound_window->content_x + cx * FONT_W,
-                          bound_window->content_y + cy * FONT_H,
-                          (uint8_t)c, fg_color, bg_color);
-    } else {
-        console_dirty = 1;
+    /* Render to surface (surface-relative coordinates) */
+    surface_t *s = get_surface();
+    if (s) {
+        surface_render_char(s, cx * FONT_W, cy * FONT_H,
+                            (uint8_t)c, fg_color, bg_color);
     }
+
+    console_dirty = 1;
     cx++;
 
     if (cx >= cols) {
@@ -239,10 +221,8 @@ void fb_console_putchar(char c) {
 void fb_console_write(const char *data, size_t size) {
     if (!fb_active || !bound_window) return;
 
-    int render = fb_should_render();
-
     fb_snap_to_bottom();
-    if (render) erase_cursor();
+    erase_cursor();
 
     for (size_t i = 0; i < size; i++) {
         switch (data[i]) {
@@ -265,14 +245,13 @@ void fb_console_write(const char *data, size_t size) {
         case '\b':
             if (cx > 0) {
                 cx--;
-                /* Always update char_buf */
                 char_buf[cy][cx].ch = ' ';
                 char_buf[cy][cx].fg = fg_idx;
                 char_buf[cy][cx].bg = bg_idx;
-                if (render) {
-                    fb_render_char_px(bound_window->content_x + cx * FONT_W,
-                                      bound_window->content_y + cy * FONT_H,
-                                      ' ', fg_color, bg_color);
+                surface_t *s = get_surface();
+                if (s) {
+                    surface_render_char(s, cx * FONT_W, cy * FONT_H,
+                                        ' ', fg_color, bg_color);
                 }
             }
             break;
@@ -283,19 +262,17 @@ void fb_console_write(const char *data, size_t size) {
         }
     }
 
-    if (render) draw_cursor();
+    draw_cursor();
 }
 
 void fb_console_repaint(void) {
     if (!fb_active || !bound_window) return;
 
-    uint32_t win_px = bound_window->content_x;
-    uint32_t win_py = bound_window->content_y;
-    uint32_t win_pw = bound_window->content_w;
-    uint32_t win_ph = bound_window->content_h;
+    surface_t *s = get_surface();
+    if (!s) return;
 
-    /* Clear content area */
-    fb_fill_rect(win_px, win_py, win_pw, win_ph, bg_color);
+    /* Clear surface */
+    surface_clear(s, bg_color);
 
     /* Repaint from character buffer */
     for (uint32_t r = 0; r < rows; r++) {
@@ -304,8 +281,8 @@ void fb_console_repaint(void) {
             if (cell.ch == 0) continue;
             uint32_t cell_fg = fb_vga_color(cell.fg);
             uint32_t cell_bg = fb_vga_color(cell.bg);
-            fb_render_char_px(win_px + c * FONT_W, win_py + r * FONT_H,
-                              cell.ch, cell_fg, cell_bg);
+            surface_render_char(s, c * FONT_W, r * FONT_H,
+                                cell.ch, cell_fg, cell_bg);
         }
     }
 }
@@ -313,7 +290,6 @@ void fb_console_repaint(void) {
 void fb_console_clear(void) {
     if (!fb_active || !bound_window) return;
 
-    /* Always reset state */
     cx = 0;
     cy = 0;
     memset(char_buf, 0, sizeof(char_buf));
@@ -322,13 +298,11 @@ void fb_console_clear(void) {
     sb_offset = 0;
     sb_saved = 0;
 
-    /* Only redraw pixels if this window is frontmost */
-    if (fb_should_render()) {
-        wm_draw_desktop();
-        wm_draw_chrome(bound_window);
-        fb_fill_rect(bound_window->content_x, bound_window->content_y,
-                     bound_window->content_w, bound_window->content_h, bg_color);
-    }
+    /* Clear the surface */
+    surface_t *s = get_surface();
+    if (s) surface_clear(s, bg_color);
+
+    console_dirty = 1;
 }
 
 void fb_console_setcolor(uint8_t fg, uint8_t bg) {
@@ -345,35 +319,37 @@ static int cursor_visible = 0;
 
 /* Draw an underline cursor at the current (cx, cy) position */
 static void draw_cursor(void) {
-    if (!fb_active || !bound_window || !fb_should_render()) return;
-    uint32_t px = bound_window->content_x + cx * FONT_W;
-    uint32_t py = bound_window->content_y + cy * FONT_H + (FONT_H - 2);
-    fb_fill_rect(px, py, FONT_W, 2, fg_color);
+    if (!fb_active || !bound_window) return;
+    surface_t *s = get_surface();
+    if (!s) return;
+    surface_fill_rect(s, cx * FONT_W, cy * FONT_H + (FONT_H - 2),
+                      FONT_W, 2, fg_color);
     cursor_visible = 1;
 }
 
 /* Erase the cursor by restoring the character at (cx, cy) */
 static void erase_cursor(void) {
-    if (!cursor_visible || !fb_active || !bound_window || !fb_should_render()) return;
+    if (!cursor_visible || !fb_active || !bound_window) return;
+    surface_t *s = get_surface();
+    if (!s) return;
     fb_cell_t cell = char_buf[cy][cx];
     uint32_t cell_fg = (cell.ch != 0) ? fb_vga_color(cell.fg) : fg_color;
     uint32_t cell_bg = (cell.ch != 0) ? fb_vga_color(cell.bg) : bg_color;
     uint8_t ch = (cell.ch != 0) ? cell.ch : ' ';
-    fb_render_char_px(bound_window->content_x + cx * FONT_W,
-                      bound_window->content_y + cy * FONT_H,
-                      ch, cell_fg, cell_bg);
+    surface_render_char(s, cx * FONT_W, cy * FONT_H,
+                        ch, cell_fg, cell_bg);
     cursor_visible = 0;
 }
 
 void fb_console_setcursor(size_t x, size_t y) {
-    if (fb_should_render()) erase_cursor();
+    erase_cursor();
     cx = (uint32_t)x;
     cy = (uint32_t)y;
-    if (fb_should_render()) draw_cursor();
+    draw_cursor();
 }
 
 void fb_console_update_cursor(void) {
-    if (!fb_active || !fb_should_render()) return;
+    if (!fb_active) return;
     draw_cursor();
 }
 
@@ -381,17 +357,15 @@ void fb_console_update_cursor(void) {
 /*  Scrollback navigation                                              */
 /* ------------------------------------------------------------------ */
 
-/* Redraw screen from scrollback + saved screen snapshot */
+/* Redraw screen from scrollback + saved screen snapshot into surface */
 static void fb_redraw_scrollback(void) {
-    if (!fb_active || !bound_window || !fb_should_render()) return;
+    if (!fb_active || !bound_window) return;
 
-    uint32_t win_px = bound_window->content_x;
-    uint32_t win_py = bound_window->content_y;
-    uint32_t win_pw = bound_window->content_w;
-    uint32_t win_ph = bound_window->content_h;
+    surface_t *s = get_surface();
+    if (!s) return;
 
-    /* Clear content area */
-    fb_fill_rect(win_px, win_py, win_pw, win_ph, bg_color);
+    /* Clear surface */
+    surface_clear(s, bg_color);
 
     for (int y = 0; y < (int)rows; y++) {
         /* Virtual line index: 0 = oldest scrollback line */
@@ -400,15 +374,12 @@ static void fb_redraw_scrollback(void) {
         fb_cell_t *src_row = NULL;
 
         if (vline < 0) {
-            /* Past beginning of history — blank */
             continue;
         } else if (vline < (int)sb_count) {
-            /* From scrollback ring */
             int idx = ((int)sb_head - (int)sb_count + vline
                        + (int)SB_LINES) % (int)SB_LINES;
             src_row = sb_ring[idx];
         } else {
-            /* From saved screen */
             int sy = vline - (int)sb_count;
             if (sy < (int)rows)
                 src_row = saved_screen[sy];
@@ -420,14 +391,16 @@ static void fb_redraw_scrollback(void) {
             if (src_row[c].ch == 0) continue;
             uint32_t cell_fg = fb_vga_color(src_row[c].fg);
             uint32_t cell_bg = fb_vga_color(src_row[c].bg);
-            fb_render_char_px(win_px + c * FONT_W, win_py + (uint32_t)y * FONT_H,
-                              src_row[c].ch, cell_fg, cell_bg);
+            surface_render_char(s, c * FONT_W, (uint32_t)y * FONT_H,
+                                src_row[c].ch, cell_fg, cell_bg);
         }
     }
+
+    console_dirty = 1;
 }
 
 void fb_console_page_up(void) {
-    if (!fb_active || !bound_window || !fb_should_render()) return;
+    if (!fb_active || !bound_window) return;
     if (sb_count == 0) return;
 
     /* Save current screen on first scroll-back */
@@ -446,7 +419,7 @@ void fb_console_page_up(void) {
 }
 
 void fb_console_page_down(void) {
-    if (!fb_active || !bound_window || !fb_should_render()) return;
+    if (!fb_active || !bound_window) return;
     if (sb_offset == 0) return;
 
     sb_offset -= (int)rows;
@@ -461,6 +434,7 @@ void fb_console_page_down(void) {
         }
         fb_console_repaint();
         draw_cursor();
+        console_dirty = 1;
         return;
     }
 

@@ -1,4 +1,5 @@
 #include <kernel/tetris.h>
+#include <kernel/surface.h>
 #include <kernel/framebuffer.h>
 #include <kernel/window.h>
 #include <kernel/fb_console.h>
@@ -16,7 +17,7 @@
 #define CELL         16   /* pixels per cell (2x original for framebuffer) */
 
 /* Board top-left corner relative to window content area */
-#define BX    0
+#define BX    2
 #define BY    8
 
 /* Info panel origin relative to window content area */
@@ -69,9 +70,12 @@ static void setup_colors(void) {
         colors[i] = fb_pack_color(PAL[i][0] * 4, PAL[i][1] * 4, PAL[i][2] * 4);
 }
 
-/* Helper: absolute screen X/Y from content-relative offset */
-static inline uint32_t cx(int x) { return tetris_win->content_x + (uint32_t)x; }
-static inline uint32_t cy(int y) { return tetris_win->content_y + (uint32_t)y; }
+/* Helper: surface-relative X/Y from content-relative offset */
+static inline uint32_t sx(int x) { return (uint32_t)x; }
+static inline uint32_t sy(int y) { return (uint32_t)y; }
+
+/* Helper: get the tetris window surface */
+static inline surface_t *tsurface(void) { return tetris_win ? tetris_win->surface : NULL; }
 
 /* =========================================================================
  * 5x7 pixel font for digits 0-9  (each row = 5 bits, MSB left)
@@ -94,11 +98,13 @@ static const uint8_t FONT5X7[10][7] = {
 /* Draw digit d at pixel position (px, py) relative to content area, scaled 2× */
 static void draw_digit(int px, int py, int d, uint32_t col) {
     if (d < 0 || d > 9) return;
+    surface_t *s = tsurface();
+    if (!s) return;
     const uint8_t *glyph = FONT5X7[d];
     for (int row = 0; row < 7; row++) {
         for (int bit = 4; bit >= 0; bit--) {
             uint32_t c = (glyph[row] >> bit) & 1 ? col : colors[COL_BG];
-            fb_fill_rect(cx(px + (4 - bit) * 2), cy(py + row * 2), 2, 2, c);
+            surface_fill_rect(s, sx(px + (4 - bit) * 2), sy(py + row * 2), 2, 2, c);
         }
     }
 }
@@ -196,8 +202,10 @@ static int fits(const tetris_t *g, int px, int py, int rot) {
  * ========================================================================= */
 
 static void draw_cell(int col, int row, uint8_t color) {
-    fb_fill_rect(cx(BX + col * CELL), cy(BY + row * CELL),
-                 CELL - 1, CELL - 1, colors[color]);
+    surface_t *s = tsurface();
+    if (!s) return;
+    surface_fill_rect(s, sx(BX + col * CELL), sy(BY + row * CELL),
+                      CELL - 1, CELL - 1, colors[color]);
 }
 
 static void draw_board(const tetris_t *g) {
@@ -219,20 +227,24 @@ static void draw_piece(const tetris_t *g, uint8_t col_override, int use_override
 }
 
 static void draw_border(void) {
+    surface_t *s = tsurface();
+    if (!s) return;
     /* left wall */
-    fb_fill_rect(cx(BX - 2), cy(BY), 2, BOARD_ROWS * CELL, colors[COL_BORDER]);
+    surface_fill_rect(s, sx(BX - 2), sy(BY), 2, BOARD_ROWS * CELL, colors[COL_BORDER]);
     /* right wall */
-    fb_fill_rect(cx(BX + BOARD_COLS * CELL), cy(BY), 2, BOARD_ROWS * CELL, colors[COL_BORDER]);
+    surface_fill_rect(s, sx(BX + BOARD_COLS * CELL), sy(BY), 2, BOARD_ROWS * CELL, colors[COL_BORDER]);
     /* bottom */
-    fb_fill_rect(cx(BX - 2), cy(BY + BOARD_ROWS * CELL),
-                 BOARD_COLS * CELL + 4, 2, colors[COL_BORDER]);
+    surface_fill_rect(s, sx(BX - 2), sy(BY + BOARD_ROWS * CELL),
+                      BOARD_COLS * CELL + 4, 2, colors[COL_BORDER]);
 }
 
 /* Paint the board area with the grid colour once.
    draw_cell() fills CELL-1 × CELL-1 leaving the 1 px borders in COL_GRID. */
 static void draw_board_bg(void) {
-    fb_fill_rect(cx(BX), cy(BY),
-                 BOARD_COLS * CELL, BOARD_ROWS * CELL, colors[COL_GRID]);
+    surface_t *s = tsurface();
+    if (!s) return;
+    surface_fill_rect(s, sx(BX), sy(BY),
+                      BOARD_COLS * CELL, BOARD_ROWS * CELL, colors[COL_GRID]);
 }
 
 /* Draw the info panel labels + values */
@@ -271,13 +283,16 @@ static void draw_info(const tetris_t *g) {
     draw_digit(IX + 36, IY + 160, 4, colors[COL_WHITE]);
 
     /* next piece preview (4×4 box) */
-    fb_fill_rect(cx(IX), cy(IY + 178), 4 * CELL, 4 * CELL, colors[COL_BG]);
-    uint8_t nc = piece_color(g->next);
-    for (int r = 0; r < 4; r++)
-        for (int c = 0; c < 4; c++)
-            if (piece_cell(g->next, 0, r, c))
-                fb_fill_rect(cx(IX + c * CELL), cy(IY + 178 + r * CELL),
-                             CELL - 1, CELL - 1, colors[nc]);
+    surface_t *s = tsurface();
+    if (s) {
+        surface_fill_rect(s, sx(IX), sy(IY + 178), 4 * CELL, 4 * CELL, colors[COL_BG]);
+        uint8_t nc = piece_color(g->next);
+        for (int r = 0; r < 4; r++)
+            for (int c = 0; c < 4; c++)
+                if (piece_cell(g->next, 0, r, c))
+                    surface_fill_rect(s, sx(IX + c * CELL), sy(IY + 178 + r * CELL),
+                                      CELL - 1, CELL - 1, colors[nc]);
+    }
 }
 
 static void render(const tetris_t *g) {
@@ -412,11 +427,10 @@ void tetris_run(void) {
     tetris_win->flags &= ~WIN_FLAG_RESIZABLE;  /* fixed-size game window */
 
     setup_colors();
-    wm_draw_chrome(tetris_win);
 
-    /* Clear content area */
-    fb_fill_rect(tetris_win->content_x, tetris_win->content_y,
-                 tetris_win->content_w, tetris_win->content_h, colors[COL_BG]);
+    /* Clear surface */
+    if (tetris_win->surface)
+        surface_clear(tetris_win->surface, colors[COL_BG]);
 
     draw_border();
     draw_board_bg();
@@ -430,6 +444,9 @@ void tetris_run(void) {
     /* Initial full render */
     draw_info(&g);
     render(&g);
+
+    /* First compositor pass to show everything */
+    wm_redraw_all();
 
     uint32_t last_fall = timer_ticks();
     uint32_t last_score = g.score + 1; /* force info redraw on first frame */
@@ -489,11 +506,20 @@ void tetris_run(void) {
             last_score = g.score;
         }
 
+        /* Blit surface to framebuffer */
+        if (tetris_win->surface)
+            surface_blit_to_fb(tetris_win->surface,
+                               tetris_win->content_x, tetris_win->content_y);
+
         asm volatile ("hlt");
     }
 
     if (!g.alive) {
         draw_game_over(&g);
+        /* Blit game over screen */
+        if (tetris_win->surface)
+            surface_blit_to_fb(tetris_win->surface,
+                               tetris_win->content_x, tetris_win->content_y);
         /* Wait for any key */
         while (keyboard_get_event().type == KEY_NONE)
             asm volatile ("hlt");
@@ -506,7 +532,6 @@ void tetris_run(void) {
     window_t *sw = wm_get_shell_window();
     if (sw) {
         wm_focus_window(sw);
-        wm_draw_chrome(sw);
-        fb_console_repaint();
+        wm_redraw_all();
     }
 }

@@ -2,6 +2,7 @@
 #define _USER_UNISTD_H
 
 #include "syscall.h"
+#include "stat.h"
 
 static inline void _exit(int status) {
     syscall1(SYS_EXIT, status);
@@ -62,6 +63,42 @@ static inline int mkdir(const char *path) {
 
 static inline int unlink(const char *path) {
     return syscall1(SYS_UNLINK, (int)path);
+}
+
+/* brk() — set the program break.
+   Returns 0 on success, -1 on failure. */
+static inline int brk(void *addr) {
+    int result = syscall1(SYS_BRK, (int)addr);
+    if (addr != (void *)0 && result != (int)addr)
+        return -1;
+    return 0;
+}
+
+/* sbrk() — increment the program break by 'incr' bytes.
+   Returns pointer to the OLD break (start of new memory), or (void*)-1 on failure. */
+static inline void *sbrk(int incr) {
+    int cur = syscall1(SYS_BRK, 0);
+    if (incr == 0)
+        return (void *)cur;
+    int new_brk = cur + incr;
+    int result = syscall1(SYS_BRK, new_brk);
+    if (result != new_brk)
+        return (void *)-1;
+    return (void *)cur;
+}
+
+static inline int lseek(int fd, int offset, int whence) {
+    return syscall3(SYS_SEEK, fd, offset, whence);
+}
+
+static inline char *getcwd(char *buf, int size) {
+    int result = syscall2(SYS_GETCWD, (int)buf, size);
+    if (result < 0) return (char *)0;
+    return buf;
+}
+
+static inline int stat(const char *path, struct spike_stat *buf) {
+    return syscall2(SYS_STAT, (int)path, (int)buf);
 }
 
 #endif
