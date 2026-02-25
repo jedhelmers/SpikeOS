@@ -31,6 +31,15 @@ typedef enum {
     KEY_HOME,
     KEY_END,
     KEY_INSERT,
+
+    KEY_TAB,
+    KEY_CTRL_V,
+    KEY_CTRL_A,
+    KEY_CTRL_Q,
+    KEY_CTRL_PLUS,
+    KEY_CTRL_MINUS,
+    KEY_CTRL_Z,
+    KEY_CTRL_SHIFT_Z,
 } key_type_t;
 
 typedef struct {

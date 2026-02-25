@@ -30,6 +30,11 @@ void surface_fill_rect(surface_t *s, uint32_t x, uint32_t y,
 void surface_render_char(surface_t *s, uint32_t px, uint32_t py,
                           uint8_t ch, uint32_t fg, uint32_t bg);
 
+/* Render an 8x16 CP437 glyph scaled by integer factor (1=normal, 2=double, etc.) */
+void surface_render_char_scaled(surface_t *s, uint32_t px, uint32_t py,
+                                 uint8_t ch, uint32_t fg, uint32_t bg,
+                                 int scale);
+
 /* Draw a horizontal line within the surface */
 void surface_draw_hline(surface_t *s, uint32_t x, uint32_t y,
                          uint32_t w, uint32_t color);
