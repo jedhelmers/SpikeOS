@@ -65,6 +65,10 @@ key_event_t keyboard_get_event_blocking(void) {
     }
 }
 
+int keyboard_shift_held(void) {
+    return shift_held;
+}
+
 static void keyboard_irq(trapframe* r) {
     (void)r;
 
@@ -123,16 +127,26 @@ static void keyboard_irq(trapframe* r) {
     } else if (ctrl_held) {
         /* Ctrl+letter combinations */
         switch (sc) {
-            case 0x2E: e.type = KEY_CTRL_C; break;  /* Ctrl+C */
-            case 0x1F: e.type = KEY_CTRL_S; break;  /* Ctrl+S */
-            case 0x2D: e.type = KEY_CTRL_X; break;  /* Ctrl+X */
-            case 0x25: e.type = KEY_CTRL_K; break;  /* Ctrl+K */
+            case 0x2E: e.type = KEY_CTRL_C; break;     /* Ctrl+C */
+            case 0x1F: e.type = KEY_CTRL_S; break;     /* Ctrl+S */
+            case 0x2D: e.type = KEY_CTRL_X; break;     /* Ctrl+X */
+            case 0x25: e.type = KEY_CTRL_K; break;     /* Ctrl+K */
+            case 0x2F: e.type = KEY_CTRL_V; break;     /* Ctrl+V */
+            case 0x1E: e.type = KEY_CTRL_A; break;     /* Ctrl+A */
+            case 0x10: e.type = KEY_CTRL_Q; break;     /* Ctrl+Q */
+            case 0x0D: e.type = KEY_CTRL_PLUS; break;  /* Ctrl+= */
+            case 0x0C: e.type = KEY_CTRL_MINUS; break; /* Ctrl+- */
+            case 0x2C:                                  /* Ctrl+Z / Ctrl+Shift+Z */
+                e.type = shift_held ? KEY_CTRL_SHIFT_Z : KEY_CTRL_Z;
+                break;
         }
     } else if (sc == 0x0E) {
         /* Backspace */
         e.type = KEY_BACKSPACE;
     } else if (sc == 0x1C) {
         e.type = KEY_ENTER;
+    } else if (sc == 0x0F) {
+        e.type = KEY_TAB;
     } else if (sc < 128) {
         char c = shift_held ? scancode_to_ascii_shift[sc]
                             : scancode_to_ascii[sc];

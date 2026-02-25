@@ -51,6 +51,496 @@ cat .debug.log    # Inspect UART debug output during or after a run
 
 ## Architecture
 
+### System Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          USER SPACE (Ring 3)                            │
+│                                                                         │
+│   hello.elf    alloc_test.elf    files_test.elf    udp_test.elf         │
+│       │              │                 │                │               │
+│       └──────────────┴─────────────────┴────────────────┘               │
+│                              │                                          │
+│                    userland libc (crt0, stdio,                          │
+│                    string, stdlib, malloc)                              │
+│                              │                                          │
+│                         int $0x80                                       │
+├──────────────────────────────┼──────────────────────────────────────────┤
+│                              ▼                                          │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │                    SYSCALL DISPATCH (24 calls)                  │    │
+│  │    exit write read open close seek stat getpid sleep brk        │    │
+│  │    spawn waitpid mkdir unlink chdir getcwd pipe dup kill        │    │
+│  │    socket bind sendto recvfrom closesock                        │    │
+│  └──────────┬───────────────┬──────────────────┬───────────────────┘    │
+│             │               │                  │                        │
+│             ▼               ▼                  ▼                        │
+│  ┌─────────────────┐ ┌───────────┐  ┌──────────────────────┐            │
+│  │  PROCESS MGMT   │ │   FILE    │  │     NETWORKING       │            │
+│  │                 │ │  SYSTEM   │  │                      │            │
+│  │  Process Table  │ │           │  │  UDP Sockets ──┐     │            │
+│  │  Scheduler      │ │  VFS ◄──► │  │  DHCP Client   │     │            │
+│  │  ELF Loader     │ │  SpikeFS  │  │  ICMP Ping     │     │            │
+│  │  Signals        │ │  Pipes    │  │       │        │     │            │
+│  │  Wait Queues    │ │  FDs      │  │       ▼        ▼     │            │
+│  │  Mutex/Sem/CV   │ │  Initrd   │  │      IPv4 ◄────┘     │            │
+│  │  RW Locks       │ │           │  │       │              │            │
+│  └────────┬────────┘ └─────┬─────┘  │       ▼              │            │
+│           │                │        │      ARP             │            │
+│           │                │        │       │              │            │
+│           │                │        │       ▼              │            │
+│           │                │        │    Ethernet          │            │
+│           │                │        └───────┬──────────────┘            │
+│           │                │                │                           │
+│           ▼                ▼                ▼                           │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │                        DRIVER LAYER                              │   │
+│  │                                                                  │   │
+│  │  Timer   Keyboard  Mouse  UART   ATA Disk  Framebuffer  e1000    │   │
+│  │  (IRQ0)  (IRQ1)   (IRQ12) (IRQ4) (PIO)     (MMIO)      (MMIO)    │   │
+│  └──────────────────────────┬───────────────────────────────────────┘   │
+│                             │                                           │
+│                             ▼                                           │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │                     HARDWARE ABSTRACTION LAYER                   │   │
+│  │      hal_irq_save/restore  hal_inb/outb  hal_set_cr3  ...        │   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+│                             │                                           │
+│  ┌──────────────────────────┴───────────────────────────────────────┐   │
+│  │                    MEMORY MANAGEMENT                             │   │
+│  │     Paging (2-level)  │  Frame Allocator  │  Heap (kmalloc)      │   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+│                             │                                           │
+│  ┌──────────────────────────┴───────────────────────────────────────┐   │
+│  │                         CORE (i386)                              │   │
+│  │        GDT  │  IDT  │  TSS  │  ISR/IRQ stubs  │  PIC             │   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+│                          KERNEL SPACE (Ring 0)                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Virtual Address Space
+
+```
+ 0xFFFFFFFF ┌───────────────────────────────┐
+            │                               │
+            │        (unmapped)             │
+            │                               │
+ 0xC0C00000 ├───────────────────────────────┤  PDE[771]
+            │   e1000 NIC MMIO (128 KB)     │  PAGE_CACHE_DISABLE
+ 0xC0800000 ├───────────────────────────────┤  PDE[770]
+            │   Framebuffer (up to 4 MB)    │  PAGE_CACHE_DISABLE
+ 0xC0400000 ├───────────────────────────────┤  PDE[769]
+            │   Kernel Heap (up to 4 MB)    │  first-fit free-list
+            │   kmalloc / kfree             │
+ 0xC03FF000 ├ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┤
+            │   Temp mapping window (4 KB)  │  PTE[1023] of first_page_table
+ 0xC0200000 ├───────────────────────────────┤  PDE[768]
+            │   Kernel Image (.text, .data, │
+            │   .bss, .rodata)              │  Higher-half mapping
+ 0xC0000000 ├═══════════════════════════════┤  KERNEL_VMA_OFFSET
+            │                               │
+            │                               │
+            │   User Space                  │  Per-process page directories
+            │   (0x00000000 – 0xBFFFFFFF)   │
+            │                               │
+            │   ELF programs load at        │
+            │   0x08048000                  │
+            │                               │
+            │   User heap grows up          │
+            │   from end of ELF image       │
+            │   via brk()/sbrk()            │
+            │                               │
+ 0x00400000 ├───────────────────────────────┤
+            │   Identity map (first 4 MB)   │  PDE[0], bootstrap only
+ 0x00200000 │ ─ Kernel physical load addr ─ │  GRUB loads here
+ 0x00000000 └───────────────────────────────┘
+```
+
+### Boot Flow
+
+```
+ GRUB/Multiboot
+       │
+       ▼
+ ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+ │   boot.S     │────▶│  kernel.c    │────▶│  Boot Splash │
+ │              │     │  kernel_main │     │ (if !verbose)│
+ │  Multiboot   │     │              │     └──────┬───────┘
+ │  header      │     │  1. Terminal │            │
+ │  Bootstrap   │     │  2. GDT/IDT  │            ▼
+ │  paging      │     │  3. TSS/PIC  │     ┌──────────────┐
+ │  Jump to     │     │  4. Paging   │     │  Window Mgr  │
+ │  higher-half │     │  5. Heap     │     │  + FB Console│
+ └──────────────┘     │  6. FB/Initrd│     │  + Desktop   │
+                      │  7. ATA/VFS  │     └──────┬───────┘
+                      │  8. SpikeFS  │            │
+                      │  9. FD/Pipe  │            ▼
+                      │ 10. Process  │     ┌──────────────┐
+                      │ 11. Scheduler│     │    Shell     │
+                      │ 12. Timer ◀──│──   │  (kernel     │
+                      │ 13. Keyboard │  │  │   thread)    │
+                      │ 14. Mouse    │  │  └──────────────┘
+                      │ 15. UART     │  │
+                      │ 16. PCI/NIC  │  └─── IRQs enabled:
+                      │ 17. Network  │       scheduler is
+                      │ 18. DHCP     │       now running
+                      └──────────────┘
+```
+
+### Process Lifecycle
+
+```
+                    proc_create_kernel_thread()
+                    proc_create_user_process()
+                              │
+                              ▼
+                         ┌─────────┐
+                         │   NEW   │
+                         └────┬────┘
+                              │  added to proc_table
+                              ▼
+      ┌──────────────── ┌─────────┐ ◀────── wake_up_one()
+      │                 │  READY  │          wake_up_all()
+      │                 └────┬────┘
+      │                      │  scheduler picks (round-robin)
+      │                      ▼
+      │                ┌──────────┐
+      │                │ RUNNING  │ ◀─┐
+      │                └────┬─────┘   │  timer IRQ0 preemption
+      │                     │         │  (100 Hz tick)
+      │  sleep_on()         │         │
+      │  pipe_read/write    │  ┌──────┘
+      │  waitpid            │  │
+      │  keyboard_blocking  │  │ scheduler_tick()
+      │                     │  │
+      ▼                     │  │
+ ┌─────────┐                │  │
+ │ BLOCKED │                │  │
+ └─────────┘                ▼  │
+                     proc_kill()
+                     signal delivery
+                           │
+                           ▼
+                      ┌─────────┐
+                      │ ZOMBIE  │ ──── waitpid() reaps
+                      └─────────┘
+```
+
+### Interrupt Flow
+
+```
+ Hardware Event (keyboard, timer, NIC, etc.)
+       │
+       ▼
+ ┌──────────┐    vector      ┌───────────────────┐
+ │   PIC    │───────────────▶│   irq_stub.S      │
+ │ (8259A)  │  IRQ 0-15      │   Push trapframe  │
+ │          │  mapped to     │   Call C handler  │
+ └──────────┘  vectors 32-47 └─────────┬─────────┘
+                                       │
+                 ┌────────────────────┬┴───────────────────┐
+                 │                    │                    │
+                 ▼                    ▼                    ▼
+          ┌────────────┐    ┌──────────────┐     ┌──────────────┐
+          │ IRQ 0      │    │ IRQ 1        │     │ Vectors 0-31 │
+          │ Timer      │    │ Keyboard     │     │ Exceptions   │
+          │            │    │              │     │              │
+          │ scheduler_ │    │ kbd_push()   │     │ ISR 14:      │
+          │ tick()     │    │ wake_up_one()│     │ page fault   │
+          │            │    │              │     │              │
+          │ Context    │    │ event_push() │     │ ISR 128:     │
+          │ switch if  │    │              │     │ int $0x80    │
+          │ preempted  │    └──────────────┘     │ syscall      │
+          └────────────┘                         │ dispatch     │
+                │                                └──────────────┘
+                ▼
+        ┌──────────────┐
+        │ pick_next()  │   If new process selected:
+        │              │   1. Save ESP
+        │ Round-robin  │   2. Update TSS esp0
+        │ READY scan   │   3. Switch CR3 (if different PD)
+        │              │   4. Return new ESP
+        └──────────────┘      → isr_stub.S does `mov %eax, %esp`
+```
+
+### Storage Stack
+
+```
+  Shell commands                     GUI Editor
+  (cat, write, cp, mv)              (load/save)
+         │                               │
+         ▼                               ▼
+  ┌──────────────────────────────────────────────────────┐
+  │                  FILE DESCRIPTORS                    │
+  │          Per-process table (16 fds each)             │
+  │          System-wide pool (64 entries)               │
+  │                                                      │
+  │   fd 0,1,2 = Console    fd N = VFS file / Pipe       │
+  └──────────────────────────┬───────────────────────────┘
+                             │
+                             ▼
+  ┌──────────────────────────────────────────────────────┐
+  │               VIRTUAL FILE SYSTEM (VFS)              │
+  │                                                      │
+  │   In-memory inode table (64 → 8192, dynamic)         │
+  │   Files: kmalloc'd byte buffers                      │
+  │   Dirs:  kmalloc'd dirent arrays                     │
+  │   Path resolution: iterative walk from root/cwd      │
+  │   Dirty tracking for write-back                      │
+  │                                                      │
+  │   vfs_read() / vfs_write() / vfs_resolve()           │
+  └──────┬────────────────────────────────────┬──────────┘
+         │  boot                    sync /    │
+         │                         auto-save  │
+         ▼                                    ▼
+  ┌──────────────┐              ┌──────────────────────┐
+  │    INITRD    │              │      SpikeFS v3      │
+  │              │              │                      │
+  │  GRUB module │              │  Superblock          │
+  │  Read-only   │              │  Block bitmap        │
+  │  Imported to │              │  Inode chunks (8/blk)│
+  │  VFS at boot │              │  Imap chain          │
+  │              │              │  Data blocks         │
+  └──────────────┘              └──────────┬───────────┘
+                                           │
+                                           ▼
+                                ┌──────────────────────┐
+                                │     ATA PIO DRIVER   │
+                                │                      │
+                                │  28-bit LBA          │
+                                │  Port 0x1F0          │
+                                │  Interrupt-safe      │
+                                │  (hal_irq_save)      │
+                                └──────────┬───────────┘
+                                           │
+                                           ▼
+                                ┌──────────────────────┐
+                                │   disk.img (64 MB)   │
+                                │   131072 sectors     │
+                                │   IDE primary master │
+                                └──────────────────────┘
+```
+
+### Network Stack
+
+```
+  Shell commands               Syscalls (userland)
+  (ping, netinfo,             (bind, sendto,
+   udpsend)                    recvfrom, closesock)
+       │                            │
+       ▼                            ▼
+  ┌──────────────────────────────────────────────────┐
+  │                  UDP SOCKETS                     │
+  │            8-slot table, per-socket              │
+  │            2 KB recv buffer + wait queue         │
+  └──────────────────────────┬───────────────────────┘
+                             │
+       ┌─────────────────────┼─────────────────────┐
+       │                     │                     │
+       ▼                     ▼                     ▼
+  ┌──────────┐       ┌──────────────┐      ┌────────────┐
+  │   ICMP   │       │     UDP      │      │    DHCP    │
+  │          │       │              │      │            │
+  │  Echo    │       │  Port-based  │      │  DISCOVER  │
+  │  req/rep │       │  dispatch    │      │  OFFER     │
+  │  Ping    │       │              │      │  REQUEST   │
+  └────┬─────┘       └──────┬───────┘      │  ACK       │
+       │                    │              │            │
+       └─────────┬──────────┘              │  Raw frame │
+                 │                         │  build     │
+                 ▼                         └─────┬──────┘
+  ┌──────────────────────────────┐               │
+  │            IPv4              │               │
+  │                              │               │
+  │  RFC 1071 checksum           │               │
+  │  TTL=64                      │               │
+  │  Next-hop routing:           │               │
+  │    same subnet → direct      │               │
+  │    else → gateway            │               │
+  └──────────────┬───────────────┘               │
+                 │                               │
+                 ▼                               │
+  ┌──────────────────────────────┐               │
+  │            ARP               │               │
+  │                              │               │
+  │  16-entry cache              │               │
+  │  Blocking resolve (3s)       │               │
+  │  Request/reply               │               │
+  └──────────────┬───────────────┘               │
+                 │                               │
+                 ▼                               │
+  ┌──────────────────────────────┐◀──────────────┘
+  │          ETHERNET            │
+  │                              │
+  │  eth_send(): build frame     │
+  │  net_rx_callback(): dispatch │
+  │  Pad to 60 bytes minimum     │
+  └──────────────┬───────────────┘
+                 │
+                 ▼
+  ┌──────────────────────────────┐
+  │      e1000 NIC DRIVER        │
+  │                              │
+  │  MMIO at 0xC0C00000          │
+  │  16 TX / 32 RX descriptors   │
+  │  IRQ-driven receive          │
+  │  nic->send() abstraction     │
+  └──────────────────────────────┘
+```
+
+### Window Manager & GUI Stack
+
+```
+  ┌──────────────────────────────────────────────────────────┐
+  │                    SCREEN (1024×768)                     │
+  │  ┌────────────────────────────────────────────────────┐  │
+  │  │            Desktop Menu Bar (22px)                 │  │
+  │  │     "SpikeOS"  │  File  Edit  View                 │  │
+  │  ├────────────────────────────────────────────────────┤  │
+  │  │                                                    │  │
+  │  │    ┌──────────────────────────────────────┐        │  │
+  │  │    │ ● ● ●     Edit: hello.txt            │        │  │
+  │  │    │  File  Edit  View                    │◀─ WM   │  │
+  │  │    ├──────────────────────────────────────┤  menus │  │
+  │  │    │ Cut │ Copy │ Paste │ A+ │ A- │ Save  │◀─ Tool │  │
+  │  │    ├──────────────────────────────────────┤   bar  │  │
+  │  │    │                                      │        │  │
+  │  │    │  Hello world!                        │◀─ Text │  │
+  │  │    │  This is a test file.                │  area  │  │
+  │  │    │  ████████████ ◀── selection          │        │  │
+  │  │    │  Tabs→   expand to 4-col stops       │        │  │
+  │  │    │                                      │        │  │
+  │  │    │                                      │        │  │
+  │  │    ├──────────────────────────────────────┤        │  │
+  │  │    │ hello.txt [Modified]    Ln 3, Col 12 │◀─ Stat.│  │
+  │  │    └──────────────────────────────────────┘  bar   │  │
+  │  │                                                    │  │
+  │  │       Desktop icons (double-click opens editor)    │  │
+  │  │                                                    │  │
+  │  └────────────────────────────────────────────────────┘  │
+  └──────────────────────────────────────────────────────────┘
+
+  Rendering pipeline:
+  ┌─────────────┐     ┌──────────────┐     ┌──────────────┐
+  │  Window     │────▶│  Surface     │────▶│  Framebuffer │
+  │  (logical)  │     │  (back buf)  │     │  (MMIO)      │
+  │             │     │              │     │              │
+  │  content_x  │     │  XRGB8888    │     │  PDE[770]    │
+  │  content_y  │     │  pixel array │     │  0xC0800000  │
+  │  content_w  │     │              │     │              │
+  │  content_h  │     │  surface_    │     │  surface_    │
+  │             │     │  render_char │     │  blit_to_fb  │
+  │  menus[]    │     │  _scaled()   │     │              │
+  │  repaint()  │     │              │     │  mouse_hide/ │
+  │             │     │  surface_    │     │  show_cursor │
+  │             │     │  fill_rect() │     │              │
+  └─────────────┘     └──────────────┘     └──────────────┘
+```
+
+### GUI Editor Architecture
+
+```
+  ┌─────────────────────────────────────────────────────┐
+  │                gui_editor_thread()                  │
+  │                (kernel thread)                      │
+  ├─────────────────────────────────────────────────────┤
+  │                                                     │
+  │  ┌───────────────┐    ┌──────────────────────────┐  │
+  │  │  LINE BUFFER  │    │     UNDO / REDO          │  │
+  │  │               │    │                          │  │
+  │  │  lines[1024]  │    │  undo_stack[256]         │  │
+  │  │  line_len[]   │    │  redo_stack[256]         │  │
+  │  │  line_cap[]   │    │                          │  │
+  │  │  nlines       │    │  CMD_INSERT / CMD_DELETE │  │
+  │  │               │    │  Consecutive char merge  │  │
+  │  └───────┬───────┘    └────────────┬─────────────┘  │
+  │          │                         │                │
+  │          ▼                         ▼                │
+  │  ┌─────────────────────────────────────────────┐    │
+  │  │          EDITING COMMANDS                   │    │
+  │  │                                             │    │
+  │  │  ge_do_insert()  ──▶ ge_raw_insert()        │    │
+  │  │  ge_do_delete()  ──▶ ge_raw_delete()        │    │
+  │  │                      ge_extract_text()      │    │
+  │  │                                             │    │
+  │  │  ge_undo()  ◀──▶  undo_stack / redo_stack   │    │
+  │  │  ge_redo()                                  │    │
+  │  └──────────────────────┬──────────────────────┘    │
+  │                         │                           │
+  │  ┌──────────────────────┴──────────────────────┐    │
+  │  │           SELECTION + CLIPBOARD             │    │
+  │  │                                             │    │
+  │  │  sel_anchor_x/y  ←→  cursor cx/cy           │    │
+  │  │  ge_in_selection() for rendering            │    │
+  │  │  ge_copy_selection() → global clipboard     │    │
+  │  │  ge_paste() ← global clipboard              │    │
+  │  │  Double-click: word select                  │    │
+  │  │  Triple-click: line select                  │    │
+  │  └─────────────────────────────────────────────┘    │
+  │                         │                           │
+  │  ┌──────────────────────┴──────────────────────┐    │
+  │  │              RENDERING                      │    │
+  │  │                                             │    │
+  │  │  Word wrap mode ←→ Horizontal scroll mode   │    │
+  │  │  Tab expansion (4-col stops)                │    │
+  │  │  Font scaling (1x, 2x, 3x)                  │    │
+  │  │  Selection highlighting (blue bg)           │    │
+  │  │  Cursor (underline bar)                     │    │
+  │  │  Toolbar + Status bar                       │    │
+  │  │                                             │    │
+  │  │  gui_editor_draw() → surface_blit_to_fb()   │    │
+  │  └─────────────────────────────────────────────┘    │
+  │                                                     │
+  │  ┌─────────────────────────────────────────────┐    │
+  │  │              INPUT LOOP                     │    │
+  │  │                                             │    │
+  │  │  wm_process_events() → mouse/keyboard       │    │
+  │  │  Mouse: toolbar clicks, text area clicks,   │    │
+  │  │         click-drag selection                │    │
+  │  │  Keyboard: editing keys, Ctrl combos,       │    │
+  │  │           Shift+arrow selection             │    │
+  │  │  Focus-gated: ignores input when unfocused  │    │
+  │  └─────────────────────────────────────────────┘    │
+  └─────────────────────────────────────────────────────┘
+```
+
+### SpikeFS On-Disk Layout
+
+```
+  Sector 0                   Sectors 1..B              Sectors B+1..end
+  ┌───────────────┐   ┌──────────────────────┐   ┌──────────────────────────┐
+  │  SUPERBLOCK   │   │    BLOCK BITMAP      │   │      DATA POOL           │
+  │               │   │                      │   │                          │
+  │  magic:       │   │  1 bit per data      │   │  ┌───────────────────┐   │
+  │  "SKFS"       │   │  block               │   │  │  Inode Chunk      │   │
+  │  (0x534B4653) │   │                      │   │  │  8 inodes × 64B   │   │
+  │               │   │  Cleared and         │   │  │  = 512B (1 sector)│   │
+  │  version: 3   │   │  rebuilt on          │   │  └───────────────────┘   │
+  │               │   │  every sync          │   │  ┌──────────────────┐    │
+  │  total_blocks │   │                      │   │  │  File Data       │    │
+  │  bitmap_sects │   │                      │   │  │  (variable size) │    │
+  │  data_start   │   │                      │   │  └──────────────────┘    │
+  │  imap_block   │───┼──────────────────────┼──▶│  ┌──────────────────┐    │
+  │               │   │                      │   │  │  Imap Block      │    │
+  └───────────────┘   └──────────────────────┘   │  │  127 chunk ptrs  │    │
+                                                 │  │  + next ptr      │────┤
+                                                 │  └──────────────────┘    │
+                                                 │  ┌──────────────────┐    │
+                                                 │  │  Dir Data        │    │
+                                                 │  │  64B dirents     │    │
+                                                 │  │  (name + inode#) │    │
+                                                 │  └──────────────────┘    │
+                                                 │          ...             │
+                                                 └──────────────────────────┘
+
+  On-disk inode (64 bytes):
+  ┌──────┬────────────┬──────┬────────────────────────────┬────────────┐
+  │ type │ link_count │ size │  12 direct block pointers  │ 1 indirect │
+  │ (4B) │   (4B)     │ (4B) │       (48B)                │   (4B)     │
+  └──────┴────────────┴──────┴────────────────────────────┴────────────┘
+```
+
 ### Memory Layout
 
 - Physical load address: `0x00200000` (GRUB loads here)
@@ -143,6 +633,50 @@ All init `printf` calls are wrapped in `#ifdef VERBOSE_BOOT`. Without the flag, 
 
 ### Paging
 
+```
+  Virtual Address
+  ┌──────────────────┐
+  │  31..22  │ 10 bits │─── Page Directory Index (1024 entries)
+  │  21..12  │ 10 bits │─── Page Table Index (1024 entries)
+  │  11..0   │ 12 bits │─── Offset within 4 KB page
+  └──────────────────┘
+
+  CR3 ──▶ ┌──────────────────────────────┐
+          │       PAGE DIRECTORY          │  1024 × 4-byte entries
+          │                              │
+          │  PDE[0]   → Identity map     │  First 4 MB (bootstrap)
+          │  PDE[768] → Higher-half      │  Kernel image
+          │  PDE[769] → Heap table       │  Kernel heap
+          │  PDE[770] → Framebuffer      │  FB MMIO
+          │  PDE[771] → e1000 NIC        │  NIC MMIO
+          └──────────┬───────────────────┘
+                     │ each PDE points to
+                     ▼
+          ┌──────────────────────────────┐
+          │        PAGE TABLE            │  1024 × 4-byte entries
+          │                              │
+          │  PTE[i] → physical frame     │  4 KB page
+          │  Flags: present, RW, user,   │
+          │         cache-disable        │
+          └──────────────────────────────┘
+
+  Physical Frame Allocator:
+  ┌─────────────────────────────────────────┐
+  │  Bitmap: 16384 bits (64 MB addressable)  │
+  │  1 bit per 4 KB frame                   │
+  │  alloc_frame() → first free bit         │
+  │  free_frame()  → clear bit              │
+  └─────────────────────────────────────────┘
+
+  Temp Mapping Window (for safe physical access):
+  ┌──────────────────────────────────────────┐
+  │  VA 0xC03FF000 (PTE[1023])              │
+  │  temp_map(phys) → set PTE, invlpg, CLI  │
+  │  temp_unmap()   → clear PTE, restore IF  │
+  │  Interrupt-safe: saves/restores EFLAGS   │
+  └──────────────────────────────────────────┘
+```
+
 - Two-level page tables: `page_directory[1024]` -> `page_table[1024]`
 - `paging_init()` sets up identity map (PDE[0]) + higher-half map (PDE[768]) + heap table (PDE[769])
 - `map_page(virt, phys, flags)` — dynamic mapping with `invlpg` TLB invalidation; uses `temp_map()` for safe page table access; returns 0 on success, -1 on failure
@@ -152,6 +686,25 @@ All init `printf` calls are wrapped in `#ifdef VERBOSE_BOOT`. Without the flag, 
 
 ### Per-Process Page Directories
 
+```
+  Kernel Process (cr3=0)          User Process (cr3=pd_phys)
+  ┌────────────────────┐          ┌────────────────────┐
+  │   Kernel's PD      │          │   Cloned PD        │
+  │                    │          │                    │
+  │  PDE[0..767]:      │          │  PDE[0..767]:      │
+  │  (unused/user)     │          │  User page tables  │◀── pgdir_map_user_page()
+  │                    │          │  (private per-proc) │
+  │  PDE[768..1023]:   │          │  PDE[768..1023]:   │
+  │  Kernel mappings   │═════════▶│  Cloned from kernel│
+  │  (shared)          │          │  (shared view)     │
+  └────────────────────┘          └────────────────────┘
+                                         ▲
+  Context switch:                        │
+  scheduler picks next process ──────────┘
+  → hal_set_cr3(next->cr3)
+  → TLB flushed automatically
+```
+
 - Each process has a `cr3` field (physical address of its page directory)
 - `pgdir_create()` — allocates a physical frame, clones all 1024 kernel PDEs via `temp_map`
 - `pgdir_map_user_page()` — maps a page in a specific process's PD; auto-clones shared kernel page tables when `PAGE_USER` is needed
@@ -159,6 +712,31 @@ All init `printf` calls are wrapped in `#ifdef VERBOSE_BOOT`. Without the flag, 
 - Scheduler switches CR3 on context switch when processes have different page directories
 
 ### Heap Allocator
+
+```
+  0xC0400000                                              0xC0800000
+  │                    Kernel Heap (up to 4 MB)                   │
+  ▼                                                               ▼
+  ┌─────────┬──────────────┬─────────┬──────────────┬─────────┬───┐
+  │  HEADER │  USED BLOCK  │ HEADER  │  FREE BLOCK  │ HEADER  │...│
+  │  16B    │  (payload)   │  16B    │  (available) │  16B    │   │
+  └─────────┴──────────────┴─────────┴──────────────┴─────────┴───┘
+       │                        │
+       ▼                        ▼
+  ┌──────────────┐        ┌──────────────┐
+  │ size (incl.  │        │ size         │
+  │   header)    │        │ free = 1     │
+  │ free = 0     │        │ prev ────────│──▶ previous block
+  │ prev ────────│──▶     │ next ────────│──▶ next block
+  │ next ────────│──▶     └──────────────┘
+  └──────────────┘
+                                   Allocation: first-fit scan
+  kmalloc(N):                      ┌─────────────────────────────┐
+  1. Round up to 16-byte aligned   │ Split if remainder > header  │
+  2. Walk free list → first fit    │ Coalesce on kfree (fwd+back)│
+  3. hal_irq_save (interrupt-safe) │ heap_grow() if no fit found  │
+  └────────────────────────────────┴─────────────────────────────┘
+```
 
 - First-fit free-list with block splitting and forward/backward coalescing
 - `kmalloc(size)` / `kfree(ptr)` / `kcalloc(n, size)` / `krealloc(ptr, size)`
@@ -174,6 +752,25 @@ All init `printf` calls are wrapped in `#ifdef VERBOSE_BOOT`. Without the flag, 
 - Enables ring-3 -> ring-0 transitions on interrupts
 
 ### Syscall Interface
+
+```
+  User Process (Ring 3)                    Kernel (Ring 0)
+  ┌──────────────────┐                    ┌──────────────────────┐
+  │  mov eax, SYS_*  │                    │  syscall_dispatch()  │
+  │  mov ebx, arg1   │   int $0x80        │                      │
+  │  mov ecx, arg2   │──────────────────▶ │  1. Validate user    │
+  │  mov edx, arg3   │                    │     pointers (reject │
+  │  int $0x80       │   IDT vector 128   │     >= 0xC0000000)   │
+  │                  │   DPL=3 gate       │  2. syscall_table[eax]│
+  │  (result in eax) │ ◀──────────────────│  3. signal_check()   │
+  └──────────────────┘                    └──────────────────────┘
+                           │
+                    ┌──────┴──────┐
+                    │    TSS      │  CPU auto-switches:
+                    │ ss0 = 0x10  │  SS:ESP → kernel stack
+                    │ esp0 = ...  │  CS → 0x08 (kernel code)
+                    └─────────────┘
+```
 
 - `int $0x80` with IDT gate DPL=3
 - Convention: EAX=syscall number, EBX/ECX/EDX=args, return value in EAX
@@ -369,11 +966,27 @@ Two text editors: a nano-like shell editor and a GUI windowed editor.
 
 **Shell editor** (`edit <filename>`): runs in the shell window. Arrow keys, Home/End, Page Up/Down for navigation. Ctrl+S to save, Ctrl+X to quit, Ctrl+K to cut line. Status bar at bottom.
 
-**GUI editor** (double-click a desktop file icon): runs as its own kernel thread in a separate window (up to 4 concurrent instances). Features:
-- File menu with Save and Quit actions
-- Mouse click-to-position cursor (converts pixel coords to text grid position)
-- Focus-gated keyboard (only receives keys when its window is focused)
-- Same editing keys as the shell editor
+**GUI editor** (double-click a desktop file icon): runs as its own kernel thread in a separate window (up to 4 concurrent instances). A full-featured text editor with:
+
+- **Toolbar**: Cut, Copy, Paste, A+, A-, Save buttons below the title bar
+- **Three menus**: File (Save/Quit), Edit (Cut/Copy/Paste/Select All/Undo/Redo), View (Zoom In/Zoom Out/Toggle Wrap)
+- **Tab support**: 4-column tab stops with proper visual alignment
+- **Font scaling**: 1x/2x/3x integer scaling (Ctrl+= / Ctrl+-)
+- **Word wrap** (default on): lines wrap at the right edge; toggle to horizontal scroll mode via View menu
+- **Selection**: Shift+arrow keys, mouse click-drag, double-click to select word, triple-click to select line
+- **Clipboard**: Ctrl+C/X/V — shared across all editor instances
+- **Undo/redo**: Ctrl+Z / Ctrl+Shift+Z — command pattern with consecutive char merge for word-level undo
+- **Focus-gated keyboard**: only receives keys when its window is focused
+
+| Key | Action |
+|-----|--------|
+| Ctrl+S | Save |
+| Ctrl+Q | Quit |
+| Ctrl+C / Ctrl+X / Ctrl+V | Copy / Cut / Paste |
+| Ctrl+A | Select All |
+| Ctrl+K | Cut line |
+| Ctrl+Z / Ctrl+Shift+Z | Undo / Redo |
+| Ctrl+= / Ctrl+- | Zoom in / Zoom out |
 
 ### Boot Splash
 
@@ -482,7 +1095,7 @@ Shell prompt shows current working directory: `jedhelmers:/path> `
 | `kernel/proc/rwlock.c` | Read-write lock implementation |
 | `kernel/shell/shell.c` | Kernel shell with command parsing, filesystem commands, test commands, auto write-back, focus-gated keyboard |
 | `kernel/shell/editor.c` | Nano-like shell text editor (`edit` command) |
-| `kernel/shell/gui_editor.c` | GUI windowed text editor (kernel thread, own window, mouse click-to-cursor, File menu) |
+| `kernel/shell/gui_editor.c` | GUI windowed text editor: toolbar, font scaling, word wrap/hscroll, selection/clipboard, undo/redo, double/triple click |
 | `kernel/shell/boot_splash.c` | 1980s-style retro boot splash |
 | `kernel/arch/i386/hal.c` | HAL implementation for i386: interrupt, I/O, TLB, MMU wrappers |
 | `kernel/arch/i386/isr_stub.S` | ISR/IRQ/syscall assembly stubs, context switch via stack swap |
