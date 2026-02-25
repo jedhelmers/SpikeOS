@@ -13,7 +13,7 @@ cc -o tools/mkinitrd tools/mkinitrd.c
 make -C userland
 
 # Create initrd
-tools/mkinitrd initrd.img userland/hello.elf
+tools/mkinitrd initrd.img userland/*.elf
 
 mkdir -p isodir
 mkdir -p isodir/boot

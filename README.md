@@ -122,7 +122,7 @@ All init `printf` calls are wrapped in `#ifdef VERBOSE_BOOT`. Without the flag, 
 | `libc/` | Freestanding kernel libc (`libk.a`): printf, string, stdlib/abort |
 | `scripts/` | Build, run, and setup scripts |
 | `tools/` | Host-side build tools (mkinitrd) |
-| `userland/` | User-mode programs and libc (crt0, syscall wrappers, stdio, string) |
+| `userland/` | User-mode programs and libc (crt0, syscall wrappers, stdio, string, stdlib, malloc) |
 | `sysroot/` | Staging install directory (headers + libraries) |
 | `isodir/` | ISO staging directory with GRUB config |
 
@@ -359,9 +359,13 @@ Freestanding C library for user-mode programs (`userland/libc/`). Built with `-n
 
 - `crt0.S` — C runtime startup (`_start` → `main()` → `_exit()`)
 - `syscall.h` — inline `int $0x80` wrappers for all 19 syscalls
-- `unistd.h` — POSIX-like function wrappers (write, read, getpid, spawn, kill, etc.)
+- `unistd.h` — POSIX-like function wrappers: `_exit`, `write`, `read`, `open`, `close`, `getpid`, `spawn`, `waitpid`, `kill`, `brk`, `sbrk`, `lseek`, `getcwd`, `stat`, `chdir`, `mkdir`, `unlink`, `spike_pipe`, `dup`, `spike_sleep`
+- `stat.h` — userland `struct spike_stat` (matches kernel), `O_*` flags, `SEEK_*` constants, `S_TYPE_*` macros
 - `stdio.h/c` — `printf` (`%d`, `%u`, `%x`, `%s`, `%c`, `%%`), `putchar`, `puts`
-- `string.h/c` — `strlen`, `memcpy`, `memset`, `strcmp`, `strcpy`
+- `string.h/c` — `strlen`, `memcpy`, `memset`, `strcmp`, `strcpy`, `strchr`, `strrchr`, `strncpy`, `strncmp`, `strcat`, `strncat`, `strstr`, `memcmp`, `memmove`
+- `stdlib.h/c` — `atoi`, `strtol`, `abs`, `rand`/`srand` (LCG), `exit`; declares `malloc`/`free`/`calloc`/`realloc`
+- `malloc.c` — userland heap allocator: first-fit free-list with block splitting and forward coalescing, grows via `sbrk()`, 8-byte aligned, 4 KB minimum sbrk increment
+- User programs: `hello.elf` (printf/getpid), `alloc_test.elf` (6-suite heap test), `files_test.elf` (6-suite filesystem test). Run via `exec <name>` in the shell.
 - Build: `make -C userland` (called automatically by `scripts/iso.sh`)
 
 ### UEFI Boot Support
@@ -440,9 +444,17 @@ Shell prompt shows current working directory: `jedhelmers:/path> `
 | `kernel/arch/i386/boot.S` | Multiboot entry, bootstrap paging, jump to higher-half |
 | `kernel/arch/i386/linker.ld` | Linker script: physical load at 0x200000, VMA at 0xC0000000+ |
 | `userland/hello.c` | User-mode test program using libc |
+| `userland/alloc_test.c` | Heap allocator test (malloc/free/calloc/realloc/stress, 6 suites) |
+| `userland/files_test.c` | Filesystem syscall test (getcwd/file I/O/stat/lseek/mkdir/unlink, 6 suites) |
 | `userland/Makefile` | Build rules for userland libc + user programs |
 | `userland/libc/syscall.h` | Inline `int $0x80` syscall wrappers |
+| `userland/libc/unistd.h` | POSIX-like syscall wrappers (brk, sbrk, lseek, getcwd, stat, etc.) |
+| `userland/libc/stat.h` | `spike_stat` struct, O_*/SEEK_*/S_TYPE_* constants |
 | `userland/libc/stdio.c` | User-mode printf/putchar/puts |
+| `userland/libc/string.c` | String/memory functions (14 functions) |
+| `userland/libc/stdlib.h` | Stdlib declarations (malloc/free/calloc/realloc, atoi, strtol, rand) |
+| `userland/libc/stdlib.c` | Stdlib implementations (atoi, strtol, abs, rand/srand, exit) |
+| `userland/libc/malloc.c` | Userland heap allocator (first-fit free-list, sbrk-based) |
 | `scripts/qemu.sh` | Build + run in QEMU (BIOS) |
 | `scripts/qemu-uefi.sh` | Build + run in QEMU with UEFI firmware (OVMF/EDK2) |
 | `scripts/setup-efi.sh` | One-time setup: symlinks x86_64-efi GRUB modules for hybrid ISO |

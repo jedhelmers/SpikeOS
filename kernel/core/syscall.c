@@ -294,7 +294,7 @@ static int32_t sys_waitpid(trapframe *tf) {
 static int32_t sys_mkdir(trapframe *tf) {
     const char *path = (const char *)tf->ebx;
     if (bad_user_string(path)) return -1;
-    return vfs_mkdir(path);
+    return vfs_mkdir(path) < 0 ? -1 : 0;
 }
 
 /* ------------------------------------------------------------------ */

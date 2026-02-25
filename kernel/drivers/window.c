@@ -1,4 +1,5 @@
 #include <kernel/window.h>
+#include <kernel/surface.h>
 #include <kernel/framebuffer.h>
 #include <kernel/fb_console.h>
 #include <kernel/event.h>
@@ -65,6 +66,14 @@ void wm_update_content_rect(window_t *win) {
     /* Snap content to character grid */
     win->content_w = (win->content_w / FONT_W) * FONT_W;
     win->content_h = (win->content_h / FONT_H) * FONT_H;
+
+    /* Recreate back buffer if content size changed */
+    if (win->surface &&
+        (win->surface->width != win->content_w ||
+         win->surface->height != win->content_h)) {
+        surface_destroy(win->surface);
+        win->surface = surface_create(win->content_w, win->content_h);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -497,6 +506,9 @@ window_t *wm_create_window(int32_t x, int32_t y, uint32_t w, uint32_t h,
 
     wm_update_content_rect(win);
 
+    /* Allocate per-window back buffer for content area */
+    win->surface = surface_create(win->content_w, win->content_h);
+
     /* Insert at top of z-order */
     if (!win_bottom) {
         win_bottom = win_top = win;
@@ -536,6 +548,9 @@ void wm_destroy_window(window_t *win) {
         dropdown_win = NULL;
         dropdown_menu_idx = -1;
     }
+
+    /* Free back buffer */
+    if (win->surface) surface_destroy(win->surface);
 
     kfree(win);
 
@@ -782,11 +797,13 @@ void wm_redraw_all(void) {
     for (window_t *w = win_bottom; w; w = w->next) {
         if (w->flags & WIN_FLAG_VISIBLE) {
             wm_draw_chrome(w);
-            /* Call per-window repaint callback */
+            /* Call per-window repaint callback (renders to surface).
+               Shell surface is maintained incrementally — just blit it. */
             if (w->repaint)
                 w->repaint(w);
-            else if (w == shell_win)
-                fb_console_repaint();
+            /* Blit back buffer to framebuffer at content position */
+            if (w->surface)
+                surface_blit_to_fb(w->surface, w->content_x, w->content_y);
         }
     }
 
@@ -925,11 +942,9 @@ static void drag_move(window_t *win, int32_t mx, int32_t my) {
     /* Draw chrome at new position */
     wm_draw_chrome(win);
 
-    /* Repaint content via callback */
-    if (win->repaint)
-        win->repaint(win);
-    else if (win == shell_win)
-        fb_console_repaint();
+    /* Blit existing back buffer — content is already rendered */
+    if (win->surface)
+        surface_blit_to_fb(win->surface, win->content_x, win->content_y);
 
     mouse_show_cursor();
 }
@@ -1020,11 +1035,13 @@ static void resize_move(window_t *win, int32_t mx, int32_t my) {
 
     wm_draw_chrome(win);
 
-    /* Repaint content via callback */
+    /* Repaint content into new surface, then blit */
     if (win->repaint)
         win->repaint(win);
     else if (win == shell_win)
         fb_console_repaint();
+    if (win->surface)
+        surface_blit_to_fb(win->surface, win->content_x, win->content_y);
 
     mouse_show_cursor();
 }
@@ -1038,12 +1055,12 @@ static void resize_end(window_t *win) {
 /*  Event processing                                                   */
 /* ------------------------------------------------------------------ */
 
-/* Throttled background repaint: at most once every 10 ticks (100ms) */
+/* Throttled compositor redraw when background content changes */
 static uint32_t last_dirty_repaint = 0;
 #define DIRTY_REPAINT_INTERVAL 10
 
 int wm_process_events(void) {
-    /* Check if background shell content has changed and needs a repaint */
+    /* Check if any background window content has changed */
     if (fb_console_check_dirty()) {
         uint32_t now = timer_ticks();
         if (now - last_dirty_repaint >= DIRTY_REPAINT_INTERVAL) {
@@ -1170,8 +1187,10 @@ int wm_process_events(void) {
                         hit->flags |= WIN_FLAG_MAXIMIZED;
                     }
                     wm_update_content_rect(hit);
-                    if (hit == shell_win)
+                    if (hit == shell_win) {
                         fb_console_bind_window(hit);
+                        fb_console_repaint();   /* populate newly-created surface */
+                    }
                     wm_redraw_all();
                     return 1;
                 }
