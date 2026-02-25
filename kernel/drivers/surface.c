@@ -86,6 +86,36 @@ void surface_render_char(surface_t *s, uint32_t px, uint32_t py,
     }
 }
 
+void surface_render_char_scaled(surface_t *s, uint32_t px, uint32_t py,
+                                 uint8_t ch, uint32_t fg, uint32_t bg,
+                                 int scale) {
+    if (!s || !s->pixels || scale < 1) return;
+    if (scale == 1) {
+        surface_render_char(s, px, py, ch, fg, bg);
+        return;
+    }
+
+    const uint8_t *glyph = &vga_font_8x16[ch * FONT_H];
+    uint32_t sc = (uint32_t)scale;
+
+    for (uint32_t row = 0; row < FONT_H; row++) {
+        uint8_t bits = glyph[row];
+        for (uint32_t col = 0; col < FONT_W; col++) {
+            uint32_t color = (bits & (0x80 >> col)) ? fg : bg;
+            /* Fill a scale x scale block */
+            for (uint32_t sy = 0; sy < sc; sy++) {
+                uint32_t dy = py + row * sc + sy;
+                if (dy >= s->height) break;
+                for (uint32_t sx = 0; sx < sc; sx++) {
+                    uint32_t dx = px + col * sc + sx;
+                    if (dx >= s->width) break;
+                    s->pixels[dy * s->width + dx] = color;
+                }
+            }
+        }
+    }
+}
+
 void surface_draw_hline(surface_t *s, uint32_t x, uint32_t y,
                          uint32_t w, uint32_t color) {
     if (!s || !s->pixels) return;

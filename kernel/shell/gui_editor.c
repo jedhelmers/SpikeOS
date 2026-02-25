@@ -11,6 +11,7 @@
 #include <kernel/process.h>
 #include <kernel/event.h>
 #include <kernel/hal.h>
+#include <kernel/timer.h>
 #include <string.h>
 #include <stdint.h>
 
@@ -24,13 +25,66 @@
 #define GE_INIT_LINE_CAP   128
 #define GE_STATUS_MAX       80
 #define MAX_GUI_EDITORS      4
+#define GE_TAB_WIDTH         4
+#define GE_TOOLBAR_H        24   /* toolbar height in pixels */
+#define GE_MAX_UNDO        256   /* max undo/redo depth */
+#define GE_DCLICK_TICKS     40   /* double-click threshold: 400ms at 100Hz */
 
 /* Colors */
-#define GE_FG     fb_pack_color(220, 220, 220)
-#define GE_BG     fb_pack_color(0, 0, 0)
-#define GE_BAR_FG fb_pack_color(0, 0, 0)
-#define GE_BAR_BG fb_pack_color(200, 200, 200)
-#define GE_CURSOR fb_pack_color(220, 220, 220)
+#define GE_FG      fb_pack_color(220, 220, 220)
+#define GE_BG      fb_pack_color(0, 0, 0)
+#define GE_BAR_FG  fb_pack_color(0, 0, 0)
+#define GE_BAR_BG  fb_pack_color(200, 200, 200)
+#define GE_CURSOR  fb_pack_color(220, 220, 220)
+#define GE_SEL_FG  fb_pack_color(255, 255, 255)
+#define GE_SEL_BG  fb_pack_color(50, 80, 140)
+
+/* Toolbar colors */
+#define GE_TB_BG   fb_pack_color(40, 40, 50)
+#define GE_TB_FG   fb_pack_color(200, 200, 200)
+#define GE_TB_SEP  fb_pack_color(70, 70, 85)
+
+/* Toolbar button layout */
+#define GE_TB_PAD_X  6
+#define GE_TB_GAP    4
+
+/* ------------------------------------------------------------------ */
+/*  Toolbar button definitions                                         */
+/* ------------------------------------------------------------------ */
+
+typedef enum {
+    TB_CUT, TB_COPY, TB_PASTE,
+    TB_SEP1,
+    TB_ZOOM_IN, TB_ZOOM_OUT,
+    TB_SEP2,
+    TB_SAVE,
+    TB_COUNT
+} tb_button_id_t;
+
+typedef struct {
+    const char *label;   /* NULL for separator */
+    int x, w;            /* pixel bounds within surface */
+} tb_button_t;
+
+static tb_button_t tb_buttons[TB_COUNT];
+
+/* ------------------------------------------------------------------ */
+/*  Command / undo-redo types                                          */
+/* ------------------------------------------------------------------ */
+
+typedef enum {
+    CMD_INSERT,   /* text was inserted at (line, col) */
+    CMD_DELETE,   /* text was deleted starting at (line, col) */
+} cmd_type_t;
+
+typedef struct {
+    cmd_type_t type;
+    int line, col;          /* start position */
+    char *text;             /* inserted or deleted text (kmalloc'd, NUL-terminated) */
+    int text_len;
+    int old_cx, old_cy;    /* cursor before command */
+    int new_cx, new_cy;    /* cursor after command */
+} edit_cmd_t;
 
 /* ------------------------------------------------------------------ */
 /*  Editor instance state                                              */
@@ -46,17 +100,155 @@ typedef struct gui_editor {
     int line_cap[GE_MAX_LINES];
     int nlines;
 
-    int cx, cy;        /* cursor col, row in file */
+    int cx, cy;        /* cursor col, row in file (buffer positions) */
     int scroll;        /* first visible line */
     int text_rows;     /* rows available for text */
-    int text_cols;     /* cols available for text */
+    int text_cols;     /* cols available for text (visual) */
     int modified;
     int quit;
     char status[GE_STATUS_MAX];
+
+    int font_scale;    /* 1, 2, or 3 */
+
+    /* Selection state */
+    int sel_active;
+    int sel_anchor_x;  /* buffer col of anchor */
+    int sel_anchor_y;  /* line of anchor */
+
+    int word_wrap;     /* 1 = wrap long lines, 0 = horizontal scroll */
+    int hscroll;       /* horizontal scroll offset (visual cols, when !word_wrap) */
+    int scroll_wrap;   /* wrap row within scroll line (when word_wrap) */
+
+    /* Undo/redo */
+    edit_cmd_t undo_stack[GE_MAX_UNDO];
+    int undo_count;
+    edit_cmd_t redo_stack[GE_MAX_UNDO];
+    int redo_count;
 } gui_editor_t;
 
 static gui_editor_t editors[MAX_GUI_EDITORS];
 static int pending_slot = -1;
+
+/* Global clipboard shared across editor instances */
+static char *clipboard = NULL;
+static int clipboard_len = 0;
+
+/* Forward declarations (used by menu callbacks) */
+static void ge_copy_selection(gui_editor_t *ed);
+static void ge_cut_selection(gui_editor_t *ed);
+static void ge_delete_selection(gui_editor_t *ed);
+static void ge_paste(gui_editor_t *ed);
+static void ge_select_all(gui_editor_t *ed);
+static void ge_insert_char(gui_editor_t *ed, char c);
+static void ge_insert_newline(gui_editor_t *ed);
+static void ge_undo(gui_editor_t *ed);
+static void ge_redo(gui_editor_t *ed);
+
+/* ------------------------------------------------------------------ */
+/*  Tab column conversion helpers                                      */
+/* ------------------------------------------------------------------ */
+
+/* Convert buffer column to visual column, expanding tabs */
+static int buf_to_vcol(gui_editor_t *ed, int line, int buf_col) {
+    if (line < 0 || line >= ed->nlines) return 0;
+    int vcol = 0;
+    const char *s = ed->lines[line];
+    int len = ed->line_len[line];
+    for (int i = 0; i < buf_col && i < len; i++) {
+        if (s[i] == '\t')
+            vcol += GE_TAB_WIDTH - (vcol % GE_TAB_WIDTH);
+        else
+            vcol++;
+    }
+    return vcol;
+}
+
+/* Convert visual column to buffer column (clamps to line length) */
+static int vcol_to_buf(gui_editor_t *ed, int line, int target_vcol) {
+    if (line < 0 || line >= ed->nlines) return 0;
+    int vcol = 0;
+    const char *s = ed->lines[line];
+    int len = ed->line_len[line];
+    for (int i = 0; i < len; i++) {
+        int next_vcol;
+        if (s[i] == '\t')
+            next_vcol = vcol + GE_TAB_WIDTH - (vcol % GE_TAB_WIDTH);
+        else
+            next_vcol = vcol + 1;
+        if (next_vcol > target_vcol) return i;
+        vcol = next_vcol;
+    }
+    return len;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Word wrap helpers                                                   */
+/* ------------------------------------------------------------------ */
+
+/* How many visual rows does a line need in word wrap mode? */
+static int ge_line_vrows(gui_editor_t *ed, int line) {
+    if (!ed->word_wrap || ed->text_cols <= 0) return 1;
+    if (line < 0 || line >= ed->nlines) return 1;
+    int vcol = buf_to_vcol(ed, line, ed->line_len[line]);
+    if (vcol == 0) return 1;
+    return (vcol + ed->text_cols - 1) / ed->text_cols;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Selection helpers                                                   */
+/* ------------------------------------------------------------------ */
+
+/* Get selection range ordered (start <= end). Returns 0 if no selection. */
+static int ge_get_selection(gui_editor_t *ed,
+                            int *sy, int *sx, int *ey, int *ex) {
+    if (!ed->sel_active) return 0;
+    int ay = ed->sel_anchor_y, ax = ed->sel_anchor_x;
+    int cy = ed->cy, cx = ed->cx;
+    if (ay < cy || (ay == cy && ax <= cx)) {
+        *sy = ay; *sx = ax; *ey = cy; *ex = cx;
+    } else {
+        *sy = cy; *sx = cx; *ey = ay; *ex = ax;
+    }
+    return 1;
+}
+
+/* Check if buffer position (line, col) is within the selection */
+static int ge_in_selection(gui_editor_t *ed, int line, int col) {
+    int sy, sx, ey, ex;
+    if (!ge_get_selection(ed, &sy, &sx, &ey, &ex)) return 0;
+    if (line < sy || line > ey) return 0;
+    if (line == sy && line == ey) return col >= sx && col < ex;
+    if (line == sy) return col >= sx;
+    if (line == ey) return col < ex;
+    return 1;  /* line between start and end */
+}
+
+/* ------------------------------------------------------------------ */
+/*  Toolbar layout                                                     */
+/* ------------------------------------------------------------------ */
+
+static void ge_layout_toolbar(void) {
+    static const char *labels[] = {
+        "Cut", "Copy", "Paste", NULL, "A+", "A-", NULL, "Save"
+    };
+    int x = GE_TB_GAP;
+    for (int i = 0; i < TB_COUNT; i++) {
+        tb_buttons[i].label = labels[i];
+        if (!labels[i]) {
+            /* Separator */
+            tb_buttons[i].x = x;
+            tb_buttons[i].w = 2;
+            x += 2 + GE_TB_GAP;
+        } else {
+            int lw = 0;
+            for (const char *p = labels[i]; *p; p++) lw++;
+            int btn_w = lw * FONT_W + 2 * GE_TB_PAD_X;
+            tb_buttons[i].x = x;
+            tb_buttons[i].w = btn_w;
+            x += btn_w + GE_TB_GAP;
+        }
+    }
+}
 
 /* ------------------------------------------------------------------ */
 /*  Line buffer management                                             */
@@ -211,30 +403,124 @@ static int ge_save_file(gui_editor_t *ed) {
 
 static void ge_compute_dims(gui_editor_t *ed) {
     if (!ed->win) return;
-    ed->text_cols = (int)(ed->win->content_w / FONT_W);
-    ed->text_rows = (int)(ed->win->content_h / FONT_H) - 1;  /* -1 for status bar */
+    int fw = FONT_W * ed->font_scale;
+    int fh = FONT_H * ed->font_scale;
+    ed->text_cols = (int)(ed->win->content_w / fw);
+    /* Available height: content minus toolbar at top, minus status bar (1x) at bottom */
+    int avail_h = (int)ed->win->content_h - GE_TOOLBAR_H - FONT_H;
+    ed->text_rows = avail_h / fh;
     if (ed->text_rows < 1) ed->text_rows = 1;
 }
 
 static void ge_putchar_at(gui_editor_t *ed, int x, int y, char ch,
                            uint32_t fg, uint32_t bg) {
     if (!ed->win || !ed->win->surface) return;
-    if (x < 0 || y < 0 || x >= ed->text_cols || y >= (int)(ed->win->content_h / FONT_H))
-        return;
-    surface_render_char(ed->win->surface,
-                        (uint32_t)x * FONT_W, (uint32_t)y * FONT_H,
-                        (uint8_t)ch, fg, bg);
+    int fw = FONT_W * ed->font_scale;
+    int fh = FONT_H * ed->font_scale;
+    if (x < 0 || y < 0 || x >= ed->text_cols || y >= ed->text_rows) return;
+    surface_render_char_scaled(ed->win->surface,
+                                (uint32_t)(x * fw),
+                                (uint32_t)(GE_TOOLBAR_H + y * fh),
+                                (uint8_t)ch, fg, bg,
+                                ed->font_scale);
 }
 
-static void ge_fill_row(gui_editor_t *ed, int y, uint32_t fg, uint32_t bg) {
-    for (int x = 0; x < ed->text_cols; x++)
-        ge_putchar_at(ed, x, y, ' ', fg, bg);
+/* Draw a string into the status bar at 1x scale (pixel-based) */
+static void ge_status_str(gui_editor_t *ed, int px, int py,
+                            const char *s, uint32_t fg, uint32_t bg) {
+    if (!ed->win || !ed->win->surface) return;
+    for (int i = 0; s[i]; i++) {
+        int x = px + i * FONT_W;
+        if (x + FONT_W > (int)ed->win->content_w) break;
+        surface_render_char(ed->win->surface,
+                            (uint32_t)x, (uint32_t)py,
+                            (uint8_t)s[i], fg, bg);
+    }
 }
 
-static void ge_draw_str(gui_editor_t *ed, int x, int y, const char *s,
-                         uint32_t fg, uint32_t bg) {
-    for (int i = 0; s[i] && x + i < ed->text_cols; i++)
-        ge_putchar_at(ed, x + i, y, s[i], fg, bg);
+static void ge_draw_toolbar(gui_editor_t *ed) {
+    if (!ed->win || !ed->win->surface) return;
+
+    /* Background */
+    surface_fill_rect(ed->win->surface, 0, 0,
+                      ed->win->content_w, GE_TOOLBAR_H, GE_TB_BG);
+    /* Bottom separator */
+    surface_draw_hline(ed->win->surface, 0, GE_TOOLBAR_H - 1,
+                       ed->win->content_w, GE_TB_SEP);
+
+    int ty = (GE_TOOLBAR_H - FONT_H) / 2;
+
+    for (int i = 0; i < TB_COUNT; i++) {
+        if (!tb_buttons[i].label) {
+            /* Draw separator */
+            surface_fill_rect(ed->win->surface,
+                              (uint32_t)tb_buttons[i].x, 4,
+                              2, GE_TOOLBAR_H - 8, GE_TB_SEP);
+        } else {
+            /* Draw button label */
+            int bx = tb_buttons[i].x + GE_TB_PAD_X;
+            const char *lbl = tb_buttons[i].label;
+            for (int c = 0; lbl[c]; c++) {
+                surface_render_char(ed->win->surface,
+                                    (uint32_t)(bx + c * FONT_W),
+                                    (uint32_t)ty,
+                                    (uint8_t)lbl[c], GE_TB_FG, GE_TB_BG);
+            }
+        }
+    }
+}
+
+/* Map screen pixel (mx, my) to file position. Returns 1 if in text area. */
+static int ge_screen_to_file(gui_editor_t *ed, int32_t mx, int32_t my,
+                              int *out_line, int *out_col) {
+    if (!ed->win) return 0;
+    int fw = FONT_W * ed->font_scale;
+    int fh = FONT_H * ed->font_scale;
+    int32_t cx_px = (int32_t)ed->win->content_x;
+    int32_t text_top = (int32_t)ed->win->content_y + GE_TOOLBAR_H;
+    int32_t text_h = (int32_t)(ed->text_rows * fh);
+    int32_t cw = (int32_t)ed->win->content_w;
+
+    if (mx < cx_px || mx >= cx_px + cw ||
+        my < text_top || my >= text_top + text_h)
+        return 0;
+
+    int click_col = (int)(mx - cx_px) / fw;
+    if (click_col < 0) click_col = 0;
+    int click_row = (int)(my - text_top) / fh;
+
+    int file_line, vcol;
+
+    if (ed->word_wrap) {
+        int sr = 0;
+        file_line = ed->nlines - 1;
+        vcol = 0;
+        for (int fl = ed->scroll; fl < ed->nlines; fl++) {
+            int skip = (fl == ed->scroll) ? ed->scroll_wrap : 0;
+            int lv = ge_line_vrows(ed, fl) - skip;
+            if (sr + lv > click_row) {
+                file_line = fl;
+                int wr = click_row - sr + skip;
+                vcol = wr * ed->text_cols + click_col;
+                break;
+            }
+            sr += lv;
+        }
+    } else {
+        file_line = click_row + ed->scroll;
+        vcol = click_col + ed->hscroll;
+    }
+
+    if (file_line >= ed->nlines) file_line = ed->nlines - 1;
+    if (file_line < 0) file_line = 0;
+
+    int buf_col = vcol_to_buf(ed, file_line, vcol);
+    if (buf_col > ed->line_len[file_line])
+        buf_col = ed->line_len[file_line];
+
+    *out_line = file_line;
+    *out_col = buf_col;
+    return 1;
 }
 
 static void gui_editor_draw(gui_editor_t *ed) {
@@ -247,39 +533,133 @@ static void gui_editor_draw(gui_editor_t *ed) {
     /* Clear surface */
     surface_clear(ed->win->surface, bg);
 
-    /* Draw text lines */
-    for (int row = 0; row < ed->text_rows; row++) {
-        int file_line = ed->scroll + row;
-        if (file_line >= ed->nlines) {
-            ge_putchar_at(ed, 0, row, '~', fb_pack_color(80, 80, 80), bg);
-        } else {
+    /* Draw toolbar */
+    ge_draw_toolbar(ed);
+
+    /* Draw text lines with tab expansion and selection highlighting */
+    if (ed->word_wrap) {
+        /* ---- Word wrap mode ---- */
+        int screen_row = 0;
+        for (int fl = ed->scroll; fl < ed->nlines && screen_row < ed->text_rows; fl++) {
+            int skip = (fl == ed->scroll) ? ed->scroll_wrap : 0;
+            int len = ed->line_len[fl];
+            int vcol = 0;
+
+            for (int bi = 0; bi < len; bi++) {
+                char c = ed->lines[fl][bi];
+                int selected = ge_in_selection(ed, fl, bi);
+                uint32_t cfgc = selected ? GE_SEL_FG : fg;
+                uint32_t cbgc = selected ? GE_SEL_BG : bg;
+
+                if (c == '\t') {
+                    int tab_end = vcol + GE_TAB_WIDTH - (vcol % GE_TAB_WIDTH);
+                    while (vcol < tab_end) {
+                        int wr = vcol / ed->text_cols;
+                        int dc = vcol % ed->text_cols;
+                        int sr = screen_row + wr - skip;
+                        if (sr >= 0 && sr < ed->text_rows)
+                            ge_putchar_at(ed, dc, sr, ' ', cfgc, cbgc);
+                        vcol++;
+                    }
+                } else {
+                    int wr = vcol / ed->text_cols;
+                    int dc = vcol % ed->text_cols;
+                    int sr = screen_row + wr - skip;
+                    if (sr >= 0 && sr < ed->text_rows)
+                        ge_putchar_at(ed, dc, sr, c, cfgc, cbgc);
+                    vcol++;
+                }
+            }
+
+            /* Selection highlight past EOL on the last wrap row */
+            if (ed->sel_active) {
+                int sy, sx, ey, ex;
+                if (ge_get_selection(ed, &sy, &sx, &ey, &ex)) {
+                    if (fl >= sy && fl < ey) {
+                        int wr = (vcol > 0) ? (vcol - 1) / ed->text_cols : 0;
+                        int dc = vcol % ed->text_cols;
+                        int sr = screen_row + wr - skip;
+                        if (dc == 0 && vcol > 0) { wr++; sr++; }
+                        while (dc < ed->text_cols && sr >= 0 && sr < ed->text_rows) {
+                            ge_putchar_at(ed, dc, sr, ' ', GE_SEL_FG, GE_SEL_BG);
+                            dc++;
+                        }
+                    }
+                }
+            }
+
+            int total_vrows = ge_line_vrows(ed, fl);
+            screen_row += total_vrows - skip;
+        }
+    } else {
+        /* ---- Horizontal scroll mode ---- */
+        for (int row = 0; row < ed->text_rows; row++) {
+            int file_line = ed->scroll + row;
+            if (file_line >= ed->nlines) continue;
+
             int len = ed->line_len[file_line];
-            for (int col = 0; col < ed->text_cols; col++) {
-                if (col < len)
-                    ge_putchar_at(ed, col, row, ed->lines[file_line][col], fg, bg);
+            int vcol = 0;
+            for (int bi = 0; bi < len; bi++) {
+                char c = ed->lines[file_line][bi];
+                int selected = ge_in_selection(ed, file_line, bi);
+                uint32_t cfgc = selected ? GE_SEL_FG : fg;
+                uint32_t cbgc = selected ? GE_SEL_BG : bg;
+
+                if (c == '\t') {
+                    int tab_end = vcol + GE_TAB_WIDTH - (vcol % GE_TAB_WIDTH);
+                    while (vcol < tab_end) {
+                        int dc = vcol - ed->hscroll;
+                        if (dc >= 0 && dc < ed->text_cols)
+                            ge_putchar_at(ed, dc, row, ' ', cfgc, cbgc);
+                        vcol++;
+                    }
+                } else {
+                    int dc = vcol - ed->hscroll;
+                    if (dc >= 0 && dc < ed->text_cols)
+                        ge_putchar_at(ed, dc, row, c, cfgc, cbgc);
+                    vcol++;
+                }
+            }
+
+            /* Selection highlight past EOL */
+            if (ed->sel_active) {
+                int sy, sx, ey, ex;
+                if (ge_get_selection(ed, &sy, &sx, &ey, &ex)) {
+                    if (file_line >= sy && file_line < ey) {
+                        int dc = vcol - ed->hscroll;
+                        while (dc < ed->text_cols) {
+                            if (dc >= 0)
+                                ge_putchar_at(ed, dc, row, ' ', GE_SEL_FG, GE_SEL_BG);
+                            dc++;
+                            vcol++;
+                        }
+                    }
+                }
             }
         }
     }
 
-    /* Draw status bar at bottom */
-    int status_y = (int)(ed->win->content_h / FONT_H) - 1;
-    ge_fill_row(ed, status_y, GE_BAR_FG, GE_BAR_BG);
+    /* Draw status bar at bottom (always 1x scale) */
+    int status_py = (int)ed->win->content_h - FONT_H;
+    surface_fill_rect(ed->win->surface, 0, (uint32_t)status_py,
+                      ed->win->content_w, FONT_H, GE_BAR_BG);
 
-    /* Left: status or filename */
-    if (ed->status[0])
-        ge_draw_str(ed, 1, status_y, ed->status, GE_BAR_FG, GE_BAR_BG);
-    else {
-        /* Show filename and modified indicator */
-        ge_draw_str(ed, 1, status_y, ed->filename, GE_BAR_FG, GE_BAR_BG);
+    int status_cols = (int)(ed->win->content_w / FONT_W);
+
+    /* Left: status message or filename */
+    if (ed->status[0]) {
+        ge_status_str(ed, FONT_W, status_py, ed->status, GE_BAR_FG, GE_BAR_BG);
+    } else {
+        ge_status_str(ed, FONT_W, status_py, ed->filename, GE_BAR_FG, GE_BAR_BG);
         if (ed->modified) {
             int flen = 0;
             while (ed->filename[flen]) flen++;
-            ge_draw_str(ed, 1 + flen + 1, status_y, "[Modified]",
-                        GE_BAR_FG, GE_BAR_BG);
+            ge_status_str(ed, FONT_W + (flen + 1) * FONT_W, status_py,
+                         "[Modified]", GE_BAR_FG, GE_BAR_BG);
         }
     }
 
-    /* Right: line/col */
+    /* Right: Ln X, Col Y (col is visual) */
     char pos[32];
     int pi = 0;
     const char *lbl = "Ln ";
@@ -297,28 +677,50 @@ static void gui_editor_draw(gui_editor_t *ed) {
     lbl = "Col ";
     for (int i = 0; lbl[i]; i++) pos[pi++] = lbl[i];
 
-    tmp = ed->cx + 1;
+    tmp = buf_to_vcol(ed, ed->cy, ed->cx) + 1;
     ni = 0;
     if (tmp == 0) num[ni++] = '0';
     else { while (tmp > 0) { num[ni++] = '0' + (tmp % 10); tmp /= 10; } }
     for (int i = ni - 1; i >= 0; i--) pos[pi++] = num[i];
     pos[pi] = '\0';
 
-    int pos_x = ed->text_cols - pi - 1;
+    int pos_x = (status_cols - pi - 1) * FONT_W;
     if (pos_x > 0)
-        ge_draw_str(ed, pos_x, status_y, pos, GE_BAR_FG, GE_BAR_BG);
+        ge_status_str(ed, pos_x, status_py, pos, GE_BAR_FG, GE_BAR_BG);
 
-    /* Draw cursor (underline) — surface-relative coordinates */
-    int cur_screen_y = ed->cy - ed->scroll;
-    if (cur_screen_y >= 0 && cur_screen_y < ed->text_rows) {
-        surface_fill_rect(ed->win->surface,
-                          (uint32_t)ed->cx * FONT_W,
-                          (uint32_t)cur_screen_y * FONT_H + 14,
-                          FONT_W, 2, GE_CURSOR);
+    /* Draw cursor (underline) */
+    {
+        int fw = FONT_W * ed->font_scale;
+        int fh = FONT_H * ed->font_scale;
+        int vcx = buf_to_vcol(ed, ed->cy, ed->cx);
+        int cur_dc, cur_sr;
+
+        if (ed->word_wrap) {
+            cur_dc = vcx % ed->text_cols;
+            int cursor_wr = vcx / ed->text_cols;
+            /* Compute screen row for cursor */
+            cur_sr = 0;
+            for (int fl = ed->scroll; fl < ed->cy && fl < ed->nlines; fl++) {
+                int skip = (fl == ed->scroll) ? ed->scroll_wrap : 0;
+                cur_sr += ge_line_vrows(ed, fl) - skip;
+            }
+            cur_sr += cursor_wr - ((ed->cy == ed->scroll) ? ed->scroll_wrap : 0);
+        } else {
+            cur_dc = vcx - ed->hscroll;
+            cur_sr = ed->cy - ed->scroll;
+        }
+
+        if (cur_dc >= 0 && cur_dc < ed->text_cols &&
+            cur_sr >= 0 && cur_sr < ed->text_rows) {
+            surface_fill_rect(ed->win->surface,
+                              (uint32_t)(cur_dc * fw),
+                              (uint32_t)(GE_TOOLBAR_H + cur_sr * fh + fh - 2),
+                              (uint32_t)fw, 2, GE_CURSOR);
+        }
     }
 }
 
-/* Repaint callback for the window manager */
+/* Repaint callback for the window manager (WM handles blitting) */
 static void ge_repaint_cb(window_t *win) {
     for (int i = 0; i < MAX_GUI_EDITORS; i++) {
         if (editors[i].active && editors[i].win == win) {
@@ -328,18 +730,15 @@ static void ge_repaint_cb(window_t *win) {
     }
 }
 
-/* ------------------------------------------------------------------ */
-/*  Menu action callbacks                                              */
-/* ------------------------------------------------------------------ */
-
-static void ge_action_save(void *ctx) {
-    gui_editor_t *ed = (gui_editor_t *)ctx;
-    ge_save_file(ed);
-}
-
-static void ge_action_quit(void *ctx) {
-    gui_editor_t *ed = (gui_editor_t *)ctx;
-    ed->quit = 1;
+/* Draw and immediately blit to framebuffer (for main-loop updates) */
+static void ge_draw_and_blit(gui_editor_t *ed) {
+    gui_editor_draw(ed);
+    if (ed->win && ed->win->surface) {
+        mouse_hide_cursor();
+        surface_blit_to_fb(ed->win->surface,
+                           ed->win->content_x, ed->win->content_y);
+        mouse_show_cursor();
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -353,93 +752,493 @@ static void ge_clamp_cx(gui_editor_t *ed) {
 
 static void ge_scroll_to_cursor(gui_editor_t *ed) {
     ge_compute_dims(ed);
-    if (ed->cy < ed->scroll)
-        ed->scroll = ed->cy;
-    if (ed->cy >= ed->scroll + ed->text_rows)
-        ed->scroll = ed->cy - ed->text_rows + 1;
+
+    if (ed->word_wrap) {
+        if (ed->text_cols <= 0) return;
+        int vcx = buf_to_vcol(ed, ed->cy, ed->cx);
+        int cursor_wr = vcx / ed->text_cols;
+
+        /* Cursor's absolute visual row from top of file */
+        int cursor_abs = 0;
+        for (int fl = 0; fl < ed->cy; fl++)
+            cursor_abs += ge_line_vrows(ed, fl);
+        cursor_abs += cursor_wr;
+
+        /* Scroll's absolute visual row */
+        int scroll_abs = 0;
+        for (int fl = 0; fl < ed->scroll; fl++)
+            scroll_abs += ge_line_vrows(ed, fl);
+        scroll_abs += ed->scroll_wrap;
+
+        /* Scroll up if cursor is above viewport */
+        if (cursor_abs < scroll_abs) {
+            ed->scroll = ed->cy;
+            ed->scroll_wrap = cursor_wr;
+        }
+        /* Scroll down if cursor is below viewport */
+        else if (cursor_abs >= scroll_abs + ed->text_rows) {
+            int target = cursor_abs - ed->text_rows + 1;
+            int vr = 0;
+            for (int fl = 0; fl < ed->nlines; fl++) {
+                int lv = ge_line_vrows(ed, fl);
+                if (vr + lv > target) {
+                    ed->scroll = fl;
+                    ed->scroll_wrap = target - vr;
+                    break;
+                }
+                vr += lv;
+            }
+        }
+    } else {
+        /* Horizontal scroll: keep cursor visible */
+        int vcx = buf_to_vcol(ed, ed->cy, ed->cx);
+        if (vcx < ed->hscroll)
+            ed->hscroll = vcx;
+        if (vcx >= ed->hscroll + ed->text_cols)
+            ed->hscroll = vcx - ed->text_cols + 1;
+
+        /* Vertical scroll: file-line based */
+        if (ed->cy < ed->scroll)
+            ed->scroll = ed->cy;
+        if (ed->cy >= ed->scroll + ed->text_rows)
+            ed->scroll = ed->cy - ed->text_rows + 1;
+
+        ed->scroll_wrap = 0;
+    }
 }
 
 /* ------------------------------------------------------------------ */
-/*  Text editing                                                       */
+/*  Undo/redo stack management                                         */
+/* ------------------------------------------------------------------ */
+
+static void ge_cmd_free(edit_cmd_t *cmd) {
+    if (cmd->text) { kfree(cmd->text); cmd->text = NULL; }
+    cmd->text_len = 0;
+}
+
+static void ge_clear_stack(edit_cmd_t *stack, int *count) {
+    for (int i = 0; i < *count; i++)
+        ge_cmd_free(&stack[i]);
+    *count = 0;
+}
+
+static void ge_push_cmd(edit_cmd_t *stack, int *count, edit_cmd_t *cmd) {
+    if (*count >= GE_MAX_UNDO) {
+        ge_cmd_free(&stack[0]);
+        for (int i = 0; i < GE_MAX_UNDO - 1; i++)
+            stack[i] = stack[i + 1];
+        (*count)--;
+    }
+    stack[*count] = *cmd;
+    (*count)++;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Raw editing primitives (no undo tracking)                          */
+/* ------------------------------------------------------------------ */
+
+/* Insert text at (line, col). Returns end position via out params. */
+static void ge_raw_insert(gui_editor_t *ed, int line, int col,
+                           const char *text, int len,
+                           int *end_line, int *end_col) {
+    int cl = line, cc = col;
+    for (int i = 0; i < len; i++) {
+        if (text[i] == '\n') {
+            if (ed->nlines >= GE_MAX_LINES) break;
+            int tail_len = ed->line_len[cl] - cc;
+            ge_insert_line(ed, cl + 1);
+            if (tail_len > 0) {
+                ge_line_ensure(ed, cl + 1, tail_len);
+                memcpy(ed->lines[cl + 1], ed->lines[cl] + cc, (size_t)tail_len);
+                ed->lines[cl + 1][tail_len] = '\0';
+                ed->line_len[cl + 1] = tail_len;
+            }
+            ed->line_len[cl] = cc;
+            ed->lines[cl][cc] = '\0';
+            cl++;
+            cc = 0;
+        } else {
+            ge_line_ensure(ed, cl, ed->line_len[cl] + 1);
+            for (int j = ed->line_len[cl]; j > cc; j--)
+                ed->lines[cl][j] = ed->lines[cl][j - 1];
+            ed->lines[cl][cc] = text[i];
+            ed->line_len[cl]++;
+            ed->lines[cl][ed->line_len[cl]] = '\0';
+            cc++;
+        }
+    }
+    *end_line = cl;
+    *end_col = cc;
+}
+
+/* Compute end position of text if inserted at (start_line, start_col) */
+static void ge_text_end_pos(const char *text, int len,
+                             int start_line, int start_col,
+                             int *end_line, int *end_col) {
+    int cl = start_line, cc = start_col;
+    for (int i = 0; i < len; i++) {
+        if (text[i] == '\n') { cl++; cc = 0; }
+        else cc++;
+    }
+    *end_line = cl;
+    *end_col = cc;
+}
+
+/* Extract text from range. Returns kmalloc'd NUL-terminated string. */
+static char *ge_extract_text(gui_editor_t *ed, int sy, int sx,
+                              int ey, int ex, int *out_len) {
+    int total = 0;
+    for (int line = sy; line <= ey; line++) {
+        int start = (line == sy) ? sx : 0;
+        int end   = (line == ey) ? ex : ed->line_len[line];
+        total += end - start;
+        if (line < ey) total++;
+    }
+    char *buf = (char *)kmalloc((size_t)(total + 1));
+    if (!buf) { *out_len = 0; return NULL; }
+    int pos = 0;
+    for (int line = sy; line <= ey; line++) {
+        int start = (line == sy) ? sx : 0;
+        int end   = (line == ey) ? ex : ed->line_len[line];
+        int len = end - start;
+        if (len > 0) {
+            memcpy(buf + pos, ed->lines[line] + start, (size_t)len);
+            pos += len;
+        }
+        if (line < ey) buf[pos++] = '\n';
+    }
+    buf[pos] = '\0';
+    *out_len = total;
+    return buf;
+}
+
+/* Delete text from (sy,sx) to (ey,ex). Does NOT record undo. */
+static void ge_raw_delete(gui_editor_t *ed, int sy, int sx, int ey, int ex) {
+    if (sy == ey) {
+        int dlen = ex - sx;
+        if (dlen <= 0) return;
+        for (int i = sx; i < ed->line_len[sy] - dlen; i++)
+            ed->lines[sy][i] = ed->lines[sy][i + dlen];
+        ed->line_len[sy] -= dlen;
+        ed->lines[sy][ed->line_len[sy]] = '\0';
+    } else {
+        int tail_len = ed->line_len[ey] - ex;
+        ge_line_ensure(ed, sy, sx + tail_len);
+        if (tail_len > 0)
+            memcpy(ed->lines[sy] + sx, ed->lines[ey] + ex, (size_t)tail_len);
+        ed->line_len[sy] = sx + tail_len;
+        ed->lines[sy][ed->line_len[sy]] = '\0';
+        for (int i = ey; i > sy; i--)
+            ge_delete_line(ed, i);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Command-aware editing                                              */
+/* ------------------------------------------------------------------ */
+
+static void ge_do_insert(gui_editor_t *ed, int line, int col,
+                          const char *text, int len) {
+    int old_cx = ed->cx, old_cy = ed->cy;
+    int end_line, end_col;
+    ge_raw_insert(ed, line, col, text, len, &end_line, &end_col);
+
+    ed->cy = end_line;
+    ed->cx = end_col;
+    ed->modified = 1;
+
+    /* Try to merge with top of undo stack for consecutive char inserts */
+    if (len == 1 && text[0] != '\n' && ed->undo_count > 0) {
+        edit_cmd_t *top = &ed->undo_stack[ed->undo_count - 1];
+        if (top->type == CMD_INSERT && top->text_len > 0 &&
+            top->new_cy == line && top->new_cx == col &&
+            top->text[top->text_len - 1] != '\n') {
+            char *new_text = (char *)krealloc(top->text,
+                                               (size_t)(top->text_len + 2));
+            if (new_text) {
+                new_text[top->text_len] = text[0];
+                new_text[top->text_len + 1] = '\0';
+                top->text = new_text;
+                top->text_len++;
+                top->new_cx = end_col;
+                top->new_cy = end_line;
+                ge_clear_stack(ed->redo_stack, &ed->redo_count);
+                return;
+            }
+        }
+    }
+
+    edit_cmd_t cmd;
+    cmd.type = CMD_INSERT;
+    cmd.line = line;
+    cmd.col = col;
+    cmd.text = (char *)kmalloc((size_t)(len + 1));
+    if (cmd.text) {
+        memcpy(cmd.text, text, (size_t)len);
+        cmd.text[len] = '\0';
+    }
+    cmd.text_len = len;
+    cmd.old_cx = old_cx;
+    cmd.old_cy = old_cy;
+    cmd.new_cx = end_col;
+    cmd.new_cy = end_line;
+
+    ge_push_cmd(ed->undo_stack, &ed->undo_count, &cmd);
+    ge_clear_stack(ed->redo_stack, &ed->redo_count);
+}
+
+static void ge_do_delete(gui_editor_t *ed, int sy, int sx, int ey, int ex) {
+    int old_cx = ed->cx, old_cy = ed->cy;
+
+    int tlen;
+    char *text = ge_extract_text(ed, sy, sx, ey, ex, &tlen);
+    ge_raw_delete(ed, sy, sx, ey, ex);
+
+    ed->cy = sy;
+    ed->cx = sx;
+    ed->modified = 1;
+
+    edit_cmd_t cmd;
+    cmd.type = CMD_DELETE;
+    cmd.line = sy;
+    cmd.col = sx;
+    cmd.text = text;
+    cmd.text_len = tlen;
+    cmd.old_cx = old_cx;
+    cmd.old_cy = old_cy;
+    cmd.new_cx = sx;
+    cmd.new_cy = sy;
+
+    ge_push_cmd(ed->undo_stack, &ed->undo_count, &cmd);
+    ge_clear_stack(ed->redo_stack, &ed->redo_count);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Undo / Redo                                                        */
+/* ------------------------------------------------------------------ */
+
+static void ge_undo(gui_editor_t *ed) {
+    if (ed->undo_count == 0) {
+        strcpy(ed->status, "Nothing to undo");
+        return;
+    }
+
+    edit_cmd_t cmd = ed->undo_stack[--ed->undo_count];
+
+    if (cmd.type == CMD_INSERT) {
+        ge_raw_delete(ed, cmd.line, cmd.col, cmd.new_cy, cmd.new_cx);
+    } else {
+        int end_line, end_col;
+        ge_raw_insert(ed, cmd.line, cmd.col, cmd.text, cmd.text_len,
+                       &end_line, &end_col);
+    }
+
+    ed->cy = cmd.old_cy;
+    ed->cx = cmd.old_cx;
+    ed->modified = 1;
+    ed->sel_active = 0;
+
+    ge_push_cmd(ed->redo_stack, &ed->redo_count, &cmd);
+    strcpy(ed->status, "Undo");
+}
+
+static void ge_redo(gui_editor_t *ed) {
+    if (ed->redo_count == 0) {
+        strcpy(ed->status, "Nothing to redo");
+        return;
+    }
+
+    edit_cmd_t cmd = ed->redo_stack[--ed->redo_count];
+
+    if (cmd.type == CMD_INSERT) {
+        int end_line, end_col;
+        ge_raw_insert(ed, cmd.line, cmd.col, cmd.text, cmd.text_len,
+                       &end_line, &end_col);
+        ed->cy = cmd.new_cy;
+        ed->cx = cmd.new_cx;
+    } else {
+        int end_line, end_col;
+        ge_text_end_pos(cmd.text, cmd.text_len, cmd.line, cmd.col,
+                         &end_line, &end_col);
+        ge_raw_delete(ed, cmd.line, cmd.col, end_line, end_col);
+        ed->cy = cmd.new_cy;
+        ed->cx = cmd.new_cx;
+    }
+
+    ed->modified = 1;
+    ed->sel_active = 0;
+
+    ge_push_cmd(ed->undo_stack, &ed->undo_count, &cmd);
+    strcpy(ed->status, "Redo");
+}
+
+/* ------------------------------------------------------------------ */
+/*  Text editing (command-aware wrappers)                              */
 /* ------------------------------------------------------------------ */
 
 static void ge_insert_char(gui_editor_t *ed, char c) {
-    ge_line_ensure(ed, ed->cy, ed->line_len[ed->cy] + 1);
-    for (int i = ed->line_len[ed->cy]; i > ed->cx; i--)
-        ed->lines[ed->cy][i] = ed->lines[ed->cy][i - 1];
-    ed->lines[ed->cy][ed->cx] = c;
-    ed->line_len[ed->cy]++;
-    ed->lines[ed->cy][ed->line_len[ed->cy]] = '\0';
-    ed->cx++;
-    ed->modified = 1;
+    ge_do_insert(ed, ed->cy, ed->cx, &c, 1);
 }
 
 static void ge_insert_newline(gui_editor_t *ed) {
-    if (ed->nlines >= GE_MAX_LINES) return;
-    int tail_len = ed->line_len[ed->cy] - ed->cx;
-    ge_insert_line(ed, ed->cy + 1);
-    if (tail_len > 0) {
-        ge_line_ensure(ed, ed->cy + 1, tail_len);
-        memcpy(ed->lines[ed->cy + 1], ed->lines[ed->cy] + ed->cx, (size_t)tail_len);
-        ed->lines[ed->cy + 1][tail_len] = '\0';
-        ed->line_len[ed->cy + 1] = tail_len;
-    }
-    ed->line_len[ed->cy] = ed->cx;
-    ed->lines[ed->cy][ed->cx] = '\0';
-    ed->cy++;
-    ed->cx = 0;
-    ed->modified = 1;
+    ge_do_insert(ed, ed->cy, ed->cx, "\n", 1);
 }
 
 static void ge_backspace(gui_editor_t *ed) {
     if (ed->cx > 0) {
-        for (int i = ed->cx - 1; i < ed->line_len[ed->cy] - 1; i++)
-            ed->lines[ed->cy][i] = ed->lines[ed->cy][i + 1];
-        ed->line_len[ed->cy]--;
-        ed->lines[ed->cy][ed->line_len[ed->cy]] = '\0';
-        ed->cx--;
-        ed->modified = 1;
+        ge_do_delete(ed, ed->cy, ed->cx - 1, ed->cy, ed->cx);
     } else if (ed->cy > 0) {
-        int prev = ed->cy - 1;
-        int old_len = ed->line_len[prev];
-        int cur_len = ed->line_len[ed->cy];
-        ge_line_ensure(ed, prev, old_len + cur_len);
-        memcpy(ed->lines[prev] + old_len, ed->lines[ed->cy], (size_t)cur_len);
-        ed->line_len[prev] = old_len + cur_len;
-        ed->lines[prev][ed->line_len[prev]] = '\0';
-        ge_delete_line(ed, ed->cy);
-        ed->cy = prev;
-        ed->cx = old_len;
-        ed->modified = 1;
+        int prev_len = ed->line_len[ed->cy - 1];
+        ge_do_delete(ed, ed->cy - 1, prev_len, ed->cy, 0);
     }
 }
 
 static void ge_delete(gui_editor_t *ed) {
     if (ed->cx < ed->line_len[ed->cy]) {
-        for (int i = ed->cx; i < ed->line_len[ed->cy] - 1; i++)
-            ed->lines[ed->cy][i] = ed->lines[ed->cy][i + 1];
-        ed->line_len[ed->cy]--;
-        ed->lines[ed->cy][ed->line_len[ed->cy]] = '\0';
-        ed->modified = 1;
+        ge_do_delete(ed, ed->cy, ed->cx, ed->cy, ed->cx + 1);
     } else if (ed->cy < ed->nlines - 1) {
-        int next = ed->cy + 1;
-        int cur_len = ed->line_len[ed->cy];
-        int next_len = ed->line_len[next];
-        ge_line_ensure(ed, ed->cy, cur_len + next_len);
-        memcpy(ed->lines[ed->cy] + cur_len, ed->lines[next], (size_t)next_len);
-        ed->line_len[ed->cy] = cur_len + next_len;
-        ed->lines[ed->cy][ed->line_len[ed->cy]] = '\0';
-        ge_delete_line(ed, next);
-        ed->modified = 1;
+        ge_do_delete(ed, ed->cy, ed->cx, ed->cy + 1, 0);
     }
 }
 
 static void ge_cut_line(gui_editor_t *ed) {
-    ge_delete_line(ed, ed->cy);
-    if (ed->cy >= ed->nlines)
-        ed->cy = ed->nlines - 1;
+    /* Copy line text to clipboard */
+    if (clipboard) { kfree(clipboard); clipboard = NULL; clipboard_len = 0; }
+    int len = ed->line_len[ed->cy];
+    clipboard = (char *)kmalloc((size_t)(len + 1));
+    if (clipboard) {
+        if (len > 0) memcpy(clipboard, ed->lines[ed->cy], (size_t)len);
+        clipboard[len] = '\0';
+        clipboard_len = len;
+    }
+
+    /* Delete the line via command system */
+    if (ed->nlines == 1) {
+        if (ed->line_len[0] > 0)
+            ge_do_delete(ed, 0, 0, 0, ed->line_len[0]);
+    } else if (ed->cy < ed->nlines - 1) {
+        ge_do_delete(ed, ed->cy, 0, ed->cy + 1, 0);
+    } else {
+        ge_do_delete(ed, ed->cy - 1, ed->line_len[ed->cy - 1],
+                      ed->cy, ed->line_len[ed->cy]);
+    }
     ge_clamp_cx(ed);
-    ed->modified = 1;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Selection operations                                               */
+/* ------------------------------------------------------------------ */
+
+static void ge_copy_selection(gui_editor_t *ed) {
+    int sy, sx, ey, ex;
+    if (!ge_get_selection(ed, &sy, &sx, &ey, &ex)) return;
+
+    if (clipboard) { kfree(clipboard); clipboard = NULL; clipboard_len = 0; }
+
+    clipboard = ge_extract_text(ed, sy, sx, ey, ex, &clipboard_len);
+    strcpy(ed->status, "Copied");
+}
+
+static void ge_delete_selection(gui_editor_t *ed) {
+    int sy, sx, ey, ex;
+    if (!ge_get_selection(ed, &sy, &sx, &ey, &ex)) return;
+    ed->sel_active = 0;
+    ge_do_delete(ed, sy, sx, ey, ex);
+}
+
+static void ge_cut_selection(gui_editor_t *ed) {
+    ge_copy_selection(ed);
+    ge_delete_selection(ed);
+    strcpy(ed->status, "Cut");
+}
+
+static void ge_paste(gui_editor_t *ed) {
+    if (!clipboard || clipboard_len == 0) return;
+    if (ed->sel_active) ge_delete_selection(ed);
+    ge_do_insert(ed, ed->cy, ed->cx, clipboard, clipboard_len);
+    strcpy(ed->status, "Pasted");
+}
+
+static void ge_select_all(gui_editor_t *ed) {
+    ed->sel_active = 1;
+    ed->sel_anchor_x = 0;
+    ed->sel_anchor_y = 0;
+    ed->cy = ed->nlines - 1;
+    ed->cx = ed->line_len[ed->cy];
+}
+
+/* ------------------------------------------------------------------ */
+/*  Menu action callbacks                                              */
+/* ------------------------------------------------------------------ */
+
+static void ge_action_save(void *ctx) {
+    ge_save_file((gui_editor_t *)ctx);
+}
+
+static void ge_action_quit(void *ctx) {
+    ((gui_editor_t *)ctx)->quit = 1;
+}
+
+static void ge_action_cut(void *ctx) {
+    ge_cut_selection((gui_editor_t *)ctx);
+}
+
+static void ge_action_copy(void *ctx) {
+    ge_copy_selection((gui_editor_t *)ctx);
+}
+
+static void ge_action_paste(void *ctx) {
+    ge_paste((gui_editor_t *)ctx);
+}
+
+static void ge_action_select_all(void *ctx) {
+    ge_select_all((gui_editor_t *)ctx);
+}
+
+static void ge_action_zoom_in(void *ctx) {
+    gui_editor_t *ed = (gui_editor_t *)ctx;
+    if (ed->font_scale < 3) { ed->font_scale++; ge_compute_dims(ed); }
+}
+
+static void ge_action_zoom_out(void *ctx) {
+    gui_editor_t *ed = (gui_editor_t *)ctx;
+    if (ed->font_scale > 1) { ed->font_scale--; ge_compute_dims(ed); }
+}
+
+static void ge_action_toggle_wrap(void *ctx) {
+    gui_editor_t *ed = (gui_editor_t *)ctx;
+    ed->word_wrap = !ed->word_wrap;
+    if (ed->word_wrap) {
+        ed->hscroll = 0;
+    } else {
+        ed->scroll_wrap = 0;
+    }
+    ge_compute_dims(ed);
+}
+
+static void ge_action_undo(void *ctx) {
+    ge_undo((gui_editor_t *)ctx);
+}
+
+static void ge_action_redo(void *ctx) {
+    ge_redo((gui_editor_t *)ctx);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Selection tracking helpers for shift+movement                      */
+/* ------------------------------------------------------------------ */
+
+/* Call before a cursor movement key. Starts selection if shift is held. */
+static void ge_sel_before_move(gui_editor_t *ed) {
+    int shift = keyboard_shift_held();
+    if (shift && !ed->sel_active) {
+        ed->sel_active = 1;
+        ed->sel_anchor_x = ed->cx;
+        ed->sel_anchor_y = ed->cy;
+    }
+    if (!shift) {
+        ed->sel_active = 0;
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -487,17 +1286,34 @@ static void gui_editor_thread(void) {
 
     ed->win->repaint = ge_repaint_cb;
 
-    /* Register File menu */
+    /* Register menus */
     wm_menu_t *file_menu = wm_window_add_menu(ed->win, "File");
     if (file_menu) {
         wm_menu_add_item(file_menu, "Save", ge_action_save, ed);
         wm_menu_add_item(file_menu, "Quit", ge_action_quit, ed);
     }
 
+    wm_menu_t *edit_menu = wm_window_add_menu(ed->win, "Edit");
+    if (edit_menu) {
+        wm_menu_add_item(edit_menu, "Cut", ge_action_cut, ed);
+        wm_menu_add_item(edit_menu, "Copy", ge_action_copy, ed);
+        wm_menu_add_item(edit_menu, "Paste", ge_action_paste, ed);
+        wm_menu_add_item(edit_menu, "Select All", ge_action_select_all, ed);
+        wm_menu_add_item(edit_menu, "Undo", ge_action_undo, ed);
+        wm_menu_add_item(edit_menu, "Redo", ge_action_redo, ed);
+    }
+
+    wm_menu_t *view_menu = wm_window_add_menu(ed->win, "View");
+    if (view_menu) {
+        wm_menu_add_item(view_menu, "Zoom In", ge_action_zoom_in, ed);
+        wm_menu_add_item(view_menu, "Zoom Out", ge_action_zoom_out, ed);
+        wm_menu_add_item(view_menu, "Toggle Wrap", ge_action_toggle_wrap, ed);
+    }
+
     /* Focus this window */
     wm_focus_window(ed->win);
 
-    /* Load file */
+    /* Load file and initialize state */
     ge_load_file(ed);
     ed->cx = 0;
     ed->cy = 0;
@@ -505,12 +1321,26 @@ static void gui_editor_thread(void) {
     ed->modified = 0;
     ed->quit = 0;
     ed->status[0] = '\0';
+    ed->font_scale = 1;
+    ed->sel_active = 0;
+    ed->word_wrap = 1;
+    ed->hscroll = 0;
+    ed->scroll_wrap = 0;
+
+    ge_layout_toolbar();
 
     /* Initial draw */
     wm_redraw_all();
 
-    /* Track previous mouse button state for click detection */
+    /* Track mouse state for click and drag selection */
     int prev_lmb = 0;
+    int mouse_selecting = 0;  /* 1 while LMB held after click in text area */
+
+    /* Double/triple click tracking */
+    uint32_t last_click_tick = 0;
+    int last_click_line = -1;
+    int last_click_col  = -1;
+    int click_count = 0;  /* 1=single, 2=double, 3=triple */
 
     /* Main loop */
     while (!ed->quit) {
@@ -522,46 +1352,136 @@ static void gui_editor_thread(void) {
             break;
         }
 
-        /* Mouse click-to-position cursor */
+        /* Mouse handling */
         {
             mouse_state_t ms = mouse_get_state();
             int cur_lmb = (ms.buttons & MOUSE_BTN_LEFT) ? 1 : 0;
+            int32_t mx = ms.x;
+            int32_t my = ms.y;
 
-            /* Detect left-button-down transition */
-            if (cur_lmb && !prev_lmb && ed->win) {
-                int32_t mx = ms.x;
-                int32_t my = ms.y;
-                int32_t cx = (int32_t)ed->win->content_x;
-                int32_t cy = (int32_t)ed->win->content_y;
+            if (cur_lmb && !prev_lmb && ed->win &&
+                (ed->win->flags & WIN_FLAG_FOCUSED)) {
+                /* Left-button-down transition */
+                int32_t cx_px = (int32_t)ed->win->content_x;
+                int32_t cy_px = (int32_t)ed->win->content_y;
                 int32_t cw = (int32_t)ed->win->content_w;
-                int32_t ch = (int32_t)ed->win->content_h - FONT_H; /* exclude status bar */
 
-                /* Check if click is within text content area */
-                if (mx >= cx && mx < cx + cw && my >= cy && my < cy + ch) {
-                    int col = (int)(mx - cx) / FONT_W;
-                    int row = (int)(my - cy) / FONT_H;
-                    int file_line = row + ed->scroll;
+                /* Check toolbar click */
+                int32_t tb_top = cy_px;
+                int32_t tb_bot = cy_px + GE_TOOLBAR_H;
+                if (mx >= cx_px && mx < cx_px + cw &&
+                    my >= tb_top && my < tb_bot) {
+                    int rel_x = (int)(mx - cx_px);
+                    for (int i = 0; i < TB_COUNT; i++) {
+                        if (tb_buttons[i].label &&
+                            rel_x >= tb_buttons[i].x &&
+                            rel_x < tb_buttons[i].x + tb_buttons[i].w) {
+                            switch (i) {
+                                case TB_CUT:      ge_cut_selection(ed); break;
+                                case TB_COPY:     ge_copy_selection(ed); break;
+                                case TB_PASTE:    ge_paste(ed); break;
+                                case TB_ZOOM_IN:
+                                    if (ed->font_scale < 3) {
+                                        ed->font_scale++;
+                                        ge_compute_dims(ed);
+                                    }
+                                    break;
+                                case TB_ZOOM_OUT:
+                                    if (ed->font_scale > 1) {
+                                        ed->font_scale--;
+                                        ge_compute_dims(ed);
+                                    }
+                                    break;
+                                case TB_SAVE:     ge_save_file(ed); break;
+                                default: break;
+                            }
+                            ge_scroll_to_cursor(ed);
+                            ge_draw_and_blit(ed);
+                            break;
+                        }
+                    }
+                    prev_lmb = cur_lmb;
+                    goto next_iter;
+                }
 
-                    /* Clamp to valid line */
-                    if (file_line >= ed->nlines)
-                        file_line = ed->nlines - 1;
-                    if (file_line < 0)
-                        file_line = 0;
+                /* Check text area click */
+                {
+                    int click_line, click_col;
+                    if (ge_screen_to_file(ed, mx, my, &click_line, &click_col)) {
+                        uint32_t now = timer_ticks();
 
-                    ed->cy = file_line;
+                        /* Detect multi-click (same position, within threshold) */
+                        if (click_line == last_click_line &&
+                            click_col == last_click_col &&
+                            (now - last_click_tick) < GE_DCLICK_TICKS) {
+                            click_count++;
+                            if (click_count > 3) click_count = 3;
+                        } else {
+                            click_count = 1;
+                        }
+                        last_click_tick = now;
+                        last_click_line = click_line;
+                        last_click_col  = click_col;
 
-                    /* Clamp column to line length */
-                    if (col > ed->line_len[ed->cy])
-                        col = ed->line_len[ed->cy];
-                    if (col < 0)
-                        col = 0;
-                    ed->cx = col;
+                        ed->cy = click_line;
+                        ed->cx = click_col;
 
-                    ed->status[0] = '\0';
-                    ge_scroll_to_cursor(ed);
-                    gui_editor_draw(ed);
+                        if (click_count == 2) {
+                            /* Double-click: select word */
+                            const char *line = ed->lines[ed->cy];
+                            int len = ed->line_len[ed->cy];
+                            int wstart = ed->cx, wend = ed->cx;
+                            /* Scan backwards for word start */
+                            while (wstart > 0 && line[wstart - 1] != ' ' &&
+                                   line[wstart - 1] != '\t')
+                                wstart--;
+                            /* Scan forwards for word end */
+                            while (wend < len && line[wend] != ' ' &&
+                                   line[wend] != '\t')
+                                wend++;
+                            ed->sel_active = 1;
+                            ed->sel_anchor_x = wstart;
+                            ed->sel_anchor_y = ed->cy;
+                            ed->cx = wend;
+                            mouse_selecting = 0;
+                        } else if (click_count == 3) {
+                            /* Triple-click: select entire line */
+                            ed->sel_active = 1;
+                            ed->sel_anchor_x = 0;
+                            ed->sel_anchor_y = ed->cy;
+                            ed->cx = ed->line_len[ed->cy];
+                            mouse_selecting = 0;
+                        } else {
+                            /* Single click */
+                            ed->sel_active = 0;
+                            mouse_selecting = 1;
+                            ed->sel_anchor_x = ed->cx;
+                            ed->sel_anchor_y = ed->cy;
+                        }
+
+                        ed->status[0] = '\0';
+                        ge_scroll_to_cursor(ed);
+                        ge_draw_and_blit(ed);
+                    }
+                }
+            } else if (cur_lmb && mouse_selecting && ed->win) {
+                /* Mouse drag for text selection */
+                int drag_line, drag_col;
+                if (ge_screen_to_file(ed, mx, my, &drag_line, &drag_col)) {
+                    if (drag_line != ed->cy || drag_col != ed->cx) {
+                        ed->sel_active = 1;
+                        ed->cy = drag_line;
+                        ed->cx = drag_col;
+                        ge_scroll_to_cursor(ed);
+                        ge_draw_and_blit(ed);
+                    }
                 }
             }
+
+            if (!cur_lmb) {
+                mouse_selecting = 0;
+            }
+
             prev_lmb = cur_lmb;
         }
 
@@ -583,43 +1503,59 @@ static void gui_editor_thread(void) {
         int redraw = 1;
         switch (k.type) {
         case KEY_CHAR:
+            if (ed->sel_active) ge_delete_selection(ed);
             ge_insert_char(ed, k.ch);
             break;
+        case KEY_TAB:
+            if (ed->sel_active) ge_delete_selection(ed);
+            ge_insert_char(ed, '\t');
+            break;
         case KEY_ENTER:
+            if (ed->sel_active) ge_delete_selection(ed);
             ge_insert_newline(ed);
             break;
         case KEY_BACKSPACE:
-            ge_backspace(ed);
+            if (ed->sel_active) ge_delete_selection(ed);
+            else ge_backspace(ed);
             break;
         case KEY_DELETE:
-            ge_delete(ed);
+            if (ed->sel_active) ge_delete_selection(ed);
+            else ge_delete(ed);
             break;
         case KEY_LEFT:
+            ge_sel_before_move(ed);
             if (ed->cx > 0) ed->cx--;
             else if (ed->cy > 0) { ed->cy--; ed->cx = ed->line_len[ed->cy]; }
             break;
         case KEY_RIGHT:
+            ge_sel_before_move(ed);
             if (ed->cx < ed->line_len[ed->cy]) ed->cx++;
             else if (ed->cy < ed->nlines - 1) { ed->cy++; ed->cx = 0; }
             break;
         case KEY_UP:
+            ge_sel_before_move(ed);
             if (ed->cy > 0) { ed->cy--; ge_clamp_cx(ed); }
             break;
         case KEY_DOWN:
+            ge_sel_before_move(ed);
             if (ed->cy < ed->nlines - 1) { ed->cy++; ge_clamp_cx(ed); }
             break;
         case KEY_HOME:
+            ge_sel_before_move(ed);
             ed->cx = 0;
             break;
         case KEY_END:
+            ge_sel_before_move(ed);
             ed->cx = ed->line_len[ed->cy];
             break;
         case KEY_PAGE_UP:
+            ge_sel_before_move(ed);
             ed->cy -= ed->text_rows;
             if (ed->cy < 0) ed->cy = 0;
             ge_clamp_cx(ed);
             break;
         case KEY_PAGE_DOWN:
+            ge_sel_before_move(ed);
             ed->cy += ed->text_rows;
             if (ed->cy >= ed->nlines) ed->cy = ed->nlines - 1;
             ge_clamp_cx(ed);
@@ -627,12 +1563,43 @@ static void gui_editor_thread(void) {
         case KEY_CTRL_S:
             ge_save_file(ed);
             break;
-        case KEY_CTRL_X:
         case KEY_CTRL_C:
+            ge_copy_selection(ed);
+            break;
+        case KEY_CTRL_X:
+            ge_cut_selection(ed);
+            break;
+        case KEY_CTRL_V:
+            ge_paste(ed);
+            break;
+        case KEY_CTRL_A:
+            ge_select_all(ed);
+            break;
+        case KEY_CTRL_Q:
             ed->quit = 1;
             break;
         case KEY_CTRL_K:
             ge_cut_line(ed);
+            break;
+        case KEY_CTRL_PLUS:
+            if (ed->font_scale < 3) {
+                ed->font_scale++;
+                ge_compute_dims(ed);
+                ge_clamp_cx(ed);
+            }
+            break;
+        case KEY_CTRL_MINUS:
+            if (ed->font_scale > 1) {
+                ed->font_scale--;
+                ge_compute_dims(ed);
+                ge_clamp_cx(ed);
+            }
+            break;
+        case KEY_CTRL_Z:
+            ge_undo(ed);
+            break;
+        case KEY_CTRL_SHIFT_Z:
+            ge_redo(ed);
             break;
         default:
             redraw = 0;
@@ -641,11 +1608,17 @@ static void gui_editor_thread(void) {
 
         if (redraw) {
             ge_scroll_to_cursor(ed);
-            gui_editor_draw(ed);
+            ge_draw_and_blit(ed);
         }
+
+        continue;
+next_iter:
+        ;
     }
 
     /* Cleanup */
+    ge_clear_stack(ed->undo_stack, &ed->undo_count);
+    ge_clear_stack(ed->redo_stack, &ed->redo_count);
     ge_free_lines(ed);
     window_t *w = ed->win;
     ed->win = NULL;
@@ -659,8 +1632,7 @@ static void gui_editor_thread(void) {
         wm_redraw_all();
     }
 
-    /* Terminate this kernel thread — kernel threads must never return
-       (there's no valid return address on the stack). */
+    /* Terminate this kernel thread */
     proc_kill(current_process->pid);
     for (;;) hal_halt();
 }
