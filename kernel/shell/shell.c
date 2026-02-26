@@ -2,6 +2,7 @@
 #include <kernel/process.h>
 #include <kernel/tetris.h>
 #include <kernel/editor.h>
+#include <kernel/finder.h>
 #include <kernel/heap.h>
 #include <kernel/initrd.h>
 #include <kernel/elf.h>
@@ -1175,6 +1176,16 @@ static void shell_execute_cmd(void) {
         } else {
             editor_run(name);
         }
+    }
+
+    /* ---- finder [path] ---- */
+    else if (strncmp(line_buf, "finder", 6) == 0 &&
+             (line_buf[6] == '\0' || line_buf[6] == ' ')) {
+        const char *arg = (line_buf[6] == ' ') ? shell_arg(line_buf, 6) : NULL;
+        if (arg && *arg)
+            finder_open(arg);
+        else
+            finder_open(vfs_get_cwd_path());
     }
 
     /* ---- mv <src> <dst> ---- */

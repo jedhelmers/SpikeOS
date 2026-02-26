@@ -59,6 +59,12 @@ typedef struct {
     int item_count;
 } wm_menu_t;
 
+/* Forward declaration for context menu callback */
+struct window;
+
+/* Context menu builder: app populates win->ctx_menu, returns 1 to show */
+typedef int (*wm_ctx_menu_builder_t)(struct window *win, int32_t mx, int32_t my);
+
 /* ------------------------------------------------------------------ */
 /*  Window structure                                                   */
 /* ------------------------------------------------------------------ */
@@ -99,6 +105,10 @@ typedef struct window {
     /* Menu bar (0 = no menu bar) */
     wm_menu_t menus[WM_MENU_MAX_MENUS];
     int menu_count;
+
+    /* Right-click context menu (rebuilt on each right-click) */
+    wm_menu_t ctx_menu;
+    wm_ctx_menu_builder_t build_ctx_menu;  /* NULL = no context menu */
 
     /* Per-window back buffer (content area only, NULL if not allocated) */
     surface_t *surface;

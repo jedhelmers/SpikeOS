@@ -127,6 +127,16 @@ void surface_draw_hline(surface_t *s, uint32_t x, uint32_t y,
         p[i] = color;
 }
 
+void surface_draw_vline(surface_t *s, uint32_t x, uint32_t y,
+                         uint32_t h, uint32_t color) {
+    if (!s || !s->pixels) return;
+    if (x >= s->width || y >= s->height) return;
+    if (y + h > s->height) h = s->height - y;
+
+    for (uint32_t row = 0; row < h; row++)
+        s->pixels[(y + row) * s->width + x] = color;
+}
+
 void surface_scroll_up(surface_t *s, uint32_t row_h, uint32_t bg_color) {
     if (!s || !s->pixels || row_h == 0) return;
     if (row_h >= s->height) {
@@ -146,8 +156,33 @@ void surface_scroll_up(surface_t *s, uint32_t row_h, uint32_t bg_color) {
         bottom[i] = bg_color;
 }
 
+void surface_blit(surface_t *dst, surface_t *src, uint32_t dst_x, uint32_t dst_y) {
+    if (!dst || !dst->pixels || !src || !src->pixels) return;
+
+    uint32_t w = src->width;
+    uint32_t h = src->height;
+    if (dst_x >= dst->width || dst_y >= dst->height) return;
+    if (dst_x + w > dst->width)  w = dst->width - dst_x;
+    if (dst_y + h > dst->height) h = dst->height - dst_y;
+
+    for (uint32_t row = 0; row < h; row++) {
+        uint32_t *dp = &dst->pixels[(dst_y + row) * dst->width + dst_x];
+        uint32_t *sp = &src->pixels[row * src->width];
+        memcpy(dp, sp, w * 4);
+    }
+}
+
 void surface_blit_to_fb(surface_t *s, uint32_t dst_x, uint32_t dst_y) {
-    if (!s || !s->pixels || !fb_info.available) return;
+    if (!s || !s->pixels) return;
+
+    /* If a render target is active, blit to it instead of hardware FB */
+    surface_t *rt = fb_get_render_target();
+    if (rt) {
+        surface_blit(rt, s, dst_x, dst_y);
+        return;
+    }
+
+    if (!fb_info.available) return;
 
     uint32_t w = s->width;
     uint32_t h = s->height;

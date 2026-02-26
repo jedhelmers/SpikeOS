@@ -16,6 +16,10 @@
 static uint32_t desktop_color;
 static window_t *shell_win = NULL;
 
+/* Compositor back buffer — all WM rendering goes here, then a single
+   blit copies the finished frame to the hardware framebuffer. */
+static surface_t *compositor = NULL;
+
 /* Window list — doubly linked, bottom to top z-order.
    win_bottom = first painted (back), win_top = last painted (front). */
 static window_t *win_bottom = NULL;
@@ -44,6 +48,10 @@ static window_t *dropdown_win = NULL;
 static int dropdown_menu_idx = -1;
 static int dropdown_from_deskbar = 0;  /* 1 = opened from deskbar, 0 = from window menubar */
 
+/* Right-click context menu state */
+static window_t *ctx_win = NULL;        /* window owning the open context menu */
+static int32_t ctx_menu_x, ctx_menu_y;  /* screen position of context menu */
+
 /* Double-click tracking for desktop icons */
 static uint32_t last_icon_click_tick = 0;
 static int last_icon_click_idx = -1;
@@ -51,6 +59,8 @@ static int last_icon_click_idx = -1;
 
 /* Forward declaration for gui_editor_open (weak — may not be linked yet) */
 extern void gui_editor_open(const char *filename) __attribute__((weak));
+/* Forward declaration for finder_open (weak — may not be linked yet) */
+extern void finder_open(const char *path) __attribute__((weak));
 
 /* ------------------------------------------------------------------ */
 /*  Content rect                                                       */
@@ -137,14 +147,28 @@ static void wm_draw_desktop_icons(void) {
 
         /* Determine type */
         vfs_inode_t *child = vfs_get_inode(entries[i].inode);
-        uint32_t fill = (child && child->type == VFS_TYPE_DIR)
-                        ? dir_color : file_color;
+        int is_dir = (child && child->type == VFS_TYPE_DIR);
 
-        /* Draw icon rect (centered horizontally in cell) */
+        /* Draw icon (centered horizontally in cell) */
         uint32_t rx = cx + (ICON_W - ICON_RECT_W) / 2;
         uint32_t ry = cy;
-        fb_fill_rect(rx, ry, ICON_RECT_W, ICON_RECT_H, fill);
-        fb_draw_rect(rx, ry, ICON_RECT_W, ICON_RECT_H, outline);
+
+        if (is_dir) {
+            /* Folder icon — matches dock Finder icon shape, amber color */
+            uint32_t folder_dk = fb_pack_color(170, 150, 70);
+            uint32_t tab_bg    = fb_pack_color(220, 200, 110);
+            /* Tab at top-left */
+            fb_fill_rect(rx, ry, 14, 6, tab_bg);
+            /* Body */
+            fb_fill_rect(rx, ry + 6, ICON_RECT_W, ICON_RECT_H - 6, dir_color);
+            fb_draw_rect(rx, ry + 6, ICON_RECT_W, ICON_RECT_H - 6, folder_dk);
+            /* Fold line */
+            fb_draw_hline(rx + 1, ry + 12, ICON_RECT_W - 2, folder_dk);
+        } else {
+            /* File icon — simple filled rect */
+            fb_fill_rect(rx, ry, ICON_RECT_W, ICON_RECT_H, file_color);
+            fb_draw_rect(rx, ry, ICON_RECT_W, ICON_RECT_H, outline);
+        }
 
         /* Draw filename label below rect (up to 2 rows of ICON_MAX_LABEL chars) */
         int total_len = 0;
@@ -574,6 +598,7 @@ void wm_destroy_window(window_t *win) {
 void wm_init(void) {
     desktop_color = fb_pack_color(64, 68, 75);
     desktop_ensure_path();
+    compositor = fb_create_compositor();
 }
 
 /* ------------------------------------------------------------------ */
@@ -754,6 +779,77 @@ static int dropdown_hit_item(int32_t mx, int32_t my) {
     return idx;
 }
 
+/* ------------------------------------------------------------------ */
+/*  Right-click context menu                                           */
+/* ------------------------------------------------------------------ */
+
+static void ctx_menu_draw(void) {
+    if (!ctx_win || ctx_win->ctx_menu.item_count == 0) return;
+
+    wm_menu_t *menu = &ctx_win->ctx_menu;
+    uint32_t item_h = FONT_H + 4;
+
+    /* Compute width from longest label */
+    uint32_t dd_w = 0;
+    for (int i = 0; i < menu->item_count; i++) {
+        uint32_t lw = menu_label_width(menu->items[i].label);
+        if (lw + 16 > dd_w) dd_w = lw + 16;
+    }
+    if (dd_w < 80) dd_w = 80;
+    uint32_t dd_h = (uint32_t)menu->item_count * item_h + 4;
+
+    /* Position at mouse cursor, clamp to screen */
+    uint32_t dd_x = (uint32_t)ctx_menu_x;
+    uint32_t dd_y = (uint32_t)ctx_menu_y;
+    if (dd_x + dd_w > fb_info.width)  dd_x = fb_info.width - dd_w;
+    if (dd_y + dd_h > fb_info.height) dd_y = fb_info.height - dd_h;
+
+    uint32_t dd_bg     = fb_pack_color(50, 50, 58);
+    uint32_t dd_border = fb_pack_color(80, 80, 90);
+    uint32_t dd_fg     = fb_pack_color(220, 220, 220);
+
+    fb_fill_rect(dd_x, dd_y, dd_w, dd_h, dd_bg);
+    fb_draw_rect(dd_x, dd_y, dd_w, dd_h, dd_border);
+
+    for (int i = 0; i < menu->item_count; i++) {
+        uint32_t iy = dd_y + 2 + (uint32_t)i * item_h;
+        uint32_t ix = dd_x + 8;
+        const char *label = menu->items[i].label;
+        for (int c = 0; label[c]; c++) {
+            fb_render_char_px(ix, iy + 2, (uint8_t)label[c], dd_fg, dd_bg);
+            ix += FONT_W;
+        }
+    }
+}
+
+static int ctx_menu_hit_item(int32_t mx, int32_t my) {
+    if (!ctx_win || ctx_win->ctx_menu.item_count == 0) return -1;
+
+    wm_menu_t *menu = &ctx_win->ctx_menu;
+    uint32_t item_h = FONT_H + 4;
+
+    uint32_t dd_w = 0;
+    for (int i = 0; i < menu->item_count; i++) {
+        uint32_t lw = menu_label_width(menu->items[i].label);
+        if (lw + 16 > dd_w) dd_w = lw + 16;
+    }
+    if (dd_w < 80) dd_w = 80;
+    uint32_t dd_h = (uint32_t)menu->item_count * item_h + 4;
+
+    uint32_t dd_x = (uint32_t)ctx_menu_x;
+    uint32_t dd_y = (uint32_t)ctx_menu_y;
+    if (dd_x + dd_w > fb_info.width)  dd_x = fb_info.width - dd_w;
+    if (dd_y + dd_h > fb_info.height) dd_y = fb_info.height - dd_h;
+
+    if (mx < (int32_t)dd_x || mx >= (int32_t)(dd_x + dd_w) ||
+        my < (int32_t)dd_y || my >= (int32_t)(dd_y + dd_h))
+        return -1;
+
+    int idx = ((int32_t)my - (int32_t)dd_y - 2) / (int32_t)item_h;
+    if (idx < 0 || idx >= menu->item_count) return -1;
+    return idx;
+}
+
 /* Test if (mx, my) hits a deskbar menu label. Returns menu index or -1. */
 static int deskbar_hit_menu(int32_t mx, int32_t my) {
     if (my < 0 || my >= (int32_t)WM_DESKBAR_H) return -1;
@@ -795,25 +891,49 @@ static int winmenu_hit_menu(window_t *win, int32_t mx, int32_t my) {
 
 void wm_redraw_all(void) {
     mouse_hide_cursor();
-    wm_draw_desktop();
 
-    /* Paint all visible windows bottom-to-top */
-    for (window_t *w = win_bottom; w; w = w->next) {
-        if (w->flags & WIN_FLAG_VISIBLE) {
-            wm_draw_chrome(w);
-            /* Call per-window repaint callback (renders to surface).
-               Shell surface is maintained incrementally — just blit it. */
-            if (w->repaint)
-                w->repaint(w);
-            /* Blit back buffer to framebuffer at content position */
-            if (w->surface)
-                surface_blit_to_fb(w->surface, w->content_x, w->content_y);
+    if (compositor) {
+        /* Compose entire frame into RAM-backed compositor surface */
+        fb_set_render_target(compositor);
+
+        wm_draw_desktop();
+
+        for (window_t *w = win_bottom; w; w = w->next) {
+            if (w->flags & WIN_FLAG_VISIBLE) {
+                wm_draw_chrome(w);
+                if (w->repaint)
+                    w->repaint(w);
+                if (w->surface)
+                    surface_blit_to_fb(w->surface, w->content_x, w->content_y);
+            }
         }
-    }
 
-    /* Draw dropdown on top of everything */
-    if (dropdown_win && dropdown_menu_idx >= 0)
-        wm_draw_dropdown();
+        if (dropdown_win && dropdown_menu_idx >= 0)
+            wm_draw_dropdown();
+        if (ctx_win)
+            ctx_menu_draw();
+
+        fb_set_render_target(NULL);
+
+        /* Single atomic blit: compositor (cached RAM) → hardware framebuffer */
+        surface_blit_to_fb(compositor, 0, 0);
+    } else {
+        /* Fallback: direct-to-hardware (no compositor available) */
+        wm_draw_desktop();
+        for (window_t *w = win_bottom; w; w = w->next) {
+            if (w->flags & WIN_FLAG_VISIBLE) {
+                wm_draw_chrome(w);
+                if (w->repaint)
+                    w->repaint(w);
+                if (w->surface)
+                    surface_blit_to_fb(w->surface, w->content_x, w->content_y);
+            }
+        }
+        if (dropdown_win && dropdown_menu_idx >= 0)
+            wm_draw_dropdown();
+        if (ctx_win)
+            ctx_menu_draw();
+    }
 
     mouse_show_cursor();
 }
@@ -912,46 +1032,12 @@ static void drag_move(window_t *win, int32_t mx, int32_t my) {
 
     if (new_x == win->x && new_y == win->y) return;
 
-    mouse_hide_cursor();
-
-    /* Erase old window area with desktop color (dirty-rect) instead of
-       repainting the entire screen.  Clamp to visible screen bounds. */
-    {
-        int32_t ox = win->x;
-        int32_t oy = win->y;
-        int32_t ow = (int32_t)win->w;
-        int32_t oh = (int32_t)win->h;
-
-        /* Clamp to screen */
-        if (ox < 0) { ow += ox; ox = 0; }
-        if (oy < 0) { oh += oy; oy = 0; }
-        if (ox + ow > (int32_t)fb_info.width)  ow = (int32_t)fb_info.width - ox;
-        if (oy + oh > (int32_t)fb_info.height) oh = (int32_t)fb_info.height - oy;
-
-        if (ow > 0 && oh > 0) {
-            fb_fill_rect((uint32_t)ox, (uint32_t)oy,
-                         (uint32_t)ow, (uint32_t)oh, desktop_color);
-        }
-    }
-
-    /* Redraw desktop icons + dock (lightweight — only icons, not the full background) */
-    wm_draw_deskbar();
-    wm_draw_desktop_icons();
-    dock_draw();
-
-    /* Update position */
     win->x = new_x;
     win->y = new_y;
     wm_update_content_rect(win);
 
-    /* Draw chrome at new position */
-    wm_draw_chrome(win);
-
-    /* Blit existing back buffer — content is already rendered */
-    if (win->surface)
-        surface_blit_to_fb(win->surface, win->content_x, win->content_y);
-
-    mouse_show_cursor();
+    /* Compositor handles overlapping windows correctly */
+    wm_redraw_all();
 }
 
 static void drag_end(window_t *win) {
@@ -1009,25 +1095,6 @@ static void resize_move(window_t *win, int32_t mx, int32_t my) {
         new_w == (int32_t)win->w && new_h == (int32_t)win->h)
         return;
 
-    mouse_hide_cursor();
-
-    /* Erase old window area */
-    {
-        int32_t ox = win->x, oy = win->y;
-        int32_t ow = (int32_t)win->w, oh = (int32_t)win->h;
-        if (ox < 0) { ow += ox; ox = 0; }
-        if (oy < 0) { oh += oy; oy = 0; }
-        if (ox + ow > (int32_t)fb_info.width)  ow = (int32_t)fb_info.width - ox;
-        if (oy + oh > (int32_t)fb_info.height) oh = (int32_t)fb_info.height - oy;
-        if (ow > 0 && oh > 0)
-            fb_fill_rect((uint32_t)ox, (uint32_t)oy,
-                         (uint32_t)ow, (uint32_t)oh, desktop_color);
-    }
-
-    wm_draw_deskbar();
-    wm_draw_desktop_icons();
-    dock_draw();
-
     /* Apply new geometry */
     win->x = new_x;
     win->y = new_y;
@@ -1039,17 +1106,8 @@ static void resize_move(window_t *win, int32_t mx, int32_t my) {
     if (win == shell_win)
         fb_console_bind_window(win);
 
-    wm_draw_chrome(win);
-
-    /* Repaint content into new surface, then blit */
-    if (win->repaint)
-        win->repaint(win);
-    else if (win == shell_win)
-        fb_console_repaint();
-    if (win->surface)
-        surface_blit_to_fb(win->surface, win->content_x, win->content_y);
-
-    mouse_show_cursor();
+    /* Compositor handles full repaint correctly */
+    wm_redraw_all();
 }
 
 static void resize_end(window_t *win) {
@@ -1084,6 +1142,23 @@ int wm_process_events(void) {
 
         int32_t mx = e.mouse_button.x;
         int32_t my = e.mouse_button.y;
+
+        /* If a context menu is open, check for item click or close it */
+        if (ctx_win) {
+            int item = ctx_menu_hit_item(mx, my);
+            if (item >= 0) {
+                wm_menu_item_t *mi = &ctx_win->ctx_menu.items[item];
+                wm_menu_action_t action = mi->action;
+                void *ctx = mi->ctx;
+                ctx_win = NULL;
+                wm_redraw_all();
+                if (action) action(ctx);
+                return 1;
+            }
+            ctx_win = NULL;
+            wm_redraw_all();
+            /* Fall through to handle the click normally */
+        }
 
         /* If a dropdown is open, check for item click first */
         if (dropdown_win && dropdown_menu_idx >= 0) {
@@ -1225,17 +1300,21 @@ int wm_process_events(void) {
                 vfs_dirent_t *de = icon_dirent(icon);
                 if (de) {
                     vfs_inode_t *node = vfs_get_inode(de->inode);
-                    if (node && node->type == VFS_TYPE_FILE) {
-                        /* Build full path */
-                        char path[128];
-                        int plen = 0;
-                        const char *dp = DESKTOP_PATH;
-                        while (*dp && plen < 126) path[plen++] = *dp++;
-                        path[plen++] = '/';
-                        const char *nm = de->name;
-                        while (*nm && plen < 126) path[plen++] = *nm++;
-                        path[plen] = '\0';
 
+                    /* Build full path */
+                    char path[128];
+                    int plen = 0;
+                    const char *dp = DESKTOP_PATH;
+                    while (*dp && plen < 126) path[plen++] = *dp++;
+                    path[plen++] = '/';
+                    const char *nm = de->name;
+                    while (*nm && plen < 126) path[plen++] = *nm++;
+                    path[plen] = '\0';
+
+                    if (node && node->type == VFS_TYPE_DIR) {
+                        if (finder_open)
+                            finder_open(path);
+                    } else if (node && node->type == VFS_TYPE_FILE) {
                         if (gui_editor_open)
                             gui_editor_open(path);
                     }
@@ -1246,6 +1325,35 @@ int wm_process_events(void) {
             last_icon_click_tick = now;
             return 1;
         }
+    }
+
+    /* --- Right-click --- */
+    if (e.type == EVENT_MOUSE_BUTTON && e.mouse_button.pressed &&
+        (e.mouse_button.button & MOUSE_BTN_RIGHT)) {
+        int32_t mx = e.mouse_button.x;
+        int32_t my = e.mouse_button.y;
+
+        /* Close any open dropdown or previous context menu */
+        if (dropdown_win) {
+            dropdown_win = NULL;
+            dropdown_menu_idx = -1;
+            dropdown_from_deskbar = 0;
+        }
+        if (ctx_win) ctx_win = NULL;
+
+        /* Find window under cursor */
+        window_t *hit = wm_window_at(mx, my);
+        if (hit && hit->build_ctx_menu) {
+            if (hit != win_top) wm_focus_window(hit);
+            hit->ctx_menu.item_count = 0;  /* clear previous items */
+            if (hit->build_ctx_menu(hit, mx, my)) {
+                ctx_win = hit;
+                ctx_menu_x = mx;
+                ctx_menu_y = my;
+            }
+        }
+        wm_redraw_all();
+        return 1;
     }
 
     /* Left-release: end drag or resize */
