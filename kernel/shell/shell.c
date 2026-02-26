@@ -18,6 +18,7 @@
 #include <kernel/event.h>
 #include <kernel/mouse.h>
 #include <kernel/window.h>
+#include <kernel/fb_console.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -78,11 +79,23 @@ void shell_clear(void) {
     shell_init_prefix();
 }
 
+/* Check if the shell window has been closed. If so, clean up and exit thread. */
+static void shell_check_close(void) {
+    window_t *sw = wm_get_shell_window();
+    if (sw && (sw->flags & WIN_FLAG_CLOSE_REQ)) {
+        fb_console_bind_window((window_t *)0);
+        wm_destroy_window(sw);
+        proc_kill(current_process->pid);
+        for (;;) __asm__ volatile("hlt");
+    }
+}
+
 void shell_readline(void) {
     line_len = 0;
 
     while (1) {
         wm_process_events();
+        shell_check_close();
 
         /* Focus-gated keyboard: only consume keys when shell window is focused */
         window_t *sw = wm_get_shell_window();

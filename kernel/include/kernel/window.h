@@ -157,4 +157,7 @@ window_t *wm_get_shell_window(void);
 window_t *wm_get_top_window(void);
 uint32_t  wm_get_desktop_color(void);
 
+/* Set the shell window pointer (used by dock launcher) */
+void wm_set_shell_window(window_t *win);
+
 #endif
