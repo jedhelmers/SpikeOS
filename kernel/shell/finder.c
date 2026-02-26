@@ -133,6 +133,7 @@ typedef struct {
     int       rename_cursor;
     int       rename_len;
 
+    int       dirty;     /* set by menu actions to signal redraw needed */
     int       quit;
 } finder_t;
 
@@ -324,6 +325,7 @@ static void finder_navigate(finder_t *fm, const char *new_path) {
     fm->path[255] = '\0';
     fm->selected = 0;
     finder_load_dir(fm);
+    fm->dirty = 1;
 
     /* Update window title */
     set_finder_title(fm);
@@ -367,6 +369,7 @@ static void finder_go_back(finder_t *fm) {
     fm->path[255] = '\0';
     fm->selected = 0;
     finder_load_dir(fm);
+    fm->dirty = 1;
     set_finder_title(fm);
 }
 
@@ -377,6 +380,7 @@ static void finder_go_forward(finder_t *fm) {
     fm->path[255] = '\0';
     fm->selected = 0;
     finder_load_dir(fm);
+    fm->dirty = 1;
     set_finder_title(fm);
 }
 
@@ -660,6 +664,7 @@ static void finder_new_folder(finder_t *fm) {
 
     vfs_mkdir(new_path);
     finder_load_dir(fm);
+    fm->dirty = 1;
 }
 
 static void finder_new_file(finder_t *fm) {
@@ -680,6 +685,7 @@ static void finder_new_file(finder_t *fm) {
 
     vfs_create_file(new_path);
     finder_load_dir(fm);
+    fm->dirty = 1;
 }
 
 static void finder_delete_selected(finder_t *fm) {
@@ -695,6 +701,7 @@ static void finder_delete_selected(finder_t *fm) {
         vfs_remove(full_path);
 
     finder_load_dir(fm);
+    fm->dirty = 1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -709,6 +716,7 @@ static void finder_start_rename(finder_t *fm) {
     fm->rename_buf[59] = '\0';
     fm->rename_len = strlen(fm->rename_buf);
     fm->rename_cursor = fm->rename_len;
+    fm->dirty = 1;
 }
 
 static void finder_commit_rename(finder_t *fm) {
@@ -725,6 +733,7 @@ static void finder_commit_rename(finder_t *fm) {
 
     vfs_rename(old_path, new_path_buf);
     finder_load_dir(fm);
+    fm->dirty = 1;
 }
 
 static void finder_cancel_rename(finder_t *fm) {
@@ -750,6 +759,41 @@ static void action_go_home(void *ctx) {
 
 static void action_go_desktop(void *ctx) {
     finder_navigate((finder_t *)ctx, "/Users/jedhelmers/Desktop");
+}
+
+/* Forward declaration for hit-testing (defined below) */
+static int finder_row_at(finder_t *fm, int32_t mx, int32_t my);
+
+/* ------------------------------------------------------------------ */
+/*  Right-click context menu builder                                   */
+/* ------------------------------------------------------------------ */
+
+static int finder_build_ctx_menu(window_t *win, int32_t mx, int32_t my) {
+    /* Find the finder instance that owns this window */
+    finder_t *fm = NULL;
+    for (int i = 0; i < MAX_FINDERS; i++) {
+        if (finders[i].active && finders[i].win == win) {
+            fm = &finders[i];
+            break;
+        }
+    }
+    if (!fm) return 0;
+
+    int row = finder_row_at(fm, mx, my);
+
+    if (row >= 0) {
+        /* Right-clicked on an entry — select it and show entry actions */
+        fm->selected = row;
+        fm->dirty = 1;
+        wm_menu_add_item(&win->ctx_menu, "Open",   action_open,   fm);
+        wm_menu_add_item(&win->ctx_menu, "Rename", action_rename, fm);
+        wm_menu_add_item(&win->ctx_menu, "Delete", action_delete, fm);
+    } else {
+        /* Right-clicked on empty space — show creation actions */
+        wm_menu_add_item(&win->ctx_menu, "New Folder", action_new_folder, fm);
+        wm_menu_add_item(&win->ctx_menu, "New File",   action_new_file,   fm);
+    }
+    return 1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -893,6 +937,7 @@ static void finder_thread(void) {
     }
 
     fm->win->repaint = finder_repaint_cb;
+    fm->win->build_ctx_menu = finder_build_ctx_menu;
 
     /* Menus */
     wm_menu_t *file_menu = wm_window_add_menu(fm->win, "File");
@@ -932,6 +977,12 @@ static void finder_thread(void) {
         }
 
         redraw = 0;
+
+        /* Check if menu actions dirtied the state */
+        if (fm->dirty) {
+            fm->dirty = 0;
+            redraw = 1;
+        }
 
         /* Recompute visible rows (window may have been resized) */
         finder_compute_visible(fm);

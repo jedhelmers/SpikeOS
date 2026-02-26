@@ -48,6 +48,10 @@ static window_t *dropdown_win = NULL;
 static int dropdown_menu_idx = -1;
 static int dropdown_from_deskbar = 0;  /* 1 = opened from deskbar, 0 = from window menubar */
 
+/* Right-click context menu state */
+static window_t *ctx_win = NULL;        /* window owning the open context menu */
+static int32_t ctx_menu_x, ctx_menu_y;  /* screen position of context menu */
+
 /* Double-click tracking for desktop icons */
 static uint32_t last_icon_click_tick = 0;
 static int last_icon_click_idx = -1;
@@ -759,6 +763,77 @@ static int dropdown_hit_item(int32_t mx, int32_t my) {
     return idx;
 }
 
+/* ------------------------------------------------------------------ */
+/*  Right-click context menu                                           */
+/* ------------------------------------------------------------------ */
+
+static void ctx_menu_draw(void) {
+    if (!ctx_win || ctx_win->ctx_menu.item_count == 0) return;
+
+    wm_menu_t *menu = &ctx_win->ctx_menu;
+    uint32_t item_h = FONT_H + 4;
+
+    /* Compute width from longest label */
+    uint32_t dd_w = 0;
+    for (int i = 0; i < menu->item_count; i++) {
+        uint32_t lw = menu_label_width(menu->items[i].label);
+        if (lw + 16 > dd_w) dd_w = lw + 16;
+    }
+    if (dd_w < 80) dd_w = 80;
+    uint32_t dd_h = (uint32_t)menu->item_count * item_h + 4;
+
+    /* Position at mouse cursor, clamp to screen */
+    uint32_t dd_x = (uint32_t)ctx_menu_x;
+    uint32_t dd_y = (uint32_t)ctx_menu_y;
+    if (dd_x + dd_w > fb_info.width)  dd_x = fb_info.width - dd_w;
+    if (dd_y + dd_h > fb_info.height) dd_y = fb_info.height - dd_h;
+
+    uint32_t dd_bg     = fb_pack_color(50, 50, 58);
+    uint32_t dd_border = fb_pack_color(80, 80, 90);
+    uint32_t dd_fg     = fb_pack_color(220, 220, 220);
+
+    fb_fill_rect(dd_x, dd_y, dd_w, dd_h, dd_bg);
+    fb_draw_rect(dd_x, dd_y, dd_w, dd_h, dd_border);
+
+    for (int i = 0; i < menu->item_count; i++) {
+        uint32_t iy = dd_y + 2 + (uint32_t)i * item_h;
+        uint32_t ix = dd_x + 8;
+        const char *label = menu->items[i].label;
+        for (int c = 0; label[c]; c++) {
+            fb_render_char_px(ix, iy + 2, (uint8_t)label[c], dd_fg, dd_bg);
+            ix += FONT_W;
+        }
+    }
+}
+
+static int ctx_menu_hit_item(int32_t mx, int32_t my) {
+    if (!ctx_win || ctx_win->ctx_menu.item_count == 0) return -1;
+
+    wm_menu_t *menu = &ctx_win->ctx_menu;
+    uint32_t item_h = FONT_H + 4;
+
+    uint32_t dd_w = 0;
+    for (int i = 0; i < menu->item_count; i++) {
+        uint32_t lw = menu_label_width(menu->items[i].label);
+        if (lw + 16 > dd_w) dd_w = lw + 16;
+    }
+    if (dd_w < 80) dd_w = 80;
+    uint32_t dd_h = (uint32_t)menu->item_count * item_h + 4;
+
+    uint32_t dd_x = (uint32_t)ctx_menu_x;
+    uint32_t dd_y = (uint32_t)ctx_menu_y;
+    if (dd_x + dd_w > fb_info.width)  dd_x = fb_info.width - dd_w;
+    if (dd_y + dd_h > fb_info.height) dd_y = fb_info.height - dd_h;
+
+    if (mx < (int32_t)dd_x || mx >= (int32_t)(dd_x + dd_w) ||
+        my < (int32_t)dd_y || my >= (int32_t)(dd_y + dd_h))
+        return -1;
+
+    int idx = ((int32_t)my - (int32_t)dd_y - 2) / (int32_t)item_h;
+    if (idx < 0 || idx >= menu->item_count) return -1;
+    return idx;
+}
+
 /* Test if (mx, my) hits a deskbar menu label. Returns menu index or -1. */
 static int deskbar_hit_menu(int32_t mx, int32_t my) {
     if (my < 0 || my >= (int32_t)WM_DESKBAR_H) return -1;
@@ -819,6 +894,8 @@ void wm_redraw_all(void) {
 
         if (dropdown_win && dropdown_menu_idx >= 0)
             wm_draw_dropdown();
+        if (ctx_win)
+            ctx_menu_draw();
 
         fb_set_render_target(NULL);
 
@@ -838,6 +915,8 @@ void wm_redraw_all(void) {
         }
         if (dropdown_win && dropdown_menu_idx >= 0)
             wm_draw_dropdown();
+        if (ctx_win)
+            ctx_menu_draw();
     }
 
     mouse_show_cursor();
@@ -1048,6 +1127,23 @@ int wm_process_events(void) {
         int32_t mx = e.mouse_button.x;
         int32_t my = e.mouse_button.y;
 
+        /* If a context menu is open, check for item click or close it */
+        if (ctx_win) {
+            int item = ctx_menu_hit_item(mx, my);
+            if (item >= 0) {
+                wm_menu_item_t *mi = &ctx_win->ctx_menu.items[item];
+                wm_menu_action_t action = mi->action;
+                void *ctx = mi->ctx;
+                ctx_win = NULL;
+                wm_redraw_all();
+                if (action) action(ctx);
+                return 1;
+            }
+            ctx_win = NULL;
+            wm_redraw_all();
+            /* Fall through to handle the click normally */
+        }
+
         /* If a dropdown is open, check for item click first */
         if (dropdown_win && dropdown_menu_idx >= 0) {
             int item = dropdown_hit_item(mx, my);
@@ -1209,6 +1305,35 @@ int wm_process_events(void) {
             last_icon_click_tick = now;
             return 1;
         }
+    }
+
+    /* --- Right-click --- */
+    if (e.type == EVENT_MOUSE_BUTTON && e.mouse_button.pressed &&
+        (e.mouse_button.button & MOUSE_BTN_RIGHT)) {
+        int32_t mx = e.mouse_button.x;
+        int32_t my = e.mouse_button.y;
+
+        /* Close any open dropdown or previous context menu */
+        if (dropdown_win) {
+            dropdown_win = NULL;
+            dropdown_menu_idx = -1;
+            dropdown_from_deskbar = 0;
+        }
+        if (ctx_win) ctx_win = NULL;
+
+        /* Find window under cursor */
+        window_t *hit = wm_window_at(mx, my);
+        if (hit && hit->build_ctx_menu) {
+            if (hit != win_top) wm_focus_window(hit);
+            hit->ctx_menu.item_count = 0;  /* clear previous items */
+            if (hit->build_ctx_menu(hit, mx, my)) {
+                ctx_win = hit;
+                ctx_menu_x = mx;
+                ctx_menu_y = my;
+            }
+        }
+        wm_redraw_all();
+        return 1;
     }
 
     /* Left-release: end drag or resize */
