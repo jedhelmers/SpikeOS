@@ -396,6 +396,16 @@ void terminal_page_down(void) {
     terminal_redraw_scrollback();
 }
 
+void terminal_scroll_lines(int n) {
+    if (use_fb) {
+        fb_console_scroll_lines(n);
+        return;
+    }
+    /* VGA text mode: fall back to page-level scroll */
+    if (n > 0) terminal_page_up();
+    else if (n < 0) terminal_page_down();
+}
+
 void terminal_switch_to_fb(void) {
     if (fb_console_active())
         use_fb = 1;

@@ -38,6 +38,9 @@ void fb_console_page_up(void);
 /* Scroll forward through history (Page Down) */
 void fb_console_page_down(void);
 
+/* Scroll by N lines (positive = into history, negative = toward live view) */
+void fb_console_scroll_lines(int n);
+
 /* Returns 1 if framebuffer console is active */
 int fb_console_active(void);
 
