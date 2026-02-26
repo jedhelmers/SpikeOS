@@ -13,6 +13,13 @@
 /* Console backend: 0 = VGA text mode (default), 1 = framebuffer */
 static int use_fb = 0;
 
+/* Output redirect hook: when non-NULL, terminal_write() sends data here instead */
+static terminal_redirect_fn redirect_fn = NULL;
+
+void terminal_set_redirect(terminal_redirect_fn fn) {
+    redirect_fn = fn;
+}
+
 static const size_t VGA_WIDTH  =  80;
 static const size_t VGA_HEIGHT =  25;
 static const size_t TAB = 4;
@@ -266,6 +273,11 @@ void terminal_putchar(char c) {
 }
 
 void terminal_write(const char* data, size_t size) {
+    if (redirect_fn) {
+        redirect_fn(data, size);
+        return;
+    }
+
     if (use_fb) {
         fb_console_write(data, size);
         return;
