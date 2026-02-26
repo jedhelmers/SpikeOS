@@ -8,6 +8,7 @@
 #include <kernel/heap.h>
 #include <kernel/vfs.h>
 #include <kernel/timer.h>
+#include <kernel/settings.h>
 #include <string.h>
 
 #define FONT_W 8
@@ -1392,7 +1393,8 @@ int wm_process_events(void) {
             if (w->flags & WIN_FLAG_FOCUSED) { focused = w; break; }
         }
         if (focused) {
-            focused->scroll_accum += e.mouse_scroll.dz;
+            int32_t dz = e.mouse_scroll.dz;
+            focused->scroll_accum += sys_settings.natural_scroll ? -dz : dz;
         }
         return 1;
     }

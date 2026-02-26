@@ -1804,8 +1804,8 @@ static void gui_editor_thread(void) {
             (ed->win->flags & WIN_FLAG_FOCUSED)) {
             int32_t dz = ed->win->scroll_accum;
             ed->win->scroll_accum = 0;
-            /* Scroll wheel: dz from PS/2, map to visual scroll direction */
-            ge_scroll_by_vrows(ed, dz * GE_SCROLL_LINES);
+            /* positive accum = scroll up, but ge positive = show later (down) */
+            ge_scroll_by_vrows(ed, -dz * GE_SCROLL_LINES);
             ge_draw_and_blit(ed);
         }
 

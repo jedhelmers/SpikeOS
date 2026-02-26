@@ -441,6 +441,43 @@ void fb_console_page_down(void) {
     fb_redraw_scrollback();
 }
 
+void fb_console_scroll_lines(int n) {
+    if (!fb_active || !bound_window) return;
+    if (sb_count == 0) return;
+
+    if (n > 0) {
+        /* Scroll up into history */
+        if (sb_offset == 0) {
+            memcpy(saved_screen, char_buf, sizeof(saved_screen));
+            saved_cx = cx;
+            saved_cy = cy;
+            sb_saved = 1;
+            erase_cursor();
+        }
+        sb_offset += n;
+        if (sb_offset > (int)sb_count) sb_offset = (int)sb_count;
+        fb_redraw_scrollback();
+    } else if (n < 0) {
+        if (sb_offset == 0) return;
+        sb_offset += n;  /* n is negative */
+        if (sb_offset <= 0) {
+            /* Snap back to live view */
+            sb_offset = 0;
+            if (sb_saved) {
+                memcpy(char_buf, saved_screen, sizeof(char_buf));
+                cx = saved_cx;
+                cy = saved_cy;
+                sb_saved = 0;
+            }
+            fb_console_repaint();
+            draw_cursor();
+            console_dirty = 1;
+            return;
+        }
+        fb_redraw_scrollback();
+    }
+}
+
 int fb_console_active(void) {
     return fb_active;
 }

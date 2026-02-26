@@ -33,6 +33,7 @@
 #include <kernel/e1000.h>
 #include <kernel/net.h>
 #include <kernel/dock.h>
+#include <kernel/settings.h>
 
 extern void kprint_howdy(void);
 extern void paging_enable(uint32_t);
@@ -231,6 +232,8 @@ void kernel_main(void) {
 #ifdef VERBOSE_BOOT
     printf("INIT Kernel Heap\n");
 #endif
+
+    settings_init();
 
     /* Map framebuffer into kernel VA (needs paging + heap) */
     fb_init();

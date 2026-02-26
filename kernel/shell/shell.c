@@ -445,6 +445,14 @@ void shell_readline(void) {
 
         /* Focus-gated keyboard: only consume keys when shell window is focused */
         window_t *sw = wm_get_shell_window();
+
+        /* Scroll wheel → scroll shell history */
+        if (sw && sw->scroll_accum != 0) {
+            int32_t dz = sw->scroll_accum;
+            sw->scroll_accum = 0;
+            terminal_scroll_lines(dz * 3);
+        }
+
         if (sw && !(sw->flags & WIN_FLAG_FOCUSED)) {
             __asm__ volatile ("hlt");
             continue;
