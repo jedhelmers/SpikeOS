@@ -16,6 +16,10 @@
 static uint32_t desktop_color;
 static window_t *shell_win = NULL;
 
+/* Compositor back buffer — all WM rendering goes here, then a single
+   blit copies the finished frame to the hardware framebuffer. */
+static surface_t *compositor = NULL;
+
 /* Window list — doubly linked, bottom to top z-order.
    win_bottom = first painted (back), win_top = last painted (front). */
 static window_t *win_bottom = NULL;
@@ -574,6 +578,7 @@ void wm_destroy_window(window_t *win) {
 void wm_init(void) {
     desktop_color = fb_pack_color(64, 68, 75);
     desktop_ensure_path();
+    compositor = fb_create_compositor();
 }
 
 /* ------------------------------------------------------------------ */
@@ -795,25 +800,45 @@ static int winmenu_hit_menu(window_t *win, int32_t mx, int32_t my) {
 
 void wm_redraw_all(void) {
     mouse_hide_cursor();
-    wm_draw_desktop();
 
-    /* Paint all visible windows bottom-to-top */
-    for (window_t *w = win_bottom; w; w = w->next) {
-        if (w->flags & WIN_FLAG_VISIBLE) {
-            wm_draw_chrome(w);
-            /* Call per-window repaint callback (renders to surface).
-               Shell surface is maintained incrementally — just blit it. */
-            if (w->repaint)
-                w->repaint(w);
-            /* Blit back buffer to framebuffer at content position */
-            if (w->surface)
-                surface_blit_to_fb(w->surface, w->content_x, w->content_y);
+    if (compositor) {
+        /* Compose entire frame into RAM-backed compositor surface */
+        fb_set_render_target(compositor);
+
+        wm_draw_desktop();
+
+        for (window_t *w = win_bottom; w; w = w->next) {
+            if (w->flags & WIN_FLAG_VISIBLE) {
+                wm_draw_chrome(w);
+                if (w->repaint)
+                    w->repaint(w);
+                if (w->surface)
+                    surface_blit_to_fb(w->surface, w->content_x, w->content_y);
+            }
         }
-    }
 
-    /* Draw dropdown on top of everything */
-    if (dropdown_win && dropdown_menu_idx >= 0)
-        wm_draw_dropdown();
+        if (dropdown_win && dropdown_menu_idx >= 0)
+            wm_draw_dropdown();
+
+        fb_set_render_target(NULL);
+
+        /* Single atomic blit: compositor (cached RAM) → hardware framebuffer */
+        surface_blit_to_fb(compositor, 0, 0);
+    } else {
+        /* Fallback: direct-to-hardware (no compositor available) */
+        wm_draw_desktop();
+        for (window_t *w = win_bottom; w; w = w->next) {
+            if (w->flags & WIN_FLAG_VISIBLE) {
+                wm_draw_chrome(w);
+                if (w->repaint)
+                    w->repaint(w);
+                if (w->surface)
+                    surface_blit_to_fb(w->surface, w->content_x, w->content_y);
+            }
+        }
+        if (dropdown_win && dropdown_menu_idx >= 0)
+            wm_draw_dropdown();
+    }
 
     mouse_show_cursor();
 }
@@ -912,46 +937,12 @@ static void drag_move(window_t *win, int32_t mx, int32_t my) {
 
     if (new_x == win->x && new_y == win->y) return;
 
-    mouse_hide_cursor();
-
-    /* Erase old window area with desktop color (dirty-rect) instead of
-       repainting the entire screen.  Clamp to visible screen bounds. */
-    {
-        int32_t ox = win->x;
-        int32_t oy = win->y;
-        int32_t ow = (int32_t)win->w;
-        int32_t oh = (int32_t)win->h;
-
-        /* Clamp to screen */
-        if (ox < 0) { ow += ox; ox = 0; }
-        if (oy < 0) { oh += oy; oy = 0; }
-        if (ox + ow > (int32_t)fb_info.width)  ow = (int32_t)fb_info.width - ox;
-        if (oy + oh > (int32_t)fb_info.height) oh = (int32_t)fb_info.height - oy;
-
-        if (ow > 0 && oh > 0) {
-            fb_fill_rect((uint32_t)ox, (uint32_t)oy,
-                         (uint32_t)ow, (uint32_t)oh, desktop_color);
-        }
-    }
-
-    /* Redraw desktop icons + dock (lightweight — only icons, not the full background) */
-    wm_draw_deskbar();
-    wm_draw_desktop_icons();
-    dock_draw();
-
-    /* Update position */
     win->x = new_x;
     win->y = new_y;
     wm_update_content_rect(win);
 
-    /* Draw chrome at new position */
-    wm_draw_chrome(win);
-
-    /* Blit existing back buffer — content is already rendered */
-    if (win->surface)
-        surface_blit_to_fb(win->surface, win->content_x, win->content_y);
-
-    mouse_show_cursor();
+    /* Compositor handles overlapping windows correctly */
+    wm_redraw_all();
 }
 
 static void drag_end(window_t *win) {
@@ -1009,25 +1000,6 @@ static void resize_move(window_t *win, int32_t mx, int32_t my) {
         new_w == (int32_t)win->w && new_h == (int32_t)win->h)
         return;
 
-    mouse_hide_cursor();
-
-    /* Erase old window area */
-    {
-        int32_t ox = win->x, oy = win->y;
-        int32_t ow = (int32_t)win->w, oh = (int32_t)win->h;
-        if (ox < 0) { ow += ox; ox = 0; }
-        if (oy < 0) { oh += oy; oy = 0; }
-        if (ox + ow > (int32_t)fb_info.width)  ow = (int32_t)fb_info.width - ox;
-        if (oy + oh > (int32_t)fb_info.height) oh = (int32_t)fb_info.height - oy;
-        if (ow > 0 && oh > 0)
-            fb_fill_rect((uint32_t)ox, (uint32_t)oy,
-                         (uint32_t)ow, (uint32_t)oh, desktop_color);
-    }
-
-    wm_draw_deskbar();
-    wm_draw_desktop_icons();
-    dock_draw();
-
     /* Apply new geometry */
     win->x = new_x;
     win->y = new_y;
@@ -1039,17 +1011,8 @@ static void resize_move(window_t *win, int32_t mx, int32_t my) {
     if (win == shell_win)
         fb_console_bind_window(win);
 
-    wm_draw_chrome(win);
-
-    /* Repaint content into new surface, then blit */
-    if (win->repaint)
-        win->repaint(win);
-    else if (win == shell_win)
-        fb_console_repaint();
-    if (win->surface)
-        surface_blit_to_fb(win->surface, win->content_x, win->content_y);
-
-    mouse_show_cursor();
+    /* Compositor handles full repaint correctly */
+    wm_redraw_all();
 }
 
 static void resize_end(window_t *win) {

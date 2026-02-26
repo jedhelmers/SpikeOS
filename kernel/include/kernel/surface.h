@@ -39,10 +39,17 @@ void surface_render_char_scaled(surface_t *s, uint32_t px, uint32_t py,
 void surface_draw_hline(surface_t *s, uint32_t x, uint32_t y,
                          uint32_t w, uint32_t color);
 
+/* Draw a vertical line within the surface */
+void surface_draw_vline(surface_t *s, uint32_t x, uint32_t y,
+                         uint32_t h, uint32_t color);
+
 /* Scroll surface contents up by row_h pixels, clear bottom with bg_color */
 void surface_scroll_up(surface_t *s, uint32_t row_h, uint32_t bg_color);
 
 /* Blit surface contents to the framebuffer at (dst_x, dst_y) */
 void surface_blit_to_fb(surface_t *s, uint32_t dst_x, uint32_t dst_y);
+
+/* Blit one surface onto another at (dst_x, dst_y) with clipping */
+void surface_blit(surface_t *dst, surface_t *src, uint32_t dst_x, uint32_t dst_y);
 
 #endif

@@ -1,10 +1,60 @@
 #include <kernel/framebuffer.h>
 #include <kernel/multiboot.h>
 #include <kernel/paging.h>
+#include <kernel/heap.h>
 #include <kernel/io.h>
 #include <string.h>
 
 framebuffer_info_t fb_info;
+
+/* ------------------------------------------------------------------ */
+/*  Render target: when set, fb_* draw ops redirect to this surface   */
+/* ------------------------------------------------------------------ */
+
+static surface_t *render_target = NULL;
+
+void fb_set_render_target(surface_t *s) { render_target = s; }
+surface_t *fb_get_render_target(void) { return render_target; }
+
+/* ------------------------------------------------------------------ */
+/*  Compositor back buffer allocation                                  */
+/* ------------------------------------------------------------------ */
+
+#define COMPOSITOR_VIRT_BASE 0xC1000000u  /* PDE[772] */
+
+surface_t *fb_create_compositor(void) {
+    if (!fb_info.available) return NULL;
+
+    uint32_t w = fb_info.width;
+    uint32_t h = fb_info.height;
+    uint32_t size = w * h * 4;
+
+    /* Map physical frames at COMPOSITOR_VIRT_BASE (cached RAM, not MMIO) */
+    uint32_t virt = COMPOSITOR_VIRT_BASE;
+    uint32_t mapped = 0;
+    while (mapped < size) {
+        uint32_t frame = alloc_frame();
+        if (frame == FRAME_ALLOC_FAIL) return NULL;
+        if (map_page(virt, frame, PAGE_PRESENT | PAGE_WRITABLE) != 0)
+            return NULL;
+        virt += PAGE_SIZE;
+        mapped += PAGE_SIZE;
+    }
+
+    /* Allocate surface_t struct on heap (small, just metadata).
+       NOTE: pixels points to VA-mapped frames, NOT heap memory.
+       Do NOT call surface_destroy() on this surface. */
+    surface_t *s = (surface_t *)kmalloc(sizeof(surface_t));
+    if (!s) return NULL;
+
+    s->pixels = (uint32_t *)COMPOSITOR_VIRT_BASE;
+    s->width  = w;
+    s->height = h;
+    s->pitch  = w * 4;
+
+    memset(s->pixels, 0, size);
+    return s;
+}
 
 /*
  * FB virtual address: starts at PDE[770] = 0xC0800000.
@@ -104,6 +154,7 @@ void fb_enable(void) {
 }
 
 void fb_putpixel(uint32_t x, uint32_t y, uint32_t color) {
+    if (render_target) { surface_putpixel(render_target, x, y, color); return; }
     if (!fb_info.available) return;
     if (x >= fb_info.width || y >= fb_info.height) return;
 
@@ -120,6 +171,7 @@ void fb_putpixel(uint32_t x, uint32_t y, uint32_t color) {
 }
 
 void fb_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t color) {
+    if (render_target) { surface_fill_rect(render_target, x, y, w, h, color); return; }
     if (!fb_info.available) return;
 
     /* Clip to screen bounds */
@@ -237,6 +289,7 @@ void fb_fill_circle_aa(uint32_t cx, uint32_t cy, uint32_t r,
 }
 
 void fb_draw_hline(uint32_t x, uint32_t y, uint32_t w, uint32_t color) {
+    if (render_target) { surface_draw_hline(render_target, x, y, w, color); return; }
     if (!fb_info.available) return;
     if (y >= fb_info.height || x >= fb_info.width) return;
     if (x + w > fb_info.width) w = fb_info.width - x;
@@ -259,6 +312,7 @@ void fb_draw_hline(uint32_t x, uint32_t y, uint32_t w, uint32_t color) {
 }
 
 void fb_draw_vline(uint32_t x, uint32_t y, uint32_t h, uint32_t color) {
+    if (render_target) { surface_draw_vline(render_target, x, y, h, color); return; }
     if (!fb_info.available) return;
     if (x >= fb_info.width || y >= fb_info.height) return;
     if (y + h > fb_info.height) h = fb_info.height - y;
@@ -288,6 +342,17 @@ void fb_draw_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t color
 
 void fb_blit(uint32_t dst_x, uint32_t dst_y, const uint32_t *src,
              uint32_t src_pitch, uint32_t w, uint32_t h) {
+    if (render_target) {
+        if (dst_x >= render_target->width || dst_y >= render_target->height) return;
+        if (dst_x + w > render_target->width)  w = render_target->width - dst_x;
+        if (dst_y + h > render_target->height) h = render_target->height - dst_y;
+        for (uint32_t row = 0; row < h; row++) {
+            uint32_t *dp = &render_target->pixels[(dst_y + row) * render_target->width + dst_x];
+            const uint8_t *sp = (const uint8_t *)src + row * src_pitch;
+            memcpy(dp, sp, w * 4);
+        }
+        return;
+    }
     if (!fb_info.available) return;
     if (dst_x >= fb_info.width || dst_y >= fb_info.height) return;
     if (dst_x + w > fb_info.width) w = fb_info.width - dst_x;
@@ -305,6 +370,21 @@ void fb_blit(uint32_t dst_x, uint32_t dst_y, const uint32_t *src,
 
 void fb_blit_masked(uint32_t dst_x, uint32_t dst_y, const uint32_t *src,
                     const uint8_t *mask, uint32_t src_pitch, uint32_t w, uint32_t h) {
+    if (render_target) {
+        for (uint32_t row = 0; row < h; row++) {
+            uint32_t sy = dst_y + row;
+            if (sy >= render_target->height) break;
+            const uint32_t *srow = (const uint32_t *)((const uint8_t *)src + row * src_pitch);
+            const uint8_t *mrow = mask + row * w;
+            for (uint32_t col = 0; col < w; col++) {
+                uint32_t sx = dst_x + col;
+                if (sx >= render_target->width) break;
+                if (!mrow[col]) continue;
+                render_target->pixels[sy * render_target->width + sx] = srow[col];
+            }
+        }
+        return;
+    }
     if (!fb_info.available) return;
 
     uint32_t bpp = fb_info.bpp / 8;

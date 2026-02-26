@@ -10,6 +10,7 @@
 #include <kernel/shell.h>
 #include <kernel/tetris.h>
 #include <kernel/gui_editor.h>
+#include <kernel/finder.h>
 #include <kernel/tty.h>
 #include <string.h>
 #include <stdio.h>
@@ -32,16 +33,19 @@ typedef struct {
 static void dock_launch_shell(void);
 static void dock_launch_editor(void);
 static void dock_launch_tetris(void);
+static void dock_launch_finder(void);
 static void draw_icon_shell(uint32_t cx, uint32_t cy);
 static void draw_icon_editor(uint32_t cx, uint32_t cy);
 static void draw_icon_tetris(uint32_t cx, uint32_t cy);
+static void draw_icon_finder(uint32_t cx, uint32_t cy);
 
-#define DOCK_APP_COUNT 3
+#define DOCK_APP_COUNT 4
 
 static dock_app_t apps[DOCK_APP_COUNT] = {
     { "Shell",  0, dock_launch_shell,  draw_icon_shell  },
     { "Editor", 0, dock_launch_editor, draw_icon_editor },
     { "Tetris", 0, dock_launch_tetris, draw_icon_tetris },
+    { "Finder", 0, dock_launch_finder, draw_icon_finder },
 };
 
 /* ------------------------------------------------------------------ */
@@ -229,6 +233,22 @@ static void draw_icon_tetris(uint32_t cx, uint32_t cy) {
     (void)grid;
 }
 
+static void draw_icon_finder(uint32_t cx, uint32_t cy) {
+    /* Blue folder with tab */
+    uint32_t bx = cx - 16, by = cy - 14;
+    uint32_t folder_bg = fb_pack_color(80, 140, 220);
+    uint32_t folder_dk = fb_pack_color(60, 110, 190);
+    uint32_t tab_bg    = fb_pack_color(100, 160, 240);
+
+    /* Folder tab (top-left) */
+    fb_fill_rect(bx, by, 14, 6, tab_bg);
+    /* Folder body */
+    fb_fill_rect(bx, by + 6, 32, 22, folder_bg);
+    fb_draw_rect(bx, by + 6, 32, 22, folder_dk);
+    /* Fold line */
+    fb_draw_hline(bx + 1, by + 12, 30, folder_dk);
+}
+
 /* ------------------------------------------------------------------ */
 /*  Hover tooltip                                                      */
 /* ------------------------------------------------------------------ */
@@ -363,10 +383,7 @@ void dock_hover(int32_t mx, int32_t my) {
     }
 
     if (hovered_idx != old_hover) {
-        /* Lightweight repaint: just redraw the dock area */
-        mouse_hide_cursor();
-        dock_draw();
-        mouse_show_cursor();
+        wm_redraw_all();
     }
 }
 
@@ -385,9 +402,10 @@ void dock_update_running(void) {
     /* Shell: check if shell window exists and is valid */
     apps[0].running = (wm_get_shell_window() != NULL) ? 1 : 0;
 
-    /* Editor + Tetris: scan window list by title */
+    /* Editor, Tetris, Finder: scan window list by title */
     apps[1].running = 0;
     apps[2].running = 0;
+    apps[3].running = 0;
 
     /* Walk the z-order list via wm_get_top_window and traverse prev.
        We can't access win_bottom directly, so use the top window and walk down. */
@@ -405,6 +423,12 @@ void dock_update_running(void) {
                 w->title[2] == 't' && w->title[3] == 'r' &&
                 w->title[4] == 'i' && w->title[5] == 's')
                 apps[2].running = 1;
+
+            /* Check for Finder */
+            if (w->title[0] == 'F' && w->title[1] == 'i' &&
+                w->title[2] == 'n' && w->title[3] == 'd' &&
+                w->title[4] == 'e' && w->title[5] == 'r')
+                apps[3].running = 1;
         }
         w = w->prev;
     }
@@ -466,6 +490,10 @@ static void tetris_thread_wrapper(void) {
 
 static void dock_launch_tetris(void) {
     proc_create_kernel_thread(tetris_thread_wrapper);
+}
+
+static void dock_launch_finder(void) {
+    finder_open("/");
 }
 
 /* ------------------------------------------------------------------ */

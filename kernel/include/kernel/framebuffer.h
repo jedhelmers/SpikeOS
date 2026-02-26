@@ -2,6 +2,7 @@
 #define _FRAMEBUFFER_H
 
 #include <stdint.h>
+#include <kernel/surface.h>
 
 struct multiboot_info;
 
@@ -56,5 +57,12 @@ void fb_blit(uint32_t dst_x, uint32_t dst_y, const uint32_t *src,
 /* Blit with transparency mask (mask: 1=opaque, 0=transparent, one byte per pixel) */
 void fb_blit_masked(uint32_t dst_x, uint32_t dst_y, const uint32_t *src,
                     const uint8_t *mask, uint32_t src_pitch, uint32_t w, uint32_t h);
+
+/* Render target: when set, fb_* draw functions redirect to this surface */
+void fb_set_render_target(surface_t *s);
+surface_t *fb_get_render_target(void);
+
+/* Allocate a full-screen compositor surface at dedicated kernel VA (not on heap) */
+surface_t *fb_create_compositor(void);
 
 #endif
