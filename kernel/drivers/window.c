@@ -1277,5 +1277,17 @@ int wm_process_events(void) {
         dock_hover(e.mouse_move.x, e.mouse_move.y);
     }
 
+    /* Mouse scroll — accumulate on focused window */
+    if (e.type == EVENT_MOUSE_SCROLL) {
+        window_t *focused = NULL;
+        for (window_t *w = win_top; w; w = w->prev) {
+            if (w->flags & WIN_FLAG_FOCUSED) { focused = w; break; }
+        }
+        if (focused) {
+            focused->scroll_accum += e.mouse_scroll.dz;
+        }
+        return 1;
+    }
+
     return 0;
 }
