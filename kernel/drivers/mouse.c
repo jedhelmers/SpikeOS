@@ -26,7 +26,8 @@ static mouse_state_t mouse_state;
 
 /* PS/2 packet assembly */
 static uint8_t mouse_cycle = 0;
-static uint8_t mouse_packet[3];
+static uint8_t mouse_packet[4];
+static uint8_t mouse_id = 0;   /* 0x00 = standard, 0x03 = IntelliMouse (scroll) */
 
 /*
  * Arrow cursor bitmap (12x19).
@@ -80,6 +81,25 @@ static void ps2_send_mouse(uint8_t byte) {
 static uint8_t ps2_read_data(void) {
     ps2_wait_read();
     return inb(PS2_DATA);
+}
+
+static void ps2_set_sample_rate(uint8_t rate) {
+    ps2_send_mouse(0xF3);   /* Set Sample Rate command */
+    ps2_read_data();         /* ACK */
+    ps2_send_mouse(rate);
+    ps2_read_data();         /* ACK */
+}
+
+static void mouse_try_intellimouse(void) {
+    /* Magic sequence: set sample rate 200, 100, 80 */
+    ps2_set_sample_rate(200);
+    ps2_set_sample_rate(100);
+    ps2_set_sample_rate(80);
+
+    /* Read mouse ID — 0x03 means IntelliMouse (scroll wheel) */
+    ps2_send_mouse(0xF2);    /* Get Device ID */
+    ps2_read_data();          /* ACK */
+    mouse_id = ps2_read_data();
 }
 
 /* ------------------------------------------------------------------ */
@@ -181,6 +201,60 @@ mouse_state_t mouse_get_state(void) {
 /*  IRQ12 handler                                                      */
 /* ------------------------------------------------------------------ */
 
+static void mouse_process_packet(int8_t scroll_dz) {
+    uint8_t flags = mouse_packet[0];
+    int32_t dx = (int32_t)mouse_packet[1];
+    int32_t dy = (int32_t)mouse_packet[2];
+
+    /* Sign extend */
+    if (flags & 0x10) dx |= (int32_t)0xFFFFFF00;
+    if (flags & 0x20) dy |= (int32_t)0xFFFFFF00;
+
+    /* Discard overflow */
+    if (flags & 0x40) dx = 0;
+    if (flags & 0x80) dy = 0;
+
+    /* PS/2 Y is inverted (positive = up), flip for screen coords */
+    dy = -dy;
+
+    uint8_t old_buttons = mouse_state.buttons;
+    mouse_state.x += dx;
+    mouse_state.y += dy;
+
+    /* Clamp to screen */
+    if (mouse_state.x < 0) mouse_state.x = 0;
+    if (mouse_state.y < 0) mouse_state.y = 0;
+    if (fb_info.available) {
+        if (mouse_state.x >= (int32_t)fb_info.width)
+            mouse_state.x = (int32_t)fb_info.width - 1;
+        if (mouse_state.y >= (int32_t)fb_info.height)
+            mouse_state.y = (int32_t)fb_info.height - 1;
+    }
+
+    mouse_state.buttons = flags & 0x07;
+
+    /* Update cursor and push move event */
+    if (dx != 0 || dy != 0) {
+        mouse_update_cursor();
+        event_push_mouse_move(mouse_state.x, mouse_state.y, dx, dy);
+    }
+
+    /* Check for button changes */
+    uint8_t changed = old_buttons ^ mouse_state.buttons;
+    for (int btn = 0; btn < 3; btn++) {
+        if (changed & (1 << btn)) {
+            uint8_t pressed = (mouse_state.buttons >> btn) & 1;
+            event_push_mouse_button(mouse_state.x, mouse_state.y,
+                                    (uint8_t)(1 << btn), pressed);
+        }
+    }
+
+    /* Push scroll event if scroll wheel moved */
+    if (scroll_dz != 0) {
+        event_push_mouse_scroll(mouse_state.x, mouse_state.y, (int32_t)scroll_dz);
+    }
+}
+
 static void mouse_irq(trapframe *r) {
     (void)r;
 
@@ -201,58 +275,21 @@ static void mouse_irq(trapframe *r) {
         mouse_packet[1] = data;
         mouse_cycle = 2;
         break;
-    case 2: {
+    case 2:
         mouse_packet[2] = data;
+        if (mouse_id == 0x03) {
+            /* IntelliMouse: need byte 3 (scroll) before processing */
+            mouse_cycle = 3;
+            break;
+        }
         mouse_cycle = 0;
-
-        uint8_t flags = mouse_packet[0];
-        int32_t dx = (int32_t)mouse_packet[1];
-        int32_t dy = (int32_t)mouse_packet[2];
-
-        /* Sign extend */
-        if (flags & 0x10) dx |= (int32_t)0xFFFFFF00;
-        if (flags & 0x20) dy |= (int32_t)0xFFFFFF00;
-
-        /* Discard overflow */
-        if (flags & 0x40) dx = 0;
-        if (flags & 0x80) dy = 0;
-
-        /* PS/2 Y is inverted (positive = up), flip for screen coords */
-        dy = -dy;
-
-        uint8_t old_buttons = mouse_state.buttons;
-        mouse_state.x += dx;
-        mouse_state.y += dy;
-
-        /* Clamp to screen */
-        if (mouse_state.x < 0) mouse_state.x = 0;
-        if (mouse_state.y < 0) mouse_state.y = 0;
-        if (fb_info.available) {
-            if (mouse_state.x >= (int32_t)fb_info.width)
-                mouse_state.x = (int32_t)fb_info.width - 1;
-            if (mouse_state.y >= (int32_t)fb_info.height)
-                mouse_state.y = (int32_t)fb_info.height - 1;
-        }
-
-        mouse_state.buttons = flags & 0x07;
-
-        /* Update cursor and push move event */
-        if (dx != 0 || dy != 0) {
-            mouse_update_cursor();
-            event_push_mouse_move(mouse_state.x, mouse_state.y, dx, dy);
-        }
-
-        /* Check for button changes */
-        uint8_t changed = old_buttons ^ mouse_state.buttons;
-        for (int btn = 0; btn < 3; btn++) {
-            if (changed & (1 << btn)) {
-                uint8_t pressed = (mouse_state.buttons >> btn) & 1;
-                event_push_mouse_button(mouse_state.x, mouse_state.y,
-                                        (uint8_t)(1 << btn), pressed);
-            }
-        }
+        mouse_process_packet(0);
         break;
-    }
+    case 3:
+        mouse_packet[3] = data;
+        mouse_cycle = 0;
+        mouse_process_packet((int8_t)data);
+        break;
     }
 }
 
@@ -297,6 +334,9 @@ void mouse_init(void) {
     /* 6. Set defaults */
     ps2_send_mouse(0xF6);
     ps2_read_data();   /* ACK */
+
+    /* 6a. Try to enable IntelliMouse extension (scroll wheel) */
+    mouse_try_intellimouse();
 
     /* 7. Enable data reporting (streaming mode) */
     ps2_send_mouse(0xF4);

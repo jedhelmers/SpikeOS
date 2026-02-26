@@ -48,6 +48,17 @@
 #define GE_TB_PAD_X  6
 #define GE_TB_GAP    4
 
+/* Scroll bar dimensions */
+#define GE_VSCROLL_W        14   /* vertical scrollbar width in pixels */
+#define GE_HSCROLL_H        14   /* horizontal scrollbar height in pixels */
+#define GE_SCROLL_MIN_THUMB 20   /* minimum thumb length in pixels */
+#define GE_SCROLL_LINES      3   /* lines per wheel notch */
+
+/* Scroll bar colors (dark theme) */
+#define GE_SB_TRACK    fb_pack_color(30, 30, 40)
+#define GE_SB_THUMB    fb_pack_color(80, 80, 100)
+#define GE_SB_THUMB_HL fb_pack_color(110, 110, 140)
+
 /* ------------------------------------------------------------------ */
 /*  Toolbar button definitions                                         */
 /* ------------------------------------------------------------------ */
@@ -119,6 +130,14 @@ typedef struct gui_editor {
     int hscroll;       /* horizontal scroll offset (visual cols, when !word_wrap) */
     int scroll_wrap;   /* wrap row within scroll line (when word_wrap) */
 
+    /* Scroll bar interaction */
+    int vscroll_dragging;
+    int hscroll_dragging;
+    int drag_start_mouse_y;
+    int drag_start_mouse_x;
+    int drag_start_scroll;
+    int drag_start_hscroll;
+
     /* Undo/redo */
     edit_cmd_t undo_stack[GE_MAX_UNDO];
     int undo_count;
@@ -143,6 +162,9 @@ static void ge_insert_char(gui_editor_t *ed, char c);
 static void ge_insert_newline(gui_editor_t *ed);
 static void ge_undo(gui_editor_t *ed);
 static void ge_redo(gui_editor_t *ed);
+static int  ge_save_as_dialog(gui_editor_t *ed);
+static void gui_editor_draw(gui_editor_t *ed);
+static void ge_draw_and_blit(gui_editor_t *ed);
 
 /* ------------------------------------------------------------------ */
 /*  Tab column conversion helpers                                      */
@@ -364,7 +386,178 @@ static void ge_load_file(gui_editor_t *ed) {
     }
 }
 
+static int ge_is_untitled(gui_editor_t *ed) {
+    return (strcmp(ed->filename, "/untitled") == 0);
+}
+
+/* Update the window title to reflect the current filename */
+static void ge_update_title(gui_editor_t *ed) {
+    if (!ed->win) return;
+    const char *base = ed->filename;
+    for (const char *p = ed->filename; *p; p++) {
+        if (*p == '/') base = p + 1;
+    }
+    char *t = ed->win->title;
+    int ti = 0;
+    const char *pfx = "Edit: ";
+    for (int i = 0; pfx[i] && ti < WIN_MAX_TITLE - 1; i++)
+        t[ti++] = pfx[i];
+    for (int i = 0; base[i] && ti < WIN_MAX_TITLE - 1; i++)
+        t[ti++] = base[i];
+    t[ti] = '\0';
+}
+
+/* Modal "Save As" dialog — draws over the editor surface, reads keyboard.
+   Returns 0 on success (filename updated), -1 on cancel. */
+static int ge_save_as_dialog(gui_editor_t *ed) {
+    if (!ed->win || !ed->win->surface) return -1;
+    surface_t *s = ed->win->surface;
+
+    char buf[128];
+    int blen = 0;
+
+    /* Pre-fill with current filename (skip leading /) */
+    const char *init = ed->filename;
+    if (init[0] == '/') init++;
+    if (strcmp(init, "untitled") != 0) {
+        for (int i = 0; init[i] && blen < 126; i++)
+            buf[blen++] = init[i];
+    }
+    buf[blen] = '\0';
+
+    /* Dialog geometry */
+    int dw = 320;
+    int dh = 80;
+    if (dw > (int)ed->win->content_w - 20) dw = (int)ed->win->content_w - 20;
+    int dx = ((int)ed->win->content_w - dw) / 2;
+    int dy = ((int)ed->win->content_h - dh) / 2;
+
+    uint32_t dlg_bg    = fb_pack_color(50, 50, 65);
+    uint32_t dlg_bord  = fb_pack_color(100, 100, 120);
+    uint32_t input_bg  = fb_pack_color(20, 20, 30);
+    uint32_t text_fg   = fb_pack_color(220, 220, 220);
+    uint32_t hint_fg   = fb_pack_color(140, 140, 150);
+
+    for (;;) {
+        /* Draw dialog box */
+        surface_fill_rect(s, (uint32_t)dx, (uint32_t)dy,
+                          (uint32_t)dw, (uint32_t)dh, dlg_bg);
+        /* Border */
+        surface_draw_hline(s, (uint32_t)dx, (uint32_t)dy, (uint32_t)dw, dlg_bord);
+        surface_draw_hline(s, (uint32_t)dx, (uint32_t)(dy + dh - 1), (uint32_t)dw, dlg_bord);
+        for (int yy = dy; yy < dy + dh; yy++) {
+            surface_putpixel(s, (uint32_t)dx, (uint32_t)yy, dlg_bord);
+            surface_putpixel(s, (uint32_t)(dx + dw - 1), (uint32_t)yy, dlg_bord);
+        }
+
+        /* "Save As:" label */
+        const char *label = "Save As:";
+        int lx = dx + 12;
+        int ly = dy + 10;
+        for (int i = 0; label[i]; i++)
+            surface_render_char(s, (uint32_t)(lx + i * FONT_W), (uint32_t)ly,
+                                (uint8_t)label[i], text_fg, dlg_bg);
+
+        /* Input field */
+        int ix = dx + 12;
+        int iy = dy + 10 + FONT_H + 8;
+        int iw = dw - 24;
+        int ih = FONT_H + 8;
+        surface_fill_rect(s, (uint32_t)ix, (uint32_t)iy,
+                          (uint32_t)iw, (uint32_t)ih, input_bg);
+
+        /* Render filename text */
+        int max_chars = (iw - 8) / FONT_W;
+        int start = 0;
+        if (blen > max_chars) start = blen - max_chars;
+        for (int i = start; i < blen; i++) {
+            surface_render_char(s, (uint32_t)(ix + 4 + (i - start) * FONT_W),
+                                (uint32_t)(iy + 4),
+                                (uint8_t)buf[i], text_fg, input_bg);
+        }
+
+        /* Cursor */
+        int cursor_x = ix + 4 + (blen - start) * FONT_W;
+        if (cursor_x < ix + iw - 2)
+            surface_fill_rect(s, (uint32_t)cursor_x, (uint32_t)(iy + 4),
+                              2, FONT_H, text_fg);
+
+        /* Hint text */
+        const char *hint = "Enter=save  Ctrl+Q=cancel";
+        int hx = dx + 12;
+        int hy = dy + dh - FONT_H - 4;
+        /* Only draw hint if it fits below the input */
+        if (hy > iy + ih) {
+            for (int i = 0; hint[i]; i++)
+                surface_render_char(s, (uint32_t)(hx + i * FONT_W), (uint32_t)hy,
+                                    (uint8_t)hint[i], hint_fg, dlg_bg);
+        }
+
+        /* Blit */
+        mouse_hide_cursor();
+        surface_blit_to_fb(s, ed->win->content_x, ed->win->content_y);
+        mouse_show_cursor();
+
+        /* Process events (keep WM responsive) */
+        wm_process_events();
+
+        /* Read keyboard */
+        key_event_t k = keyboard_get_event();
+        if (k.type == KEY_NONE) {
+            hal_halt();
+            continue;
+        }
+
+        if (k.type == KEY_ENTER) {
+            if (blen == 0) continue;  /* don't save empty name */
+            /* Build full path: prepend / if not present */
+            char path[128];
+            int pi = 0;
+            if (buf[0] != '/') path[pi++] = '/';
+            for (int i = 0; i < blen && pi < 126; i++)
+                path[pi++] = buf[i];
+            path[pi] = '\0';
+            /* Update editor filename */
+            strcpy(ed->filename, path);
+            ge_update_title(ed);
+            return 0;
+        }
+
+        if (k.type == KEY_CTRL_Q || k.type == KEY_CTRL_X) {
+            return -1;
+        }
+
+        if (k.type == KEY_BACKSPACE) {
+            if (blen > 0) blen--;
+            buf[blen] = '\0';
+            continue;
+        }
+
+        if (k.type == KEY_CHAR && blen < 126) {
+            char c = k.ch;
+            /* Allow alphanumeric, dot, dash, underscore, slash */
+            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                (c >= '0' && c <= '9') || c == '.' || c == '-' ||
+                c == '_' || c == '/') {
+                buf[blen++] = c;
+                buf[blen] = '\0';
+            }
+        }
+    }
+}
+
 static int ge_save_file(gui_editor_t *ed) {
+    /* If the file is untitled, prompt for a name first */
+    if (ge_is_untitled(ed)) {
+        if (ge_save_as_dialog(ed) < 0) {
+            strcpy(ed->status, "Save cancelled");
+            return -1;
+        }
+        /* Redraw with updated title */
+        wm_draw_chrome(ed->win);
+        ge_draw_and_blit(ed);
+    }
+
     int32_t ino = vfs_resolve(ed->filename, NULL, NULL);
     if (ino < 0) {
         ino = vfs_create_file(ed->filename);
@@ -405,11 +598,206 @@ static void ge_compute_dims(gui_editor_t *ed) {
     if (!ed->win) return;
     int fw = FONT_W * ed->font_scale;
     int fh = FONT_H * ed->font_scale;
-    ed->text_cols = (int)(ed->win->content_w / fw);
-    /* Available height: content minus toolbar at top, minus status bar (1x) at bottom */
-    int avail_h = (int)ed->win->content_h - GE_TOOLBAR_H - FONT_H;
+    /* Subtract vertical scrollbar width from available text width */
+    int avail_w = (int)ed->win->content_w - GE_VSCROLL_W;
+    if (avail_w < fw) avail_w = fw;
+    ed->text_cols = avail_w / fw;
+    /* Subtract horizontal scrollbar height when not in word wrap mode */
+    int hscroll_h = ed->word_wrap ? 0 : GE_HSCROLL_H;
+    int avail_h = (int)ed->win->content_h - GE_TOOLBAR_H - FONT_H - hscroll_h;
     ed->text_rows = avail_h / fh;
     if (ed->text_rows < 1) ed->text_rows = 1;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Scroll bar geometry helpers                                        */
+/* ------------------------------------------------------------------ */
+
+/* Total visual rows in the document */
+static int ge_total_vrows(gui_editor_t *ed) {
+    if (ed->word_wrap) {
+        int total = 0;
+        for (int i = 0; i < ed->nlines; i++)
+            total += ge_line_vrows(ed, i);
+        return total;
+    }
+    return ed->nlines;
+}
+
+/* Current scroll position as a visual row offset from top */
+static int ge_scroll_vrow(gui_editor_t *ed) {
+    if (ed->word_wrap) {
+        int vr = 0;
+        for (int i = 0; i < ed->scroll; i++)
+            vr += ge_line_vrows(ed, i);
+        vr += ed->scroll_wrap;
+        return vr;
+    }
+    return ed->scroll;
+}
+
+/* Longest line's visual column count */
+static int ge_max_vcol(gui_editor_t *ed) {
+    int max_vc = 0;
+    for (int i = 0; i < ed->nlines; i++) {
+        int vc = buf_to_vcol(ed, i, ed->line_len[i]);
+        if (vc > max_vc) max_vc = vc;
+    }
+    return max_vc;
+}
+
+/* Vertical scrollbar track geometry (relative to surface) */
+static void ge_vscroll_rect(gui_editor_t *ed,
+                             int *track_x, int *track_y,
+                             int *track_w, int *track_h) {
+    int hscroll_h = ed->word_wrap ? 0 : GE_HSCROLL_H;
+    *track_x = (int)ed->win->content_w - GE_VSCROLL_W;
+    *track_y = GE_TOOLBAR_H;
+    *track_w = GE_VSCROLL_W;
+    *track_h = (int)ed->win->content_h - GE_TOOLBAR_H - FONT_H - hscroll_h;
+}
+
+/* Vertical thumb position and size within the track */
+static void ge_vscroll_thumb(gui_editor_t *ed,
+                              int track_y, int track_h,
+                              int *thumb_y, int *thumb_h) {
+    int total = ge_total_vrows(ed);
+    if (total <= ed->text_rows) {
+        *thumb_y = track_y;
+        *thumb_h = track_h;
+        return;
+    }
+    int th = (ed->text_rows * track_h) / total;
+    if (th < GE_SCROLL_MIN_THUMB) th = GE_SCROLL_MIN_THUMB;
+    int scroll_vr = ge_scroll_vrow(ed);
+    int max_scroll = total - ed->text_rows;
+    if (max_scroll < 1) max_scroll = 1;
+    int ty = track_y + (scroll_vr * (track_h - th)) / max_scroll;
+    if (ty < track_y) ty = track_y;
+    if (ty + th > track_y + track_h) ty = track_y + track_h - th;
+    *thumb_y = ty;
+    *thumb_h = th;
+}
+
+/* Horizontal scrollbar track geometry (only when !word_wrap) */
+static void ge_hscroll_rect(gui_editor_t *ed,
+                              int *track_x, int *track_y,
+                              int *track_w, int *track_h) {
+    *track_x = 0;
+    *track_y = (int)ed->win->content_h - FONT_H - GE_HSCROLL_H;
+    *track_w = (int)ed->win->content_w - GE_VSCROLL_W;
+    *track_h = GE_HSCROLL_H;
+}
+
+/* Horizontal thumb position and size */
+static void ge_hscroll_thumb(gui_editor_t *ed,
+                               int track_x, int track_w,
+                               int *thumb_x, int *thumb_w) {
+    int max_vc = ge_max_vcol(ed);
+    if (max_vc <= ed->text_cols) {
+        *thumb_x = track_x;
+        *thumb_w = track_w;
+        return;
+    }
+    int tw = (ed->text_cols * track_w) / max_vc;
+    if (tw < GE_SCROLL_MIN_THUMB) tw = GE_SCROLL_MIN_THUMB;
+    int max_hscroll = max_vc - ed->text_cols;
+    if (max_hscroll < 1) max_hscroll = 1;
+    int tx = track_x + (ed->hscroll * (track_w - tw)) / max_hscroll;
+    if (tx < track_x) tx = track_x;
+    if (tx + tw > track_x + track_w) tx = track_x + track_w - tw;
+    *thumb_x = tx;
+    *thumb_w = tw;
+}
+
+/* Scroll by N visual rows (positive = show later content) */
+static void ge_scroll_by_vrows(gui_editor_t *ed, int delta) {
+    if (ed->word_wrap) {
+        int current_vr = ge_scroll_vrow(ed);
+        int target_vr = current_vr + delta;
+        int total = ge_total_vrows(ed);
+        int max_vr = total - ed->text_rows;
+        if (max_vr < 0) max_vr = 0;
+        if (target_vr < 0) target_vr = 0;
+        if (target_vr > max_vr) target_vr = max_vr;
+
+        int vr = 0;
+        for (int fl = 0; fl < ed->nlines; fl++) {
+            int lv = ge_line_vrows(ed, fl);
+            if (vr + lv > target_vr) {
+                ed->scroll = fl;
+                ed->scroll_wrap = target_vr - vr;
+                return;
+            }
+            vr += lv;
+        }
+        ed->scroll = ed->nlines > 0 ? ed->nlines - 1 : 0;
+        ed->scroll_wrap = 0;
+    } else {
+        ed->scroll += delta;
+        if (ed->scroll < 0) ed->scroll = 0;
+        int max_scroll = ed->nlines - ed->text_rows;
+        if (max_scroll < 0) max_scroll = 0;
+        if (ed->scroll > max_scroll) ed->scroll = max_scroll;
+    }
+}
+
+/* Set scroll to a specific visual row (for thumb drag) */
+static void ge_scroll_to_vrow(gui_editor_t *ed, int target_vr) {
+    int total = ge_total_vrows(ed);
+    int max_vr = total - ed->text_rows;
+    if (max_vr < 0) max_vr = 0;
+    if (target_vr < 0) target_vr = 0;
+    if (target_vr > max_vr) target_vr = max_vr;
+
+    if (ed->word_wrap) {
+        int vr = 0;
+        for (int fl = 0; fl < ed->nlines; fl++) {
+            int lv = ge_line_vrows(ed, fl);
+            if (vr + lv > target_vr) {
+                ed->scroll = fl;
+                ed->scroll_wrap = target_vr - vr;
+                return;
+            }
+            vr += lv;
+        }
+        ed->scroll = ed->nlines > 0 ? ed->nlines - 1 : 0;
+        ed->scroll_wrap = 0;
+    } else {
+        ed->scroll = target_vr;
+    }
+}
+
+/* Vertical scrollbar hit-test: 0=miss, 1=above thumb, 2=on thumb, 3=below thumb */
+static int ge_vscroll_hit(gui_editor_t *ed, int32_t mx, int32_t my) {
+    if (!ed->win) return 0;
+    int tx, ty, tw, th;
+    ge_vscroll_rect(ed, &tx, &ty, &tw, &th);
+    int rx = (int)(mx - (int32_t)ed->win->content_x);
+    int ry = (int)(my - (int32_t)ed->win->content_y);
+    if (rx < tx || rx >= tx + tw || ry < ty || ry >= ty + th)
+        return 0;
+    int thumb_y, thumb_h;
+    ge_vscroll_thumb(ed, ty, th, &thumb_y, &thumb_h);
+    if (ry < thumb_y) return 1;
+    if (ry < thumb_y + thumb_h) return 2;
+    return 3;
+}
+
+/* Horizontal scrollbar hit-test: 0=miss, 1=left of thumb, 2=on thumb, 3=right */
+static int ge_hscroll_hit(gui_editor_t *ed, int32_t mx, int32_t my) {
+    if (!ed->win || ed->word_wrap) return 0;
+    int tx, ty, tw, th;
+    ge_hscroll_rect(ed, &tx, &ty, &tw, &th);
+    int rx = (int)(mx - (int32_t)ed->win->content_x);
+    int ry = (int)(my - (int32_t)ed->win->content_y);
+    if (rx < tx || rx >= tx + tw || ry < ty || ry >= ty + th)
+        return 0;
+    int thumb_x, thumb_w;
+    ge_hscroll_thumb(ed, tx, tw, &thumb_x, &thumb_w);
+    if (rx < thumb_x) return 1;
+    if (rx < thumb_x + thumb_w) return 2;
+    return 3;
 }
 
 static void ge_putchar_at(gui_editor_t *ed, int x, int y, char ch,
@@ -479,9 +867,9 @@ static int ge_screen_to_file(gui_editor_t *ed, int32_t mx, int32_t my,
     int32_t cx_px = (int32_t)ed->win->content_x;
     int32_t text_top = (int32_t)ed->win->content_y + GE_TOOLBAR_H;
     int32_t text_h = (int32_t)(ed->text_rows * fh);
-    int32_t cw = (int32_t)ed->win->content_w;
+    int32_t text_w = (int32_t)ed->win->content_w - GE_VSCROLL_W;
 
-    if (mx < cx_px || mx >= cx_px + cw ||
+    if (mx < cx_px || mx >= cx_px + text_w ||
         my < text_top || my >= text_top + text_h)
         return 0;
 
@@ -687,6 +1075,51 @@ static void gui_editor_draw(gui_editor_t *ed) {
     int pos_x = (status_cols - pi - 1) * FONT_W;
     if (pos_x > 0)
         ge_status_str(ed, pos_x, status_py, pos, GE_BAR_FG, GE_BAR_BG);
+
+    /* Draw scroll bars */
+    {
+        surface_t *s = ed->win->surface;
+
+        /* --- Vertical scroll bar (always present) --- */
+        {
+            int tx, ty, tw, th;
+            ge_vscroll_rect(ed, &tx, &ty, &tw, &th);
+            surface_fill_rect(s, (uint32_t)tx, (uint32_t)ty,
+                              (uint32_t)tw, (uint32_t)th, GE_SB_TRACK);
+            /* 1px left separator */
+            for (int yy = ty; yy < ty + th; yy++)
+                surface_putpixel(s, (uint32_t)tx, (uint32_t)yy, GE_TB_SEP);
+            /* Thumb */
+            int thumb_y, thumb_h;
+            ge_vscroll_thumb(ed, ty, th, &thumb_y, &thumb_h);
+            uint32_t tc = ed->vscroll_dragging ? GE_SB_THUMB_HL : GE_SB_THUMB;
+            surface_fill_rect(s, (uint32_t)(tx + 2), (uint32_t)thumb_y,
+                              (uint32_t)(tw - 4), (uint32_t)thumb_h, tc);
+        }
+
+        /* --- Horizontal scroll bar (only when !word_wrap) --- */
+        if (!ed->word_wrap) {
+            int tx, ty, tw, th;
+            ge_hscroll_rect(ed, &tx, &ty, &tw, &th);
+            surface_fill_rect(s, (uint32_t)tx, (uint32_t)ty,
+                              (uint32_t)tw, (uint32_t)th, GE_SB_TRACK);
+            surface_draw_hline(s, (uint32_t)tx, (uint32_t)ty,
+                              (uint32_t)tw, GE_TB_SEP);
+            int thumb_x, thumb_w;
+            ge_hscroll_thumb(ed, tx, tw, &thumb_x, &thumb_w);
+            uint32_t tc = ed->hscroll_dragging ? GE_SB_THUMB_HL : GE_SB_THUMB;
+            surface_fill_rect(s, (uint32_t)thumb_x, (uint32_t)(ty + 2),
+                              (uint32_t)thumb_w, (uint32_t)(th - 4), tc);
+        }
+
+        /* Corner fill (junction of vscroll and hscroll) */
+        if (!ed->word_wrap) {
+            int cx = (int)ed->win->content_w - GE_VSCROLL_W;
+            int cy_pos = (int)ed->win->content_h - FONT_H - GE_HSCROLL_H;
+            surface_fill_rect(s, (uint32_t)cx, (uint32_t)cy_pos,
+                              GE_VSCROLL_W, GE_HSCROLL_H, GE_SB_TRACK);
+        }
+    }
 
     /* Draw cursor (underline) */
     {
@@ -1175,6 +1608,17 @@ static void ge_action_save(void *ctx) {
     ge_save_file((gui_editor_t *)ctx);
 }
 
+static void ge_action_save_as(void *ctx) {
+    gui_editor_t *ed = (gui_editor_t *)ctx;
+    if (ge_save_as_dialog(ed) == 0) {
+        wm_draw_chrome(ed->win);
+        ge_save_file(ed);   /* filename was updated, no longer untitled */
+    } else {
+        strcpy(ed->status, "Save cancelled");
+    }
+    ge_draw_and_blit(ed);
+}
+
 static void ge_action_quit(void *ctx) {
     ((gui_editor_t *)ctx)->quit = 1;
 }
@@ -1290,6 +1734,7 @@ static void gui_editor_thread(void) {
     wm_menu_t *file_menu = wm_window_add_menu(ed->win, "File");
     if (file_menu) {
         wm_menu_add_item(file_menu, "Save", ge_action_save, ed);
+        wm_menu_add_item(file_menu, "Save As", ge_action_save_as, ed);
         wm_menu_add_item(file_menu, "Quit", ge_action_quit, ed);
     }
 
@@ -1326,6 +1771,8 @@ static void gui_editor_thread(void) {
     ed->word_wrap = 1;
     ed->hscroll = 0;
     ed->scroll_wrap = 0;
+    ed->vscroll_dragging = 0;
+    ed->hscroll_dragging = 0;
 
     ge_layout_toolbar();
 
@@ -1350,6 +1797,16 @@ static void gui_editor_thread(void) {
         if (ed->win->flags & WIN_FLAG_CLOSE_REQ) {
             ed->quit = 1;
             break;
+        }
+
+        /* Consume scroll wheel accumulator */
+        if (ed->win->scroll_accum != 0 &&
+            (ed->win->flags & WIN_FLAG_FOCUSED)) {
+            int32_t dz = ed->win->scroll_accum;
+            ed->win->scroll_accum = 0;
+            /* Scroll wheel: dz from PS/2, map to visual scroll direction */
+            ge_scroll_by_vrows(ed, dz * GE_SCROLL_LINES);
+            ge_draw_and_blit(ed);
         }
 
         /* Mouse handling */
@@ -1402,6 +1859,57 @@ static void gui_editor_thread(void) {
                     }
                     prev_lmb = cur_lmb;
                     goto next_iter;
+                }
+
+                /* Check vertical scrollbar click */
+                {
+                    int vhit = ge_vscroll_hit(ed, mx, my);
+                    if (vhit == 1) {
+                        ge_scroll_by_vrows(ed, -ed->text_rows);
+                        ge_draw_and_blit(ed);
+                        prev_lmb = cur_lmb;
+                        goto next_iter;
+                    } else if (vhit == 3) {
+                        ge_scroll_by_vrows(ed, ed->text_rows);
+                        ge_draw_and_blit(ed);
+                        prev_lmb = cur_lmb;
+                        goto next_iter;
+                    } else if (vhit == 2) {
+                        ed->vscroll_dragging = 1;
+                        ed->drag_start_mouse_y = (int)my;
+                        ed->drag_start_scroll = ge_scroll_vrow(ed);
+                        ge_draw_and_blit(ed);
+                        prev_lmb = cur_lmb;
+                        goto next_iter;
+                    }
+                }
+
+                /* Check horizontal scrollbar click */
+                if (!ed->word_wrap) {
+                    int hhit = ge_hscroll_hit(ed, mx, my);
+                    if (hhit == 1) {
+                        ed->hscroll -= ed->text_cols;
+                        if (ed->hscroll < 0) ed->hscroll = 0;
+                        ge_draw_and_blit(ed);
+                        prev_lmb = cur_lmb;
+                        goto next_iter;
+                    } else if (hhit == 3) {
+                        int max_vc = ge_max_vcol(ed);
+                        ed->hscroll += ed->text_cols;
+                        int max_hs = max_vc - ed->text_cols;
+                        if (max_hs < 0) max_hs = 0;
+                        if (ed->hscroll > max_hs) ed->hscroll = max_hs;
+                        ge_draw_and_blit(ed);
+                        prev_lmb = cur_lmb;
+                        goto next_iter;
+                    } else if (hhit == 2) {
+                        ed->hscroll_dragging = 1;
+                        ed->drag_start_mouse_x = (int)mx;
+                        ed->drag_start_hscroll = ed->hscroll;
+                        ge_draw_and_blit(ed);
+                        prev_lmb = cur_lmb;
+                        goto next_iter;
+                    }
                 }
 
                 /* Check text area click */
@@ -1464,22 +1972,60 @@ static void gui_editor_thread(void) {
                         ge_draw_and_blit(ed);
                     }
                 }
-            } else if (cur_lmb && mouse_selecting && ed->win) {
-                /* Mouse drag for text selection */
-                int drag_line, drag_col;
-                if (ge_screen_to_file(ed, mx, my, &drag_line, &drag_col)) {
-                    if (drag_line != ed->cy || drag_col != ed->cx) {
-                        ed->sel_active = 1;
-                        ed->cy = drag_line;
-                        ed->cx = drag_col;
-                        ge_scroll_to_cursor(ed);
-                        ge_draw_and_blit(ed);
+            } else if (cur_lmb && ed->win) {
+                if (ed->vscroll_dragging) {
+                    /* Vertical thumb drag */
+                    int tx, ty, tw, th;
+                    ge_vscroll_rect(ed, &tx, &ty, &tw, &th);
+                    int thumb_y, thumb_h;
+                    ge_vscroll_thumb(ed, ty, th, &thumb_y, &thumb_h);
+                    int total = ge_total_vrows(ed);
+                    int max_vr = total - ed->text_rows;
+                    if (max_vr < 1) max_vr = 1;
+                    int usable_track = th - thumb_h;
+                    if (usable_track < 1) usable_track = 1;
+                    int mouse_dy = (int)my - ed->drag_start_mouse_y;
+                    int new_vr = ed->drag_start_scroll +
+                                 (mouse_dy * max_vr) / usable_track;
+                    ge_scroll_to_vrow(ed, new_vr);
+                    ge_draw_and_blit(ed);
+                } else if (ed->hscroll_dragging) {
+                    /* Horizontal thumb drag */
+                    int tx, ty, tw, th;
+                    ge_hscroll_rect(ed, &tx, &ty, &tw, &th);
+                    int thumb_x, thumb_w;
+                    ge_hscroll_thumb(ed, tx, tw, &thumb_x, &thumb_w);
+                    int max_vc = ge_max_vcol(ed);
+                    int max_hs = max_vc - ed->text_cols;
+                    if (max_hs < 1) max_hs = 1;
+                    int usable_track = tw - thumb_w;
+                    if (usable_track < 1) usable_track = 1;
+                    int mouse_dx = (int)mx - ed->drag_start_mouse_x;
+                    int new_hs = ed->drag_start_hscroll +
+                                 (mouse_dx * max_hs) / usable_track;
+                    if (new_hs < 0) new_hs = 0;
+                    if (new_hs > max_hs) new_hs = max_hs;
+                    ed->hscroll = new_hs;
+                    ge_draw_and_blit(ed);
+                } else if (mouse_selecting) {
+                    /* Mouse drag for text selection */
+                    int drag_line, drag_col;
+                    if (ge_screen_to_file(ed, mx, my, &drag_line, &drag_col)) {
+                        if (drag_line != ed->cy || drag_col != ed->cx) {
+                            ed->sel_active = 1;
+                            ed->cy = drag_line;
+                            ed->cx = drag_col;
+                            ge_scroll_to_cursor(ed);
+                            ge_draw_and_blit(ed);
+                        }
                     }
                 }
             }
 
             if (!cur_lmb) {
                 mouse_selecting = 0;
+                ed->vscroll_dragging = 0;
+                ed->hscroll_dragging = 0;
             }
 
             prev_lmb = cur_lmb;

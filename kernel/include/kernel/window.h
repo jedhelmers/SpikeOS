@@ -81,6 +81,7 @@ typedef struct window {
 
     /* State */
     uint32_t flags;
+    int32_t  scroll_accum;   /* scroll wheel accumulator (WM writes, owner consumes) */
 
     /* Drag tracking */
     int32_t  drag_off_x, drag_off_y;
