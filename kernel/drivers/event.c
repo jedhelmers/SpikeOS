@@ -86,3 +86,13 @@ void event_push_mouse_button(int32_t x, int32_t y,
     e.mouse_button.pressed = pressed;
     event_push(&e);
 }
+
+void event_push_mouse_scroll(int32_t x, int32_t y, int32_t dz) {
+    event_t e;
+    e.type = EVENT_MOUSE_SCROLL;
+    e.timestamp = timer_ticks();
+    e.mouse_scroll.x = x;
+    e.mouse_scroll.y = y;
+    e.mouse_scroll.dz = dz;
+    event_push(&e);
+}

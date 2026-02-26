@@ -81,6 +81,7 @@ typedef struct window {
 
     /* State */
     uint32_t flags;
+    int32_t  scroll_accum;   /* scroll wheel accumulator (WM writes, owner consumes) */
 
     /* Drag tracking */
     int32_t  drag_off_x, drag_off_y;
@@ -156,5 +157,8 @@ void wm_menu_add_item(wm_menu_t *menu, const char *label,
 window_t *wm_get_shell_window(void);
 window_t *wm_get_top_window(void);
 uint32_t  wm_get_desktop_color(void);
+
+/* Set the shell window pointer (used by dock launcher) */
+void wm_set_shell_window(window_t *win);
 
 #endif

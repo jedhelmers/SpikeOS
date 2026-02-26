@@ -32,6 +32,7 @@
 #include <kernel/pci.h>
 #include <kernel/e1000.h>
 #include <kernel/net.h>
+#include <kernel/dock.h>
 
 extern void kprint_howdy(void);
 extern void paging_enable(uint32_t);
@@ -372,42 +373,18 @@ void kernel_main(void) {
     wm_init();
     fb_console_init();
 
-    /* Create shell window — 80% width, 50% height, centered horizontally.
-       Position below the desktop menu bar (WM_DESKBAR_H). */
-    if (fb_info.available) {
-        uint32_t content_w = (fb_info.width * 4 / 5);
-        uint32_t content_h = (fb_info.height / 2);
-        content_w = (content_w / 8) * 8;
-        content_h = (content_h / 16) * 16;
+    /* Init dock (app launcher at bottom of screen) */
+    dock_init();
 
-        uint32_t outer_w = content_w + 2 * WIN_BORDER_W;
-        uint32_t outer_h = content_h + WIN_TITLEBAR_H + 2 * WIN_BORDER_W;
-        int32_t  outer_x = ((int32_t)fb_info.width - (int32_t)outer_w) / 2;
-        int32_t  outer_y = (int32_t)fb_info.height - (int32_t)outer_h - 16;
-        if (outer_y < (int32_t)WM_DESKBAR_H)
-            outer_y = (int32_t)WM_DESKBAR_H;
-
-        window_t *win = wm_create_window(outer_x, outer_y,
-                                         outer_w, outer_h, "SpikeOS Shell");
-        fb_console_bind_window(win);
-    }
-
-    fb_console_setcolor(14, 0);  /* yellow text on black background */
     terminal_switch_to_fb();
 
-    /* Draw desktop + window chrome, then clear content area */
-    if (fb_info.available) {
+    /* Draw desktop (deskbar + icons + dock) */
+    if (fb_info.available)
         wm_draw_desktop();
-        wm_draw_chrome(wm_get_shell_window());
-    }
-    terminal_clear();
 
     mouse_show_cursor();
 
-    // ring3_test_perprocess();
-    proc_create_kernel_thread(shell_run);
-
-    shell_run();
-
-    asm volatile ("sti");
+    /* Desktop event loop — replaces shell_run() as the main loop.
+       Apps are launched from the dock. Never returns. */
+    dock_desktop_loop();
 }

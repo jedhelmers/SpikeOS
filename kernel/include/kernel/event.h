@@ -10,6 +10,7 @@ typedef enum {
     EVENT_KEY_RELEASE,
     EVENT_MOUSE_MOVE,
     EVENT_MOUSE_BUTTON,
+    EVENT_MOUSE_SCROLL,
 } event_type_t;
 
 typedef struct {
@@ -19,6 +20,7 @@ typedef struct {
         struct { key_type_t key; char ch; } keyboard;
         struct { int32_t x, y, dx, dy; } mouse_move;
         struct { int32_t x, y; uint8_t button; uint8_t pressed; } mouse_button;
+        struct { int32_t x, y; int32_t dz; } mouse_scroll;
     };
 } event_t;
 
@@ -36,5 +38,6 @@ void event_push_key(event_type_t type, key_type_t key, char ch);
 void event_push_mouse_move(int32_t x, int32_t y, int32_t dx, int32_t dy);
 void event_push_mouse_button(int32_t x, int32_t y,
                               uint8_t button, uint8_t pressed);
+void event_push_mouse_scroll(int32_t x, int32_t y, int32_t dz);
 
 #endif

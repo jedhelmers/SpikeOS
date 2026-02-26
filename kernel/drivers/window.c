@@ -1,4 +1,5 @@
 #include <kernel/window.h>
+#include <kernel/dock.h>
 #include <kernel/surface.h>
 #include <kernel/framebuffer.h>
 #include <kernel/fb_console.h>
@@ -291,6 +292,7 @@ void wm_draw_desktop(void) {
     fb_fill_rect(0, 0, fb_info.width, fb_info.height, desktop_color);
     wm_draw_deskbar();
     wm_draw_desktop_icons();
+    dock_draw();
 }
 
 uint32_t wm_get_desktop_color(void) { return desktop_color; }
@@ -518,7 +520,7 @@ window_t *wm_create_window(int32_t x, int32_t y, uint32_t w, uint32_t h,
         win_top = win;
     }
 
-    if (!shell_win) shell_win = win;
+    dock_update_running();
 
     return win;
 }
@@ -561,6 +563,7 @@ void wm_destroy_window(window_t *win) {
         win_top->flags |= WIN_FLAG_FOCUSED;
     }
 
+    dock_update_running();
     wm_redraw_all();
 }
 
@@ -579,6 +582,7 @@ void wm_init(void) {
 
 window_t *wm_get_shell_window(void) { return shell_win; }
 window_t *wm_get_top_window(void)   { return win_top; }
+void wm_set_shell_window(window_t *win) { shell_win = win; }
 
 /* ------------------------------------------------------------------ */
 /*  Menu helpers                                                       */
@@ -930,9 +934,10 @@ static void drag_move(window_t *win, int32_t mx, int32_t my) {
         }
     }
 
-    /* Redraw desktop icons (lightweight — only icons, not the full background) */
+    /* Redraw desktop icons + dock (lightweight — only icons, not the full background) */
     wm_draw_deskbar();
     wm_draw_desktop_icons();
+    dock_draw();
 
     /* Update position */
     win->x = new_x;
@@ -1021,6 +1026,7 @@ static void resize_move(window_t *win, int32_t mx, int32_t my) {
 
     wm_draw_deskbar();
     wm_draw_desktop_icons();
+    dock_draw();
 
     /* Apply new geometry */
     win->x = new_x;
@@ -1151,8 +1157,7 @@ int wm_process_events(void) {
                 if ((rel_x - WIN_DOT_CLOSE_X) * (rel_x - WIN_DOT_CLOSE_X) +
                     (rel_y - WIN_DOT_Y_OFF) * (rel_y - WIN_DOT_Y_OFF) <=
                     WIN_DOT_RADIUS * WIN_DOT_RADIUS) {
-                    if (hit != shell_win)
-                        hit->flags |= WIN_FLAG_CLOSE_REQ;
+                    hit->flags |= WIN_FLAG_CLOSE_REQ;
                     return 1;
                 }
 
@@ -1183,7 +1188,7 @@ int wm_process_events(void) {
                         hit->x = 0;
                         hit->y = (int32_t)WM_DESKBAR_H;
                         hit->w = fb_info.width;
-                        hit->h = fb_info.height - WM_DESKBAR_H;
+                        hit->h = fb_info.height - WM_DESKBAR_H - dock_reserved_height();
                         hit->flags |= WIN_FLAG_MAXIMIZED;
                     }
                     wm_update_content_rect(hit);
@@ -1204,7 +1209,11 @@ int wm_process_events(void) {
             return 1;
         }
 
-        /* No window hit — check desktop icon click */
+        /* No window hit — check dock click first */
+        if (dock_click(mx, my))
+            return 1;
+
+        /* Check desktop icon click */
         int icon = icon_at(mx, my);
         if (icon >= 0) {
             uint32_t now = timer_ticks();
@@ -1264,6 +1273,20 @@ int wm_process_events(void) {
             drag_move(dragging_win, e.mouse_move.x, e.mouse_move.y);
             return 1;
         }
+        /* Track dock hover for tooltip labels */
+        dock_hover(e.mouse_move.x, e.mouse_move.y);
+    }
+
+    /* Mouse scroll — accumulate on focused window */
+    if (e.type == EVENT_MOUSE_SCROLL) {
+        window_t *focused = NULL;
+        for (window_t *w = win_top; w; w = w->prev) {
+            if (w->flags & WIN_FLAG_FOCUSED) { focused = w; break; }
+        }
+        if (focused) {
+            focused->scroll_accum += e.mouse_scroll.dz;
+        }
+        return 1;
     }
 
     return 0;
