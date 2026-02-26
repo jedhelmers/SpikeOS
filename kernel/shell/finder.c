@@ -10,6 +10,7 @@
 #include <kernel/hal.h>
 #include <kernel/gui_editor.h>
 #include <kernel/heap.h>
+#include <kernel/spikefs.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -622,9 +623,9 @@ static void finder_draw(finder_t *fm) {
 
 static void finder_draw_and_blit(finder_t *fm) {
     finder_draw(fm);
-    if (fm->win->surface)
-        surface_blit_to_fb(fm->win->surface,
-                           fm->win->content_x, fm->win->content_y);
+    /* Use compositor (not direct blit) so overlays like context menus
+       and dropdown menus render on top of the Finder content. */
+    wm_redraw_all();
 }
 
 /* ------------------------------------------------------------------ */
@@ -966,6 +967,8 @@ static void finder_thread(void) {
     uint32_t last_click_tick = 0;
     int last_click_row = -1;
     int redraw = 0;
+    uint32_t last_sync_tick = 0;
+    #define FINDER_SYNC_TICKS 500  /* 5 seconds at 100Hz */
 
     while (!fm->quit) {
         wm_process_events();
@@ -982,6 +985,18 @@ static void finder_thread(void) {
         if (fm->dirty) {
             fm->dirty = 0;
             redraw = 1;
+            /* Sync mouse tracking so the click that triggered the menu
+               action isn't re-interpreted as a new press by our handler */
+            prev_lmb = (mouse_get_state().buttons & MOUSE_BTN_LEFT) ? 1 : 0;
+        }
+
+        /* Auto write-back: sync dirty VFS to disk periodically */
+        {
+            uint32_t now = timer_ticks();
+            if (vfs_is_dirty() && (now - last_sync_tick) >= FINDER_SYNC_TICKS) {
+                spikefs_sync();
+                last_sync_tick = now;
+            }
         }
 
         /* Recompute visible rows (window may have been resized) */

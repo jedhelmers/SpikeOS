@@ -59,6 +59,8 @@ static int last_icon_click_idx = -1;
 
 /* Forward declaration for gui_editor_open (weak — may not be linked yet) */
 extern void gui_editor_open(const char *filename) __attribute__((weak));
+/* Forward declaration for finder_open (weak — may not be linked yet) */
+extern void finder_open(const char *path) __attribute__((weak));
 
 /* ------------------------------------------------------------------ */
 /*  Content rect                                                       */
@@ -145,14 +147,28 @@ static void wm_draw_desktop_icons(void) {
 
         /* Determine type */
         vfs_inode_t *child = vfs_get_inode(entries[i].inode);
-        uint32_t fill = (child && child->type == VFS_TYPE_DIR)
-                        ? dir_color : file_color;
+        int is_dir = (child && child->type == VFS_TYPE_DIR);
 
-        /* Draw icon rect (centered horizontally in cell) */
+        /* Draw icon (centered horizontally in cell) */
         uint32_t rx = cx + (ICON_W - ICON_RECT_W) / 2;
         uint32_t ry = cy;
-        fb_fill_rect(rx, ry, ICON_RECT_W, ICON_RECT_H, fill);
-        fb_draw_rect(rx, ry, ICON_RECT_W, ICON_RECT_H, outline);
+
+        if (is_dir) {
+            /* Folder icon — matches dock Finder icon shape, amber color */
+            uint32_t folder_dk = fb_pack_color(170, 150, 70);
+            uint32_t tab_bg    = fb_pack_color(220, 200, 110);
+            /* Tab at top-left */
+            fb_fill_rect(rx, ry, 14, 6, tab_bg);
+            /* Body */
+            fb_fill_rect(rx, ry + 6, ICON_RECT_W, ICON_RECT_H - 6, dir_color);
+            fb_draw_rect(rx, ry + 6, ICON_RECT_W, ICON_RECT_H - 6, folder_dk);
+            /* Fold line */
+            fb_draw_hline(rx + 1, ry + 12, ICON_RECT_W - 2, folder_dk);
+        } else {
+            /* File icon — simple filled rect */
+            fb_fill_rect(rx, ry, ICON_RECT_W, ICON_RECT_H, file_color);
+            fb_draw_rect(rx, ry, ICON_RECT_W, ICON_RECT_H, outline);
+        }
 
         /* Draw filename label below rect (up to 2 rows of ICON_MAX_LABEL chars) */
         int total_len = 0;
@@ -1284,17 +1300,21 @@ int wm_process_events(void) {
                 vfs_dirent_t *de = icon_dirent(icon);
                 if (de) {
                     vfs_inode_t *node = vfs_get_inode(de->inode);
-                    if (node && node->type == VFS_TYPE_FILE) {
-                        /* Build full path */
-                        char path[128];
-                        int plen = 0;
-                        const char *dp = DESKTOP_PATH;
-                        while (*dp && plen < 126) path[plen++] = *dp++;
-                        path[plen++] = '/';
-                        const char *nm = de->name;
-                        while (*nm && plen < 126) path[plen++] = *nm++;
-                        path[plen] = '\0';
 
+                    /* Build full path */
+                    char path[128];
+                    int plen = 0;
+                    const char *dp = DESKTOP_PATH;
+                    while (*dp && plen < 126) path[plen++] = *dp++;
+                    path[plen++] = '/';
+                    const char *nm = de->name;
+                    while (*nm && plen < 126) path[plen++] = *nm++;
+                    path[plen] = '\0';
+
+                    if (node && node->type == VFS_TYPE_DIR) {
+                        if (finder_open)
+                            finder_open(path);
+                    } else if (node && node->type == VFS_TYPE_FILE) {
                         if (gui_editor_open)
                             gui_editor_open(path);
                     }
