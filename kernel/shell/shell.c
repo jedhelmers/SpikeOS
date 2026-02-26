@@ -37,6 +37,351 @@ static int fg_count = 0;
 
 extern void thread_inc(void);
 
+/* ================================================================== */
+/*  Output capture (redirect terminal_write to buffer)                */
+/* ================================================================== */
+
+static char    *redir_buf  = NULL;
+static uint32_t redir_size = 0;
+static uint32_t redir_cap  = 0;
+#define REDIR_MAX_CAP  (64 * 1024)
+
+static void redir_sink(const char *data, size_t size) {
+    uint32_t need = redir_size + (uint32_t)size;
+    if (need > REDIR_MAX_CAP) return;
+    if (need > redir_cap) {
+        uint32_t nc = redir_cap * 2;
+        if (nc < need) nc = need;
+        if (nc < 1024) nc = 1024;
+        char *nb = krealloc(redir_buf, nc);
+        if (!nb) return;
+        redir_buf = nb;
+        redir_cap = nc;
+    }
+    memcpy(redir_buf + redir_size, data, size);
+    redir_size = need;
+}
+
+static void capture_start(void) {
+    redir_buf = kmalloc(1024);
+    redir_size = 0;
+    redir_cap = redir_buf ? 1024 : 0;
+    terminal_set_redirect(redir_sink);
+}
+
+static void capture_stop(char **out, uint32_t *len) {
+    terminal_set_redirect((terminal_redirect_fn)0);
+    *out = redir_buf;
+    *len = redir_size;
+    redir_buf = NULL;
+    redir_size = 0;
+    redir_cap = 0;
+}
+
+/* ================================================================== */
+/*  Piped stdin buffer                                                 */
+/* ================================================================== */
+
+static const char *stdin_buf = NULL;
+static uint32_t    stdin_pos = 0;
+static uint32_t    stdin_len = 0;
+
+static void shell_stdin_set(const char *buf, uint32_t len) {
+    stdin_buf = buf;
+    stdin_pos = 0;
+    stdin_len = len;
+}
+
+static void shell_stdin_clear(void) {
+    stdin_buf = NULL;
+    stdin_pos = 0;
+    stdin_len = 0;
+}
+
+/* ================================================================== */
+/*  Shell variables                                                    */
+/* ================================================================== */
+
+#define MAX_SHELL_VARS 32
+#define VAR_NAME_MAX   31
+#define VAR_VALUE_MAX  127
+
+typedef struct {
+    char name[VAR_NAME_MAX + 1];
+    char value[VAR_VALUE_MAX + 1];
+    int  exported;
+} shell_var_t;
+
+static shell_var_t shell_vars[MAX_SHELL_VARS];
+static int num_vars = 0;
+
+static const char *shell_getvar(const char *name) {
+    for (int i = 0; i < num_vars; i++)
+        if (strcmp(shell_vars[i].name, name) == 0)
+            return shell_vars[i].value;
+    return (const char *)0;
+}
+
+static void shell_setvar(const char *name, const char *value) {
+    for (int i = 0; i < num_vars; i++) {
+        if (strcmp(shell_vars[i].name, name) == 0) {
+            strncpy(shell_vars[i].value, value, VAR_VALUE_MAX);
+            shell_vars[i].value[VAR_VALUE_MAX] = '\0';
+            return;
+        }
+    }
+    if (num_vars >= MAX_SHELL_VARS) return;
+    strncpy(shell_vars[num_vars].name, name, VAR_NAME_MAX);
+    shell_vars[num_vars].name[VAR_NAME_MAX] = '\0';
+    strncpy(shell_vars[num_vars].value, value, VAR_VALUE_MAX);
+    shell_vars[num_vars].value[VAR_VALUE_MAX] = '\0';
+    shell_vars[num_vars].exported = 0;
+    num_vars++;
+}
+
+static int is_varname_start(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+}
+
+static int is_varname_char(char c) {
+    return is_varname_start(c) || (c >= '0' && c <= '9');
+}
+
+static void shell_expand_vars(const char *input, char *output, uint32_t cap) {
+    uint32_t out = 0;
+    while (*input && out < cap - 1) {
+        if (*input == '$' && is_varname_start(input[1])) {
+            input++;
+            char vname[VAR_NAME_MAX + 1];
+            int vn = 0;
+            while (*input && is_varname_char(*input) && vn < VAR_NAME_MAX)
+                vname[vn++] = *input++;
+            vname[vn] = '\0';
+
+            const char *val = (const char *)0;
+            if (strcmp(vname, "PWD") == 0)
+                val = vfs_get_cwd_path();
+            else if (strcmp(vname, "USER") == 0)
+                val = "jedhelmers";
+            else if (strcmp(vname, "HOME") == 0)
+                val = "/";
+            else
+                val = shell_getvar(vname);
+
+            if (val) {
+                uint32_t vlen = strlen(val);
+                if (out + vlen < cap - 1) {
+                    memcpy(output + out, val, vlen);
+                    out += vlen;
+                }
+            }
+        } else {
+            output[out++] = *input++;
+        }
+    }
+    output[out] = '\0';
+}
+
+/* Check for variable assignment: NAME=VALUE (no spaces before =) */
+static int try_var_assignment(const char *line) {
+    if (!is_varname_start(line[0])) return 0;
+    const char *eq = strchr(line, '=');
+    if (!eq || eq == line) return 0;
+    /* Make sure no spaces before = (otherwise it's a command) */
+    for (const char *p = line; p < eq; p++)
+        if (!is_varname_char(*p)) return 0;
+
+    char name[VAR_NAME_MAX + 1];
+    int nlen = eq - line;
+    if (nlen > VAR_NAME_MAX) nlen = VAR_NAME_MAX;
+    memcpy(name, line, nlen);
+    name[nlen] = '\0';
+    shell_setvar(name, eq + 1);
+    return 1;
+}
+
+/* ================================================================== */
+/*  Pipeline parsing                                                   */
+/* ================================================================== */
+
+#define MAX_PIPE_STAGES 4
+#define REDIR_NONE   0
+#define REDIR_WRITE  1
+#define REDIR_APPEND 2
+
+typedef struct {
+    char *cmd;
+    int   redir_type;
+    char *redir_file;
+} shell_segment_t;
+
+static shell_segment_t segments[MAX_PIPE_STAGES];
+static int num_segments;
+
+static void shell_parse_line(char *line) {
+    num_segments = 0;
+    segments[0].cmd = line;
+    segments[0].redir_type = REDIR_NONE;
+    segments[0].redir_file = (char *)0;
+    num_segments = 1;
+
+    char *p = line;
+    while (*p) {
+        if (*p == '|') {
+            *p = '\0';
+            p++;
+            while (*p == ' ') p++;
+            if (num_segments < MAX_PIPE_STAGES) {
+                segments[num_segments].cmd = p;
+                segments[num_segments].redir_type = REDIR_NONE;
+                segments[num_segments].redir_file = (char *)0;
+                num_segments++;
+            }
+        } else {
+            p++;
+        }
+    }
+
+    /* Check last segment for > or >> */
+    shell_segment_t *last = &segments[num_segments - 1];
+    char *gt = strchr(last->cmd, '>');
+    if (gt) {
+        if (*(gt + 1) == '>') {
+            last->redir_type = REDIR_APPEND;
+            *gt = '\0';
+            gt += 2;
+        } else {
+            last->redir_type = REDIR_WRITE;
+            *gt = '\0';
+            gt += 1;
+        }
+        while (*gt == ' ') gt++;
+        last->redir_file = gt;
+        /* Trim trailing spaces from filename */
+        int flen = strlen(gt);
+        while (flen > 0 && gt[flen - 1] == ' ') gt[--flen] = '\0';
+    }
+
+    /* Trim leading/trailing whitespace from each segment command */
+    for (int i = 0; i < num_segments; i++) {
+        char *s = segments[i].cmd;
+        while (*s == ' ') s++;
+        segments[i].cmd = s;
+        int slen = strlen(s);
+        while (slen > 0 && s[slen - 1] == ' ') s[--slen] = '\0';
+    }
+}
+
+/* Write captured output to a file */
+static void shell_write_to_file(const char *filename, int redir_type,
+                                const char *data, uint32_t len) {
+    if (!filename || !*filename) {
+        printf("Error: missing filename for redirect\n");
+        return;
+    }
+    uint32_t flags = O_WRONLY | O_CREAT;
+    if (redir_type == REDIR_APPEND) flags |= O_APPEND;
+    else flags |= O_TRUNC;
+    int fd = fd_open(filename, flags);
+    if (fd < 0) {
+        printf("Error: cannot open '%s'\n", filename);
+        return;
+    }
+    if (len > 0) fd_write(fd, data, len);
+    fd_close(fd);
+}
+
+/* ================================================================== */
+/*  Pipe-aware command helpers: grep, wc, head, tail                   */
+/* ================================================================== */
+
+static void shell_grep_data(const char *data, uint32_t size,
+                            const char *pattern) {
+    if (!data || !size || !pattern || !*pattern) return;
+    uint32_t plen = strlen(pattern);
+    const char *p = data;
+    const char *end = data + size;
+
+    while (p < end) {
+        const char *eol = p;
+        while (eol < end && *eol != '\n') eol++;
+        uint32_t llen = eol - p;
+
+        int found = 0;
+        if (llen >= plen) {
+            for (uint32_t i = 0; i + plen <= llen; i++) {
+                if (memcmp(p + i, pattern, plen) == 0) {
+                    found = 1;
+                    break;
+                }
+            }
+        }
+        if (found) {
+            for (uint32_t i = 0; i < llen; i++) putchar(p[i]);
+            putchar('\n');
+        }
+        p = eol;
+        if (p < end && *p == '\n') p++;
+    }
+}
+
+static void shell_wc_data(const char *data, uint32_t size, const char *label) {
+    if (!data) { printf("  0  0  0\n"); return; }
+    uint32_t lines = 0, words = 0;
+    int in_word = 0;
+    for (uint32_t i = 0; i < size; i++) {
+        if (data[i] == '\n') lines++;
+        if (data[i] == ' ' || data[i] == '\n' || data[i] == '\t')
+            in_word = 0;
+        else if (!in_word) { in_word = 1; words++; }
+    }
+    printf("  %d  %d  %d", lines, words, size);
+    if (label) printf("  %s", label);
+    printf("\n");
+}
+
+static void shell_head_data(const char *data, uint32_t size, int n) {
+    if (!data || !size) return;
+    const char *p = data;
+    const char *end = data + size;
+    int count = 0;
+    while (p < end && count < n) {
+        const char *eol = p;
+        while (eol < end && *eol != '\n') eol++;
+        for (const char *c = p; c < eol; c++) putchar(*c);
+        putchar('\n');
+        count++;
+        p = eol;
+        if (p < end && *p == '\n') p++;
+    }
+}
+
+static void shell_tail_data(const char *data, uint32_t size, int n) {
+    if (!data || !size) return;
+    int total = 0;
+    for (uint32_t i = 0; i < size; i++)
+        if (data[i] == '\n') total++;
+    if (size > 0 && data[size - 1] != '\n') total++;
+
+    int skip = total - n;
+    if (skip < 0) skip = 0;
+
+    const char *p = data;
+    const char *end = data + size;
+    int count = 0;
+    while (p < end) {
+        const char *eol = p;
+        while (eol < end && *eol != '\n') eol++;
+        if (count >= skip) {
+            for (const char *c = p; c < eol; c++) putchar(*c);
+            putchar('\n');
+        }
+        count++;
+        p = eol;
+        if (p < end && *p == '\n') p++;
+    }
+}
+
 /* Parse a decimal string to uint32 */
 static uint32_t parse_uint(const char *s) {
     uint32_t v = 0;
@@ -613,8 +958,11 @@ static void thread_counter_dec(void) {
     }
 }
 
-void shell_execute(void) {
+static void shell_execute_cmd(void) {
     if (line_len == 0) return;
+
+    /* Check for variable assignment: NAME=VALUE */
+    if (try_var_assignment(line_buf)) return;
 
     /* ---- help ---- */
     if (strcmp(line_buf, "help") == 0) {
@@ -646,6 +994,18 @@ void shell_execute(void) {
         printf("  netinfo        - show network interface info\n");
         printf("  ping <ip>      - send ICMP echo requests\n");
         printf("  udpsend <ip> <port> <msg> - send UDP datagram\n");
+        printf("  echo [text]    - print text (supports $VAR expansion)\n");
+        printf("  grep <pat> [f] - search for pattern in file or piped input\n");
+        printf("  wc [file]      - count lines, words, bytes\n");
+        printf("  head [-N] [f]  - show first N lines (default 10)\n");
+        printf("  tail [-N] [f]  - show last N lines (default 10)\n");
+        printf("  VAR=value      - set shell variable\n");
+        printf("  export VAR=val - set and export variable\n");
+        printf("  set            - list all shell variables\n");
+        printf("  unset <name>   - remove shell variable\n");
+        printf("  cmd > file     - redirect output to file\n");
+        printf("  cmd >> file    - append output to file\n");
+        printf("  cmd1 | cmd2    - pipe output of cmd1 to cmd2\n");
         printf("  test <name>    - run kernel tests (fd|pipe|sleep|stat|stdin|waitpid|\n");
         printf("                   mutex|sem|signal|cwd|condvar|rwlock|all)\n");
         printf("  clear          - clear screen\n");
@@ -724,7 +1084,19 @@ void shell_execute(void) {
         }
     }
 
-    /* ---- cat ---- */
+    /* ---- cat (no args — read from piped stdin) ---- */
+    else if (strcmp(line_buf, "cat") == 0) {
+        if (stdin_buf && stdin_len > 0) {
+            for (uint32_t i = 0; i < stdin_len; i++)
+                putchar(stdin_buf[i]);
+            if (stdin_buf[stdin_len - 1] != '\n')
+                putchar('\n');
+        } else {
+            printf("Usage: cat <name>\n");
+        }
+    }
+
+    /* ---- cat <name> ---- */
     else if (strncmp(line_buf, "cat ", 4) == 0) {
         const char *name = shell_arg(line_buf, 3);
         if (!name) {
@@ -1081,9 +1453,285 @@ void shell_execute(void) {
         shell_clear();
     }
 
+    /* ---- echo ---- */
+    else if (strcmp(line_buf, "echo") == 0) {
+        printf("\n");
+    }
+    else if (strncmp(line_buf, "echo ", 5) == 0) {
+        const char *text = shell_arg(line_buf, 4);
+        if (text)
+            printf("%s\n", text);
+        else
+            printf("\n");
+    }
+
+    /* ---- grep ---- */
+    else if (strncmp(line_buf, "grep ", 5) == 0) {
+        const char *args = shell_arg(line_buf, 4);
+        if (!args) {
+            printf("Usage: grep <pattern> [file]\n");
+        } else {
+            const char *pattern, *filename;
+            shell_split_args(args, &pattern, &filename);
+            if (filename) {
+                int32_t ino = vfs_resolve(filename, (uint32_t *)0, (char *)0);
+                if (ino < 0) {
+                    printf("grep: %s: not found\n", filename);
+                } else {
+                    vfs_inode_t *node = vfs_get_inode((uint32_t)ino);
+                    if (!node || node->type != VFS_TYPE_FILE)
+                        printf("grep: %s: not a regular file\n", filename);
+                    else
+                        shell_grep_data((const char *)node->data, node->size,
+                                        pattern);
+                }
+            } else if (stdin_buf) {
+                shell_grep_data(stdin_buf, stdin_len, pattern);
+            } else {
+                printf("Usage: grep <pattern> [file]\n");
+            }
+        }
+    }
+
+    /* ---- export ---- */
+    else if (strcmp(line_buf, "export") == 0) {
+        for (int i = 0; i < num_vars; i++) {
+            if (shell_vars[i].exported)
+                printf("export %s=%s\n", shell_vars[i].name,
+                       shell_vars[i].value);
+        }
+    }
+    else if (strncmp(line_buf, "export ", 7) == 0) {
+        const char *arg = shell_arg(line_buf, 6);
+        if (arg) {
+            const char *eq = strchr(arg, '=');
+            if (eq) {
+                char name[VAR_NAME_MAX + 1];
+                int nlen = eq - arg;
+                if (nlen > VAR_NAME_MAX) nlen = VAR_NAME_MAX;
+                memcpy(name, arg, nlen);
+                name[nlen] = '\0';
+                shell_setvar(name, eq + 1);
+                for (int i = 0; i < num_vars; i++) {
+                    if (strcmp(shell_vars[i].name, name) == 0) {
+                        shell_vars[i].exported = 1;
+                        break;
+                    }
+                }
+            } else {
+                for (int i = 0; i < num_vars; i++) {
+                    if (strcmp(shell_vars[i].name, arg) == 0) {
+                        shell_vars[i].exported = 1;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /* ---- set (list all variables) ---- */
+    else if (strcmp(line_buf, "set") == 0) {
+        for (int i = 0; i < num_vars; i++) {
+            printf("%s=%s%s\n", shell_vars[i].name, shell_vars[i].value,
+                   shell_vars[i].exported ? " [exported]" : "");
+        }
+    }
+
+    /* ---- unset ---- */
+    else if (strncmp(line_buf, "unset ", 6) == 0) {
+        const char *name = shell_arg(line_buf, 5);
+        if (!name) {
+            printf("Usage: unset <name>\n");
+        } else {
+            for (int i = 0; i < num_vars; i++) {
+                if (strcmp(shell_vars[i].name, name) == 0) {
+                    for (int j = i; j < num_vars - 1; j++)
+                        shell_vars[j] = shell_vars[j + 1];
+                    num_vars--;
+                    break;
+                }
+            }
+        }
+    }
+
+    /* ---- wc ---- */
+    else if (strcmp(line_buf, "wc") == 0) {
+        if (stdin_buf)
+            shell_wc_data(stdin_buf, stdin_len, (const char *)0);
+        else
+            printf("Usage: wc [file]\n");
+    }
+    else if (strncmp(line_buf, "wc ", 3) == 0) {
+        const char *name = shell_arg(line_buf, 2);
+        if (!name) {
+            if (stdin_buf)
+                shell_wc_data(stdin_buf, stdin_len, (const char *)0);
+            else
+                printf("Usage: wc [file]\n");
+        } else {
+            int32_t ino = vfs_resolve(name, (uint32_t *)0, (char *)0);
+            if (ino < 0) {
+                printf("wc: %s: not found\n", name);
+            } else {
+                vfs_inode_t *node = vfs_get_inode((uint32_t)ino);
+                if (!node || node->type != VFS_TYPE_FILE)
+                    printf("wc: %s: not a regular file\n", name);
+                else
+                    shell_wc_data((const char *)node->data, node->size, name);
+            }
+        }
+    }
+
+    /* ---- head ---- */
+    else if (strcmp(line_buf, "head") == 0) {
+        if (stdin_buf)
+            shell_head_data(stdin_buf, stdin_len, 10);
+        else
+            printf("Usage: head [-N] [file]\n");
+    }
+    else if (strncmp(line_buf, "head ", 5) == 0) {
+        const char *arg = shell_arg(line_buf, 4);
+        int n = 10;
+        if (arg && arg[0] == '-' && arg[1] >= '0' && arg[1] <= '9') {
+            n = (int)parse_uint(arg + 1);
+            if (n <= 0) n = 10;
+            /* Skip past -N to get filename */
+            const char *p = arg + 1;
+            while (*p >= '0' && *p <= '9') p++;
+            while (*p == ' ') p++;
+            arg = (*p) ? p : (const char *)0;
+        }
+        if (arg) {
+            int32_t ino = vfs_resolve(arg, (uint32_t *)0, (char *)0);
+            if (ino < 0)
+                printf("head: %s: not found\n", arg);
+            else {
+                vfs_inode_t *node = vfs_get_inode((uint32_t)ino);
+                if (!node || node->type != VFS_TYPE_FILE)
+                    printf("head: %s: not a regular file\n", arg);
+                else
+                    shell_head_data((const char *)node->data, node->size, n);
+            }
+        } else if (stdin_buf) {
+            shell_head_data(stdin_buf, stdin_len, n);
+        } else {
+            printf("Usage: head [-N] [file]\n");
+        }
+    }
+
+    /* ---- tail ---- */
+    else if (strcmp(line_buf, "tail") == 0) {
+        if (stdin_buf)
+            shell_tail_data(stdin_buf, stdin_len, 10);
+        else
+            printf("Usage: tail [-N] [file]\n");
+    }
+    else if (strncmp(line_buf, "tail ", 5) == 0) {
+        const char *arg = shell_arg(line_buf, 4);
+        int n = 10;
+        if (arg && arg[0] == '-' && arg[1] >= '0' && arg[1] <= '9') {
+            n = (int)parse_uint(arg + 1);
+            if (n <= 0) n = 10;
+            /* Skip past -N to get filename */
+            const char *p = arg + 1;
+            while (*p >= '0' && *p <= '9') p++;
+            while (*p == ' ') p++;
+            arg = (*p) ? p : (const char *)0;
+        }
+        if (arg) {
+            int32_t ino = vfs_resolve(arg, (uint32_t *)0, (char *)0);
+            if (ino < 0)
+                printf("tail: %s: not found\n", arg);
+            else {
+                vfs_inode_t *node = vfs_get_inode((uint32_t)ino);
+                if (!node || node->type != VFS_TYPE_FILE)
+                    printf("tail: %s: not a regular file\n", arg);
+                else
+                    shell_tail_data((const char *)node->data, node->size, n);
+            }
+        } else if (stdin_buf) {
+            shell_tail_data(stdin_buf, stdin_len, n);
+        } else {
+            printf("Usage: tail [-N] [file]\n");
+        }
+    }
+
     else {
         printf("Unknown command: '%s' (type 'help')\n", line_buf);
     }
+}
+
+/* ================================================================== */
+/*  Pipeline / redirect wrapper around shell_execute_cmd               */
+/* ================================================================== */
+
+void shell_execute(void) {
+    if (line_len == 0) return;
+
+    /* Expand variables in the whole line first */
+    static char expanded[LINE_BUF_SIZE * 2];
+    shell_expand_vars(line_buf, expanded, sizeof(expanded));
+
+    /* Parse the expanded line for pipes and redirects */
+    static char parse_buf[LINE_BUF_SIZE * 2];
+    int elen = strlen(expanded);
+    memcpy(parse_buf, expanded, elen + 1);
+    shell_parse_line(parse_buf);
+
+    /* Fast path: simple command, no pipe, no redirect */
+    if (num_segments == 1 && segments[0].redir_type == REDIR_NONE) {
+        int slen = strlen(segments[0].cmd);
+        if (slen >= LINE_BUF_SIZE) slen = LINE_BUF_SIZE - 1;
+        memcpy(line_buf, segments[0].cmd, slen);
+        line_buf[slen] = '\0';
+        line_len = slen;
+        shell_execute_cmd();
+        return;
+    }
+
+    /* Pipeline and/or redirection */
+    char *input = (char *)0;
+    uint32_t input_len = 0;
+
+    for (int i = 0; i < num_segments; i++) {
+        int is_last = (i == num_segments - 1);
+
+        /* Set up piped stdin from previous stage */
+        if (input) shell_stdin_set(input, input_len);
+
+        /* Capture output if piping to next stage or redirecting to file */
+        int capturing = !is_last || segments[i].redir_type != REDIR_NONE;
+        if (capturing) capture_start();
+
+        /* Copy segment command into line_buf and execute */
+        int slen = strlen(segments[i].cmd);
+        if (slen >= LINE_BUF_SIZE) slen = LINE_BUF_SIZE - 1;
+        memcpy(line_buf, segments[i].cmd, slen);
+        line_buf[slen] = '\0';
+        line_len = slen;
+        shell_execute_cmd();
+
+        /* Collect captured output */
+        char *output = (char *)0;
+        uint32_t output_len = 0;
+        if (capturing) capture_stop(&output, &output_len);
+
+        /* Clean up previous input */
+        if (input) { kfree(input); input = (char *)0; }
+        shell_stdin_clear();
+
+        /* Route output */
+        if (is_last && segments[i].redir_type != REDIR_NONE) {
+            shell_write_to_file(segments[i].redir_file,
+                                segments[i].redir_type, output, output_len);
+            if (output) kfree(output);
+        } else if (!is_last) {
+            input = output;
+            input_len = output_len;
+        }
+    }
+
+    if (input) kfree(input);
 }
 
 static uint32_t last_sync_tick = 0;
