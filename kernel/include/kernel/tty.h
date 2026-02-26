@@ -25,4 +25,8 @@ void terminal_page_up(void);
 void terminal_page_down(void);
 void terminal_switch_to_fb(void);
 
+/* Output redirect: when set, terminal_write() diverts all output to this callback */
+typedef void (*terminal_redirect_fn)(const char *data, size_t size);
+void terminal_set_redirect(terminal_redirect_fn fn);
+
 #endif
