@@ -57,6 +57,7 @@ qemu-system-x86_64 \
     -drive file=disk.img,format=raw,if=ide,index=0,media=disk \
     -cdrom myos.iso \
     -vga std \
+    -device virtio-gpu-pci \
     -serial file:.debug.log \
     -netdev user,id=net0,hostfwd=udp::9999-:9999 \
     -device e1000,netdev=net0 \

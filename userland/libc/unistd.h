@@ -102,6 +102,72 @@ static inline int stat(const char *path, struct spike_stat *buf) {
 }
 
 /* ------------------------------------------------------------------ */
+/*  Memory mapping API                                                */
+/* ------------------------------------------------------------------ */
+
+#define PROT_NONE   0x0
+#define PROT_READ   0x1
+#define PROT_WRITE  0x2
+#define PROT_EXEC   0x4
+
+#define MAP_SHARED    0x01
+#define MAP_PRIVATE   0x02
+#define MAP_ANONYMOUS 0x04
+#define MAP_FIXED     0x08
+
+#define MAP_FAILED ((void *)-1)
+
+struct mmap_args {
+    unsigned int addr;
+    unsigned int length;
+    unsigned int prot;
+    unsigned int flags;
+    int          fd;
+    unsigned int offset;
+};
+
+static inline void *spike_mmap(void *addr, unsigned int length,
+                                unsigned int prot, unsigned int flags,
+                                int fd, unsigned int offset) {
+    struct mmap_args args;
+    args.addr   = (unsigned int)addr;
+    args.length = length;
+    args.prot   = prot;
+    args.flags  = flags;
+    args.fd     = fd;
+    args.offset = offset;
+    int result = syscall1(SYS_MMAP, (int)&args);
+    if (result == -1) return MAP_FAILED;
+    return (void *)result;
+}
+
+static inline int spike_munmap(void *addr, unsigned int length) {
+    return syscall2(SYS_MUNMAP, (int)addr, (int)length);
+}
+
+/* ------------------------------------------------------------------ */
+/*  GPU API                                                            */
+/* ------------------------------------------------------------------ */
+
+struct gpu_submit_args {
+    unsigned int ctx_id;
+    const unsigned int *cmdbuf;
+    unsigned int size_bytes;
+};
+
+static inline int spike_gpu_create_ctx(unsigned int ctx_id, const char *name) {
+    return syscall2(SYS_GPU_CREATE_CTX, (int)ctx_id, (int)name);
+}
+
+static inline int spike_gpu_submit(struct gpu_submit_args *args) {
+    return syscall1(SYS_GPU_SUBMIT, (int)args);
+}
+
+static inline int spike_gpu_destroy_ctx(unsigned int ctx_id) {
+    return syscall1(SYS_GPU_DESTROY_CTX, (int)ctx_id);
+}
+
+/* ------------------------------------------------------------------ */
 /*  Socket API                                                        */
 /* ------------------------------------------------------------------ */
 

@@ -11,6 +11,7 @@
 #include <kernel/tetris.h>
 #include <kernel/gui_editor.h>
 #include <kernel/finder.h>
+#include <kernel/gl_test.h>
 #include <kernel/tty.h>
 #include <string.h>
 #include <stdio.h>
@@ -34,18 +35,21 @@ static void dock_launch_shell(void);
 static void dock_launch_editor(void);
 static void dock_launch_tetris(void);
 static void dock_launch_finder(void);
+static void dock_launch_opengl(void);
 static void draw_icon_shell(uint32_t cx, uint32_t cy);
 static void draw_icon_editor(uint32_t cx, uint32_t cy);
 static void draw_icon_tetris(uint32_t cx, uint32_t cy);
 static void draw_icon_finder(uint32_t cx, uint32_t cy);
+static void draw_icon_opengl(uint32_t cx, uint32_t cy);
 
-#define DOCK_APP_COUNT 4
+#define DOCK_APP_COUNT 5
 
 static dock_app_t apps[DOCK_APP_COUNT] = {
     { "Shell",  0, dock_launch_shell,  draw_icon_shell  },
     { "Editor", 0, dock_launch_editor, draw_icon_editor },
     { "Tetris", 0, dock_launch_tetris, draw_icon_tetris },
     { "Finder", 0, dock_launch_finder, draw_icon_finder },
+    { "OpenGL", 0, dock_launch_opengl, draw_icon_opengl },
 };
 
 /* ------------------------------------------------------------------ */
@@ -249,6 +253,55 @@ static void draw_icon_finder(uint32_t cx, uint32_t cy) {
     fb_draw_hline(bx + 1, by + 12, 30, folder_dk);
 }
 
+static void draw_icon_opengl(uint32_t cx, uint32_t cy) {
+    /* 3D cube/tetrahedron on dark background — represents OpenGL */
+    uint32_t bx = cx - 18, by = cy - 18;
+    uint32_t dark   = fb_pack_color(15, 15, 25);
+    uint32_t border = fb_pack_color(40, 40, 55);
+
+    /* Background */
+    fb_fill_rect(bx, by, 36, 36, dark);
+    fb_draw_rect(bx, by, 36, 36, border);
+
+    /* Red triangle (front face) */
+    uint32_t red   = fb_pack_color(220, 40, 40);
+    uint32_t green = fb_pack_color(40, 200, 60);
+    uint32_t blue  = fb_pack_color(50, 80, 220);
+
+    /* Draw a filled triangle using horizontal lines:
+     * Top vertex at (cx, by+5), bottom-left (bx+5, by+30), bottom-right (bx+31, by+30) */
+    {
+        int top_x = (int)cx, top_y = (int)by + 5;
+        int bl_x = (int)bx + 5, br_x = (int)bx + 31;
+        int bot_y = (int)by + 30;
+        int tri_h = bot_y - top_y;
+
+        for (int row = 0; row < tri_h; row++) {
+            int y = top_y + row;
+            float t = (float)row / (float)tri_h;
+            int lx = top_x + (int)((float)(bl_x - top_x) * t);
+            int rx = top_x + (int)((float)(br_x - top_x) * t);
+            if (lx > rx) { int tmp = lx; lx = rx; rx = tmp; }
+
+            /* Color gradient: red at top, green bottom-left, blue bottom-right */
+            uint8_t r = (uint8_t)(220 - (int)(180.0f * t));
+            uint8_t g = (uint8_t)(40 + (int)(160.0f * t));
+            uint8_t b = (uint8_t)(40 + (int)(80.0f * t));
+            uint32_t clr = fb_pack_color(r, g, b);
+
+            if (rx > lx)
+                fb_fill_rect((uint32_t)lx, (uint32_t)y,
+                             (uint32_t)(rx - lx), 1, clr);
+        }
+    }
+
+    /* "GL" text overlay at bottom */
+    fb_render_char_px(bx + 10, by + 20, 'G', green, dark);
+    fb_render_char_px(bx + 18, by + 20, 'L', blue, dark);
+
+    (void)red;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Hover tooltip                                                      */
 /* ------------------------------------------------------------------ */
@@ -402,10 +455,11 @@ void dock_update_running(void) {
     /* Shell: check if shell window exists and is valid */
     apps[0].running = (wm_get_shell_window() != NULL) ? 1 : 0;
 
-    /* Editor, Tetris, Finder: scan window list by title */
+    /* Editor, Tetris, Finder, OpenGL: scan window list by title */
     apps[1].running = 0;
     apps[2].running = 0;
     apps[3].running = 0;
+    apps[4].running = 0;
 
     /* Walk the z-order list via wm_get_top_window and traverse prev.
        We can't access win_bottom directly, so use the top window and walk down. */
@@ -429,6 +483,12 @@ void dock_update_running(void) {
                 w->title[2] == 'n' && w->title[3] == 'd' &&
                 w->title[4] == 'e' && w->title[5] == 'r')
                 apps[3].running = 1;
+
+            /* Check for OpenGL Demo */
+            if (w->title[0] == 'O' && w->title[1] == 'p' &&
+                w->title[2] == 'e' && w->title[3] == 'n' &&
+                w->title[4] == 'G' && w->title[5] == 'L')
+                apps[4].running = 1;
         }
         w = w->prev;
     }
@@ -494,6 +554,18 @@ static void dock_launch_tetris(void) {
 
 static void dock_launch_finder(void) {
     finder_open("/");
+}
+
+/* Wrapper so gl_test_run() can execute in its own kernel thread */
+static void opengl_thread_wrapper(void) {
+    gl_test_run();
+    dock_update_running();
+    proc_kill(current_process->pid);
+    for (;;) __asm__ volatile("hlt");
+}
+
+static void dock_launch_opengl(void) {
+    proc_create_kernel_thread(opengl_thread_wrapper);
 }
 
 /* ------------------------------------------------------------------ */

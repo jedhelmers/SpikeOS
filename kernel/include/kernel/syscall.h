@@ -39,8 +39,45 @@ struct trapframe;
 #define SYS_SENDTO    21
 #define SYS_RECVFROM  22
 #define SYS_CLOSESOCK 23
+#define SYS_MMAP      24
+#define SYS_MUNMAP    25
+#define SYS_GPU_CREATE_CTX  26
+#define SYS_GPU_SUBMIT      27
+#define SYS_GPU_DESTROY_CTX 28
 
-#define NUM_SYSCALLS  24
+#define NUM_SYSCALLS  29
+
+/* Argument struct for SYS_GPU_SUBMIT */
+struct gpu_submit_args {
+    uint32_t ctx_id;        /* VirGL context ID */
+    const uint32_t *cmdbuf; /* pointer to command buffer (uint32 words) */
+    uint32_t size_bytes;    /* size of command buffer in bytes */
+};
+
+/* mmap protection flags (prot argument) */
+#define PROT_NONE   0x0
+#define PROT_READ   0x1
+#define PROT_WRITE  0x2
+#define PROT_EXEC   0x4
+
+/* mmap flags */
+#define MAP_SHARED    0x01
+#define MAP_PRIVATE   0x02
+#define MAP_ANONYMOUS 0x04
+#define MAP_FIXED     0x08
+
+/* mmap failure sentinel */
+#define MAP_FAILED ((void *)-1)
+
+/* Argument struct passed by pointer for SYS_MMAP (6 params > 3 registers) */
+struct mmap_args {
+    uint32_t addr;      /* hint or fixed address (0 = kernel chooses) */
+    uint32_t length;    /* size in bytes (rounded up to PAGE_SIZE) */
+    uint32_t prot;      /* PROT_READ | PROT_WRITE | PROT_EXEC */
+    uint32_t flags;     /* MAP_ANONYMOUS | MAP_PRIVATE | MAP_SHARED */
+    int32_t  fd;        /* file descriptor (-1 for anonymous) */
+    uint32_t offset;    /* offset into file (must be page-aligned) */
+};
 
 /* Socket type for SYS_SOCKET */
 #define SOCK_UDP  1

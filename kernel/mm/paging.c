@@ -127,6 +127,49 @@ void free_frame(uint32_t phys) {
     clear_frame(frame);
 }
 
+uint32_t alloc_frames_contiguous(uint32_t count, uint32_t align_frames) {
+    if (count == 0) return FRAME_ALLOC_FAIL;
+    if (align_frames == 0) align_frames = 1;
+
+    uint32_t flags = hal_irq_save();
+
+    /* Scan for a run of 'count' free frames starting at an aligned boundary */
+    for (uint32_t start = 0; start <= MAX_FRAMES - count; ) {
+        /* Align start to the requested boundary */
+        uint32_t rem = start % align_frames;
+        if (rem != 0) start += align_frames - rem;
+        if (start + count > MAX_FRAMES) break;
+
+        /* Check if all 'count' frames from 'start' are free */
+        uint32_t run = 0;
+        for (run = 0; run < count; run++) {
+            if (test_frame(start + run)) break;
+        }
+
+        if (run == count) {
+            /* Found a contiguous run — mark all frames as used */
+            for (uint32_t i = 0; i < count; i++)
+                set_frame(start + i);
+            hal_irq_restore(flags);
+            return start * FRAME_SIZE;
+        }
+
+        /* Skip past the occupied frame */
+        start += run + 1;
+    }
+
+    hal_irq_restore(flags);
+    return FRAME_ALLOC_FAIL;
+}
+
+void free_frames_contiguous(uint32_t phys, uint32_t count) {
+    uint32_t frame = phys / FRAME_SIZE;
+    uint32_t flags = hal_irq_save();
+    for (uint32_t i = 0; i < count; i++)
+        clear_frame(frame + i);
+    hal_irq_restore(flags);
+}
+
 /*
  * Temp mapping: map any physical frame at TEMP_MAP_VADDR (0xC03FF000).
  * Uses PTE[1023] of first_page_table. Since first_page_table is in
@@ -320,6 +363,48 @@ int map_page(uint32_t virt, uint32_t phys, uint32_t flags) {
     temp_unmap();
 
     hal_tlb_invalidate(virt);
+    return 0;
+}
+
+/*
+ * Track which PDE slots have been claimed for MMIO.
+ * mmio_next_pde starts at MMIO_PDE_START and advances as regions are mapped.
+ */
+static int mmio_next_pde = MMIO_PDE_START;
+
+int map_mmio_region(uint32_t phys_base, uint32_t size, uint32_t *virt_out) {
+    if (size == 0 || !virt_out) return -1;
+
+    /* Page-align physical base (preserve sub-page offset for caller) */
+    uint32_t phys_aligned = phys_base & ~0xFFFu;
+    uint32_t offset_in_page = phys_base & 0xFFFu;
+    uint32_t total_bytes = size + offset_in_page;
+
+    /* Calculate how many pages (and PDEs) we need */
+    uint32_t num_pages = (total_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint32_t num_pdes  = (num_pages + PAGE_ENTRIES - 1) / PAGE_ENTRIES;
+
+    /* Check we have enough PDE slots */
+    if (mmio_next_pde + (int)num_pdes > PAGE_ENTRIES) return -1;
+
+    uint32_t virt_base = (uint32_t)mmio_next_pde << 22;
+
+    /* Map all pages */
+    uint32_t phys = phys_aligned;
+    uint32_t virt = virt_base;
+    for (uint32_t i = 0; i < num_pages; i++) {
+        if (map_page(virt, phys,
+                     PAGE_PRESENT | PAGE_WRITABLE | PAGE_CACHE_DISABLE) != 0) {
+            return -1;
+        }
+        virt += PAGE_SIZE;
+        phys += PAGE_SIZE;
+    }
+
+    /* Advance the PDE cursor past the claimed slots */
+    mmio_next_pde += num_pdes;
+
+    *virt_out = virt_base + offset_in_page;
     return 0;
 }
 

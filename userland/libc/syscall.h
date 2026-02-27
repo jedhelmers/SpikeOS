@@ -26,6 +26,11 @@
 #define SYS_SENDTO    21
 #define SYS_RECVFROM  22
 #define SYS_CLOSESOCK 23
+#define SYS_MMAP      24
+#define SYS_MUNMAP    25
+#define SYS_GPU_CREATE_CTX  26
+#define SYS_GPU_SUBMIT      27
+#define SYS_GPU_DESTROY_CTX 28
 
 static inline int syscall0(int num) {
     int ret;

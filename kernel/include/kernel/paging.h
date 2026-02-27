@@ -98,11 +98,34 @@ void clear_frame(uint32_t frame);
 
 int test_frame(uint32_t frame);
 
-uint32_t alloc_frame();
+uint32_t alloc_frame(void);
 
 void free_frame(uint32_t phys);
 
+/*
+    Allocate 'count' physically contiguous frames aligned to 'align_frames'
+    frame boundary (e.g., align_frames=1 for page-aligned, 4 for 16KB-aligned).
+    Returns the physical address of the first frame, or FRAME_ALLOC_FAIL on failure.
+*/
+uint32_t alloc_frames_contiguous(uint32_t count, uint32_t align_frames);
+
+/*
+    Free 'count' contiguous frames starting at physical address 'phys'.
+*/
+void free_frames_contiguous(uint32_t phys, uint32_t count);
+
 int map_page(uint32_t virt, uint32_t phys, uint32_t flags);
+
+/*
+    Map a device MMIO region into kernel virtual address space.
+    Automatically selects a free PDE slot (starting from PDE[773]),
+    maps 'size' bytes from 'phys_base' with PAGE_CACHE_DISABLE.
+    On success, writes the kernel virtual address to *virt_out and returns 0.
+    On failure (no free PDE or map_page failed), returns -1.
+    Note: PDE[772] is reserved for the compositor buffer (COMPOSITOR_VIRT_BASE).
+*/
+#define MMIO_PDE_START 773  /* first PDE available for dynamic MMIO mapping */
+int map_mmio_region(uint32_t phys_base, uint32_t size, uint32_t *virt_out);
 
 /*
     Per-process page directory management
