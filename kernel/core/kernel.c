@@ -31,6 +31,7 @@
 #include <kernel/mouse.h>
 #include <kernel/pci.h>
 #include <kernel/e1000.h>
+#include <kernel/virtio_gpu.h>
 #include <kernel/net.h>
 #include <kernel/dock.h>
 #include <kernel/settings.h>
@@ -344,6 +345,17 @@ void kernel_main(void) {
                nic->link_up ? "UP" : "DOWN");
 #endif
 
+    virtio_gpu_init();
+#ifdef VERBOSE_BOOT
+    {
+        uint32_t gw, gh;
+        if (virtio_gpu_get_display_size(&gw, &gh) == 0)
+            printf("INIT VirtIO GPU (%dx%d)\n", gw, gh);
+        else
+            printf("INIT VirtIO GPU (not found)\n");
+    }
+#endif
+
     net_init();
 #ifdef VERBOSE_BOOT
     printf("INIT Network stack\n");
@@ -375,6 +387,9 @@ void kernel_main(void) {
     /* Init window manager and framebuffer console */
     wm_init();
     fb_console_init();
+
+    /* Set up VirtIO GPU scanout (needs compositor from wm_init) */
+    virtio_gpu_setup_scanout();
 
     /* Init dock (app launcher at bottom of screen) */
     dock_init();

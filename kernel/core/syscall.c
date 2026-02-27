@@ -11,6 +11,7 @@
 #include <kernel/tty.h>
 #include <kernel/signal.h>
 #include <kernel/net.h>
+#include <kernel/virtio_gpu.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -473,6 +474,232 @@ static int32_t sys_closesock(trapframe *tf) {
 }
 
 /* ------------------------------------------------------------------ */
+/*  SYS_MMAP (24) — map anonymous memory into process address space   */
+/*  EBX = pointer to struct mmap_args                                 */
+/*  Returns mapped address, or (uint32_t)-1 on failure.               */
+/* ------------------------------------------------------------------ */
+
+/* mmap region base — anonymous mappings start here and grow up */
+#define MMAP_BASE 0x40000000u
+
+static int32_t sys_mmap(trapframe *tf) {
+    struct mmap_args *args = (struct mmap_args *)tf->ebx;
+
+    if (bad_user_ptr(args, sizeof(struct mmap_args))) return -1;
+
+    /* Kernel threads have no user address space */
+    if (current_process->cr3 == 0) return -1;
+
+    uint32_t length = args->length;
+    uint32_t flags  = args->flags;
+    uint32_t prot   = args->prot;
+    uint32_t addr   = args->addr;
+
+    /* Must be anonymous for now (no file-backed mappings) */
+    if (!(flags & MAP_ANONYMOUS)) return -1;
+
+    /* Length must be nonzero */
+    if (length == 0) return -1;
+
+    /* Page-align length upward */
+    length = (length + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+
+    /* Check VMA table capacity */
+    if (current_process->vma_count >= MAX_VMAS) return -1;
+
+    /* Find a free address range */
+    if (flags & MAP_FIXED) {
+        /* MAP_FIXED: use exact address, must be page-aligned and in user space */
+        if (addr & (PAGE_SIZE - 1)) return -1;
+        if (addr < MMAP_BASE || addr + length > USER_STACK_VADDR) return -1;
+        if (addr + length < addr) return -1;  /* overflow */
+
+        /* Check for overlap with existing VMAs */
+        for (uint32_t i = 0; i < current_process->vma_count; i++) {
+            vma_t *v = &current_process->vmas[i];
+            if (addr < v->base + v->length && addr + length > v->base)
+                return -1;  /* overlap */
+        }
+    } else {
+        /* Kernel chooses: find first gap starting from MMAP_BASE */
+        addr = MMAP_BASE;
+
+        /* Retry if overlapping — simple linear scan */
+        int found = 0;
+        for (int attempt = 0; attempt < 1000 && !found; attempt++) {
+            found = 1;
+            for (uint32_t i = 0; i < current_process->vma_count; i++) {
+                vma_t *v = &current_process->vmas[i];
+                if (addr < v->base + v->length && addr + length > v->base) {
+                    /* Overlap — skip past this VMA */
+                    addr = (v->base + v->length + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+                    found = 0;
+                    break;
+                }
+            }
+        }
+        if (!found) return -1;
+
+        /* Bounds check */
+        if (addr + length > USER_STACK_VADDR || addr + length < addr)
+            return -1;
+    }
+
+    /* Allocate physical frames and map pages */
+    uint32_t pages_mapped = 0;
+    uint32_t page_flags = PAGE_PRESENT | PAGE_USER;
+    if (prot & PROT_WRITE)
+        page_flags |= PAGE_WRITABLE;
+
+    for (uint32_t off = 0; off < length; off += PAGE_SIZE) {
+        uint32_t frame = alloc_frame();
+        if (frame == FRAME_ALLOC_FAIL) goto fail_unmap;
+
+        if (pgdir_map_user_page(current_process->cr3, addr + off, frame,
+                                page_flags) != 0) {
+            free_frame(frame);
+            goto fail_unmap;
+        }
+
+        /* Zero the page */
+        uint8_t *p = (uint8_t *)temp_map(frame);
+        memset(p, 0, PAGE_SIZE);
+        temp_unmap();
+
+        pages_mapped++;
+    }
+
+    /* Record VMA */
+    vma_t *vma = &current_process->vmas[current_process->vma_count++];
+    vma->base   = addr;
+    vma->length = length;
+    vma->prot   = prot;
+    vma->flags  = flags;
+
+    return (int32_t)addr;
+
+fail_unmap:
+    /* Roll back: unmap and free already-mapped pages */
+    for (uint32_t i = 0; i < pages_mapped; i++) {
+        uint32_t va = addr + i * PAGE_SIZE;
+        uint32_t phys = virt_to_phys(va);
+        if (phys != 0 && phys != FRAME_ALLOC_FAIL) {
+            free_frame(phys);
+        }
+        /* Clear the PTE (map to 0 with no flags effectively unmaps) */
+        pgdir_map_user_page(current_process->cr3, va, 0, 0);
+    }
+    return -1;
+}
+
+/* ------------------------------------------------------------------ */
+/*  SYS_MUNMAP (25) — unmap memory region                             */
+/*  EBX = address, ECX = length                                       */
+/*  Returns 0 on success, -1 on failure.                              */
+/* ------------------------------------------------------------------ */
+
+static int32_t sys_munmap(trapframe *tf) {
+    uint32_t addr   = tf->ebx;
+    uint32_t length = tf->ecx;
+
+    /* Kernel threads have no user address space */
+    if (current_process->cr3 == 0) return -1;
+
+    /* Must be page-aligned */
+    if (addr & (PAGE_SIZE - 1)) return -1;
+    if (length == 0) return -1;
+
+    /* Page-align length upward */
+    length = (length + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+
+    /* Find the VMA that matches this range */
+    int vma_idx = -1;
+    for (uint32_t i = 0; i < current_process->vma_count; i++) {
+        if (current_process->vmas[i].base == addr &&
+            current_process->vmas[i].length == length) {
+            vma_idx = (int)i;
+            break;
+        }
+    }
+    if (vma_idx < 0) return -1;  /* no matching VMA */
+
+    /* Unmap pages and free frames */
+    for (uint32_t off = 0; off < length; off += PAGE_SIZE) {
+        uint32_t va = addr + off;
+        uint32_t phys = virt_to_phys(va);
+        if (phys != 0 && phys != FRAME_ALLOC_FAIL) {
+            free_frame(phys);
+        }
+        pgdir_map_user_page(current_process->cr3, va, 0, 0);
+        hal_tlb_invalidate(va);
+    }
+
+    /* Remove VMA entry by shifting the rest down */
+    for (uint32_t i = (uint32_t)vma_idx; i + 1 < current_process->vma_count; i++) {
+        current_process->vmas[i] = current_process->vmas[i + 1];
+    }
+    current_process->vma_count--;
+
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  SYS_GPU_CREATE_CTX (26) — create a VirGL 3D rendering context     */
+/*  EBX = context ID (1-255)                                          */
+/*  ECX = debug name string (or NULL)                                 */
+/*  Returns 0 on success, -1 on failure.                              */
+/* ------------------------------------------------------------------ */
+
+static int32_t sys_gpu_create_ctx(trapframe *tf) {
+    uint32_t ctx_id = tf->ebx;
+    const char *name = (const char *)tf->ecx;
+
+    if (ctx_id == 0 || ctx_id > 255) return -1;
+    if (name && bad_user_string(name)) return -1;
+    if (!virtio_gpu_has_virgl()) return -1;
+
+    return (int32_t)virtio_gpu_ctx_create(ctx_id, name ? name : "user");
+}
+
+/* ------------------------------------------------------------------ */
+/*  SYS_GPU_SUBMIT (27) — submit a VirGL command buffer               */
+/*  EBX = pointer to struct gpu_submit_args                           */
+/*  Returns 0 on success, -1 on failure.                              */
+/* ------------------------------------------------------------------ */
+
+static int32_t sys_gpu_submit(trapframe *tf) {
+    struct gpu_submit_args *args = (struct gpu_submit_args *)tf->ebx;
+
+    if (bad_user_ptr(args, sizeof(struct gpu_submit_args))) return -1;
+    if (!virtio_gpu_has_virgl()) return -1;
+
+    uint32_t ctx_id = args->ctx_id;
+    const uint32_t *cmdbuf = args->cmdbuf;
+    uint32_t size_bytes = args->size_bytes;
+
+    if (ctx_id == 0 || ctx_id > 255) return -1;
+    if (size_bytes == 0 || size_bytes > 65536) return -1;
+    if (bad_user_ptr(cmdbuf, size_bytes)) return -1;
+
+    return (int32_t)virtio_gpu_submit_3d(ctx_id, cmdbuf, size_bytes);
+}
+
+/* ------------------------------------------------------------------ */
+/*  SYS_GPU_DESTROY_CTX (28) — destroy a VirGL context                */
+/*  EBX = context ID                                                  */
+/*  Returns 0 on success, -1 on failure.                              */
+/* ------------------------------------------------------------------ */
+
+static int32_t sys_gpu_destroy_ctx(trapframe *tf) {
+    uint32_t ctx_id = tf->ebx;
+
+    if (ctx_id == 0 || ctx_id > 255) return -1;
+    if (!virtio_gpu_has_virgl()) return -1;
+
+    return (int32_t)virtio_gpu_ctx_destroy(ctx_id);
+}
+
+/* ------------------------------------------------------------------ */
 /*  Dispatch table                                                    */
 /* ------------------------------------------------------------------ */
 
@@ -503,6 +730,11 @@ static syscall_fn syscall_table[NUM_SYSCALLS] = {
     [SYS_SENDTO]    = sys_sendto,
     [SYS_RECVFROM]  = sys_recvfrom,
     [SYS_CLOSESOCK] = sys_closesock,
+    [SYS_MMAP]      = sys_mmap,
+    [SYS_MUNMAP]    = sys_munmap,
+    [SYS_GPU_CREATE_CTX]  = sys_gpu_create_ctx,
+    [SYS_GPU_SUBMIT]      = sys_gpu_submit,
+    [SYS_GPU_DESTROY_CTX] = sys_gpu_destroy_ctx,
 };
 
 void syscall_dispatch(trapframe *tf) {

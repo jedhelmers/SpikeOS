@@ -7,6 +7,15 @@
 #include <kernel/wait.h>
 
 #define MAX_PROCS 32
+#define MAX_VMAS  16        /* max mmap'd regions per process */
+
+/* Virtual Memory Area — tracks one mmap'd region */
+typedef struct {
+    uint32_t base;          /* page-aligned start address */
+    uint32_t length;        /* byte length (page-aligned) */
+    uint32_t prot;          /* PROT_READ | PROT_WRITE | PROT_EXEC */
+    uint32_t flags;         /* MAP_ANONYMOUS | MAP_PRIVATE | MAP_SHARED */
+} vma_t;
 
 struct trapframe;   // forward declaration
 
@@ -46,6 +55,10 @@ struct process {
     uint32_t cwd;               /* inode of current working directory */
     uint32_t pending_signals;   /* bitmask of pending signals */
     uint32_t brk;               /* program break (end of user heap) */
+
+    /* Virtual memory areas — tracks mmap'd regions */
+    vma_t    vmas[MAX_VMAS];    /* per-process VMA table */
+    uint32_t vma_count;         /* number of active VMAs */
 };
 
 extern struct process *current_process;

@@ -41,6 +41,7 @@ void process_init(void) {
         proc_table[i].cwd = 0;
         proc_table[i].pending_signals = 0;
         proc_table[i].brk = 0;
+        proc_table[i].vma_count = 0;
         for (int j = 0; j < MAX_FDS; j++)
             proc_table[i].fds[j] = -1;
     }
@@ -145,6 +146,7 @@ static void reap_orphan_zombies(void) {
         proc_table[i].pending_signals = 0;
         proc_table[i].cwd = 0;
         proc_table[i].brk = 0;
+        proc_table[i].vma_count = 0;
         proc_table[i].wait_children.head = NULL;
         for (int j = 0; j < MAX_FDS; j++)
             proc_table[i].fds[j] = -1;
@@ -166,6 +168,7 @@ struct process *proc_create_kernel_thread(void (*entry)(void)) {
             /* Inherit parent's cwd */
             p->cwd = current_process ? current_process->cwd : 0;
             p->pending_signals = 0;
+            p->vma_count = 0;
 
             /* Inherit parent's fds (kernel threads share console) */
             fd_init_process(p->fds);
@@ -231,6 +234,7 @@ struct process *proc_create_user_process(uint32_t pd_phys,
             /* Inherit parent's cwd */
             p->cwd = current_process ? current_process->cwd : 0;
             p->pending_signals = 0;
+            p->vma_count = 0;
 
             /* Give user process its own console fds */
             fd_init_process(p->fds);

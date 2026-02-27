@@ -27,6 +27,8 @@
 #include <kernel/pci.h>
 #include <kernel/e1000.h>
 #include <kernel/net.h>
+#include <kernel/virtio_gpu.h>
+#include <kernel/gl_test.h>
 
 #define LINE_BUF_SIZE 128
 
@@ -37,6 +39,15 @@ static uint32_t fg_pids[MAX_FG_PIDS];
 static int fg_count = 0;
 
 extern void thread_inc(void);
+extern void dock_update_running(void);
+
+/* Wrapper for gl_test_run — kernel threads must never return */
+static void gl_test_thread_wrapper(void) {
+    gl_test_run();
+    dock_update_running();
+    proc_kill(current_process->pid);
+    for (;;) __asm__ volatile("hlt");
+}
 
 /* ================================================================== */
 /*  Output capture (redirect terminal_write to buffer)                */
@@ -996,6 +1007,8 @@ static void shell_execute_cmd(void) {
         printf("  run            - start thread_inc\n");
         printf("  run concurrent - mutex demo: two threads inc/dec a shared counter\n");
         printf("  run tetris     - play Tetris (WASD=move, Space=drop, Q=quit)\n");
+        printf("  run virgl3d    - GPU-accelerated 3D triangle demo (VirGL)\n");
+        printf("  run opengl     - TinyGL software-rendered spinning triangle\n");
         printf("  ps             - list processes\n");
         printf("  kill <pid>     - kill process by PID\n");
         printf("  meminfo        - show heap info\n");
@@ -1282,6 +1295,24 @@ static void shell_execute_cmd(void) {
     else if (strcmp(line_buf, "run tetris") == 0) {
         tetris_run();
     }
+    /* ---- run opengl ---- */
+    else if (strcmp(line_buf, "run opengl") == 0) {
+        struct process *p = proc_create_kernel_thread(gl_test_thread_wrapper);
+        if (p) {
+            printf("Started OpenGL demo [PID %d]\n", p->pid);
+        } else {
+            printf("Error: process table full\n");
+        }
+    }
+    /* ---- run virgl3d ---- */
+    else if (strcmp(line_buf, "run virgl3d") == 0) {
+        if (!virtio_gpu_scanout_active()) {
+            printf("VirtIO GPU not active\n");
+        } else {
+            printf("Running VirGL 3D triangle demo...\n");
+            virtio_gpu_3d_demo();
+        }
+    }
     /* ---- run ---- */
     else if (strcmp(line_buf, "run") == 0) {
         struct process *p = proc_create_kernel_thread(thread_inc);
@@ -1334,11 +1365,30 @@ static void shell_execute_cmd(void) {
             printf("No PCI devices found\n");
         } else {
             for (int i = 0; i < count; i++) {
-                printf("%02x:%02x.%x %04x:%04x class=%02x:%02x IRQ=%d BAR0=0x%x\n",
-                       devs[i].bus, devs[i].slot, devs[i].func,
-                       devs[i].vendor_id, devs[i].device_id,
-                       devs[i].class_code, devs[i].subclass,
-                       devs[i].irq_line, devs[i].bar[0]);
+                pci_device_t *d = &devs[i];
+                printf("%02x:%02x.%x %04x:%04x class=%02x:%02x IRQ=%d",
+                       d->bus, d->slot, d->func,
+                       d->vendor_id, d->device_id,
+                       d->class_code, d->subclass, d->irq_line);
+                /* Show BARs with sizes */
+                for (int b = 0; b < 6; b++) {
+                    if (d->bar[b] == 0) continue;
+                    uint32_t addr = pci_bar_addr(d, b);
+                    if (addr) {
+                        printf(" BAR%d=0x%x", b, addr);
+                        if (d->bar_size[b])
+                            printf("[%dK]", d->bar_size[b] / 1024);
+                        if (d->bar_is_64 & (1 << b))
+                            printf("(64)");
+                    }
+                }
+                /* Show capabilities */
+                if (d->cap_count > 0) {
+                    printf(" caps:");
+                    for (int c = 0; c < d->cap_count; c++)
+                        printf("%s%02x", c ? "," : "", d->caps[c].id);
+                }
+                printf("\n");
             }
         }
     }

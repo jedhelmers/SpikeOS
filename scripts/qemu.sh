@@ -29,8 +29,8 @@ qemu-system-$(scripts/target-triplet-to-arch.sh $HOST) \
     -drive file=disk.img,format=raw,if=ide,index=0,media=disk \
     -cdrom myos.iso \
     -vga std \
+    -device virtio-gpu-pci \
     -serial file:.debug.log \
     -netdev user,id=net0,hostfwd=udp::9999-:9999 \
     -device e1000,netdev=net0 \
-    -no-reboot -no-shutdown \
-    -d int,cpu_reset # -D qemu_debug.log
+    -no-reboot -no-shutdown

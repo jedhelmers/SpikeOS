@@ -9,6 +9,7 @@
 #include <kernel/vfs.h>
 #include <kernel/timer.h>
 #include <kernel/settings.h>
+#include <kernel/virtio_gpu.h>
 #include <string.h>
 
 #define FONT_W 8
@@ -918,6 +919,10 @@ void wm_redraw_all(void) {
 
         /* Single atomic blit: compositor (cached RAM) → hardware framebuffer */
         surface_blit_to_fb(compositor, 0, 0);
+
+        /* Also present via VirtIO GPU if available */
+        if (virtio_gpu_scanout_active())
+            virtio_gpu_present(compositor);
     } else {
         /* Fallback: direct-to-hardware (no compositor available) */
         wm_draw_desktop();
